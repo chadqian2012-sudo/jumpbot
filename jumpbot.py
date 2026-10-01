@@ -679,6 +679,15 @@ class Config:
     modal_dismiss_point: list = field(default_factory=lambda: [0.127, 0.914])  # 弹窗返回键
     top_bar_ratio: float = 0.06          # 微信小游戏顶栏高度占比
     bottom_bar_ratio: float = 0.0
+    # ---- 窗口尺寸守卫 ----
+    # 识别里所有**绝对像素**阈值（中心白点面积 14~260、最小方块宽 120px、落点安定容差 3px…）
+    # 都按下面这个基准尺寸标定。客户区尺寸一变，"开始游戏"按钮的模板匹配就会从 0.95
+    # 掉到 0.79 之类，表现为"点不进游戏 / 识别不了"（实测 2026-10-01：532x1016 时）。
+    #   auto = 自动调回基准尺寸（默认）；warn = 只警告不改；off = 不检查
+    window_ref_width: int = 553
+    window_ref_height: int = 1050
+    window_size_policy: str = "auto"
+    window_size_tol_px: int = 1
     piece_hue_min: int = 100             # 棋子是深蓝紫色（默认皮肤）
     piece_hue_max: int = 155
     piece_sat_min: int = 55              # 棋子：饱和度高（排除灰白方块与背景）
@@ -2068,6 +2077,69 @@ def resolve_window(cfg: Config, wait_s: float = 0.0) -> WindowInfo:
         time.sleep(0.5)
 
 
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+
+
+def ensure_window_size(win: WindowInfo, cfg: Config) -> WindowInfo:
+    """把游戏窗口的**客户区**校正回标定基准尺寸（默认 553x1050）。
+
+    为什么必须做：识别里所有**绝对像素**阈值都按基准尺寸标定（中心白点面积 14~260、
+    最小方块宽 120px、落点安定容差 3px…）。窗口被拖动/缩放后，最直接的症状是
+    "开始游戏"按钮的模板匹配从 0.95 掉到 ~0.79 → 点不进游戏，看起来就像"识别不了"
+    （实测 2026-10-01：客户区 532x1016 时的表现，识别本身还能出东西但阈值全失配）。
+
+    做法：按"外框 = 客户区 + 边框"换算后调 SetWindowPos，迭代收敛到精确尺寸
+    （不能靠用户拖边框，差几个像素阈值照样对不上）。policy=warn 只提示不改，off 不管。
+    """
+    try:
+        policy = str(getattr(cfg, "window_size_policy", "auto")).lower()
+        if policy == "off":
+            return win
+        tw = int(getattr(cfg, "window_ref_width", 553))
+        th = int(getattr(cfg, "window_ref_height", 1050))
+        tol = max(0, int(getattr(cfg, "window_size_tol_px", 1)))
+        if abs(win.width - tw) <= tol and abs(win.height - th) <= tol:
+            return win
+        if policy != "auto":
+            log(f"警告：游戏窗口客户区 {win.width}x{win.height} 与标定基准 {tw}x{th} 不一致，"
+                f"识别阈值可能失配（window_size_policy={policy}，只警告不改）")
+            return win
+
+        hwnd = wintypes.HWND(win.hwnd)
+        before = (win.width, win.height)
+        for _ in range(4):
+            wr = wintypes.RECT()
+            cr = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(wr)):
+                break
+            if not user32.GetClientRect(hwnd, ctypes.byref(cr)):
+                break
+            ow, oh = wr.right - wr.left, wr.bottom - wr.top
+            cw, ch = cr.right - cr.left, cr.bottom - cr.top
+            if abs(cw - tw) <= tol and abs(ch - th) <= tol:
+                break
+            user32.SetWindowPos(hwnd, None, wr.left, wr.top,
+                                ow + (tw - cw), oh + (th - ch),
+                                SWP_NOZORDER | SWP_NOACTIVATE)
+            time.sleep(0.25)
+        new = resolve_window(cfg, 0.5)
+        after = (new.width, new.height)
+        if after != before:
+            log(f"窗口尺寸已自动校正：客户区 {before[0]}x{before[1]} → {after[0]}x{after[1]}"
+                f"（标定基准 {tw}x{th}；绝对像素阈值都按基准标定）")
+        elif after != (tw, th):
+            log(f"警告：窗口尺寸校正后仍是 {after[0]}x{after[1]}（基准 {tw}x{th}），"
+                f"识别阈值可能失配")
+        status_write(window={"hwnd": new.hwnd, "pid": new.pid, "title": new.title,
+                             "client": list(new.client_rect)})
+        return new
+    except Exception as exc:
+        # 尺寸守卫绝不能把主流程搞挂：出问题就按原窗口继续
+        log(f"窗口尺寸校正失败（忽略，按当前尺寸继续）：{exc}")
+        return win
+
+
 def selftest(args) -> int:
     """部署自检：不碰游戏窗口，验证依赖 / 模板 / GPU 后端 / 掩码一致性 / 计时。"""
     ok = True
@@ -2165,6 +2237,7 @@ def cupydebug(args) -> int:
 def probe(args) -> int:
     cfg = Config.load(Path(args.config), {"k": args.k} if args.k else None)
     win = resolve_window(cfg)
+    win = ensure_window_size(win, cfg)
     log("目标窗口：" + win.describe())
     if not args.no_activate:
         ok = force_foreground(win.hwnd)
@@ -3198,6 +3271,7 @@ def play(args) -> int:
 
     try:
         win = resolve_window(cfg)
+        win = ensure_window_size(win, cfg)
         log("目标窗口：" + win.describe())
         if foreground:
             ok = force_foreground(win.hwnd)
@@ -3243,6 +3317,8 @@ def play(args) -> int:
                 stop_reason = "按下 F8 手动停止"
                 break
             win = resolve_window(cfg, cfg.window_wait_s)
+            # 每跳前守卫：用户在跑的过程中把窗口拖小了，这里当场调回去（不会在飞行途中动窗口）
+            win = ensure_window_size(win, cfg)
             if foreground and foreground_hwnd() != win.hwnd:
                 if not force_foreground(win.hwnd):
                     log("窗口失去前台且无法切回，停止。")
