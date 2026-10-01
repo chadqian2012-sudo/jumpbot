@@ -73,6 +73,38 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
+
+# ---- 剔除 CUDA 数学库（约 1.37 GB），只保留掩码计算真正需要的 cudart + nvrtc ----
+# 背景：CuPy 的掩码路径只用 cudart64_12.dll 与 nvrtc64_120_0.dll；cublas/cusparse/
+# cufft/cusolver/curand 共 2.6GB，掩码完全用不到（老版本 364MB 的包就是不带它们的）。
+# 但只要这些 DLL 能在系统里被解析到（例如本机装了 CUDA Toolkit、其 bin 进了 PATH），
+# PyInstaller 的依赖扫描就会把它们一并收进 _internal，包体从 364MB 涨到 1.7GB。
+# 这里按文件名前缀显式剔除——注意**不能**动 cudart64_*/nvrtc64_120_0.dll，删了 GPU 会挂。
+# 故意**不**剔除 nvJitLink（仅 37MB）：nvrtc 在新驱动上做 LTO 时可能用到它，
+# 留着当保险；真正的大头是 cublas/cusparse/cufft/cusolver/curand 这几个。
+_CUDA_DROP_PREFIXES = ("cublas", "cusparse", "cusolver", "cufft", "curand",
+                       "nvperf", "npp", "cupti", "nvjpeg")
+
+
+def _drop_cuda_math(entries):
+    kept, dropped, dropped_bytes = [], [], 0
+    for entry in entries:
+        name = os.path.basename(str(entry[0])).lower()
+        if name.startswith(_CUDA_DROP_PREFIXES) and not name.startswith(("cudart", "nvrtc64_120_0.dll")):
+            dropped.append(name)
+            try:
+                dropped_bytes += os.path.getsize(entry[0])
+            except OSError:
+                pass
+            continue
+        kept.append(entry)
+    if dropped:
+        print(f"[spec] 剔除 CUDA 数学库 {len(dropped)} 个 / {dropped_bytes / 1048576:.0f} MB")
+    return type(a.binaries)(kept)
+
+
+a.binaries = _drop_cuda_math(a.binaries)
+
 exe = EXE(
     pyz,
     a.scripts,

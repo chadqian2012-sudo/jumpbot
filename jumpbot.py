@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field, asdict
@@ -2424,6 +2425,50 @@ def f8_pressed() -> bool:
     return poll_stop_key()
 
 
+# 在跑脚本的那个命令行窗口里，按这些键即可停止（与 F8 等价）。
+CONSOLE_STOP_KEYS = ("q", "Q", "\x1b")     # q / Q / Esc
+
+
+def _console_key_watcher() -> None:
+    """后台读控制台按键：q / Q / Esc → 与 F8 走同一条停止路径。
+
+    为什么需要它：F8 是全局热键（GetAsyncKeyState），但脚本常常在后台/隐藏控制台里跑，
+    或者用户更习惯在命令行窗口里按键。这里用 msvcrt 读**本进程控制台**的按键，
+    不抢全局键盘事件；没有控制台（stdin 被重定向、打包后无窗口）时静默退出。
+    """
+    global _STOP_REQUESTED
+    try:
+        import msvcrt
+    except ImportError:            # 非 Windows
+        return
+    try:
+        while not _STOP_REQUESTED:
+            if msvcrt.kbhit():
+                try:
+                    ch = msvcrt.getwch()
+                except Exception:
+                    return
+                if ch in CONSOLE_STOP_KEYS:
+                    _STOP_REQUESTED = True
+                    key = {"\x1b": "Esc"}.get(ch, ch)
+                    log(f"收到控制台停止键 {key!r}，正在停止（松开鼠标后退出；等价于 F8）…")
+                    return
+            time.sleep(0.05)
+    except Exception:
+        # 没有真正的控制台时 kbhit() 会失败——这不是错误，静默退出即可
+        return
+
+
+def start_console_watcher() -> None:
+    """启动控制台按键监听（daemon 线程，进程退出即消失）。"""
+    try:
+        thread = threading.Thread(target=_console_key_watcher,
+                                  name="console-stop-key", daemon=True)
+        thread.start()
+    except Exception as exc:
+        log(f"控制台按键监听未启动（不影响 F8）：{exc}")
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -3781,6 +3826,8 @@ def main(argv=None) -> int:
     except Exception:
         pass
     tune_cpu(threads=getattr(_cfg_for_tune, "cv2_threads", 4), priority="above")
+    # 命令行窗口里按键即可停止（q / Q / Esc），与 F8 等价；无控制台时自动跳过
+    start_console_watcher()
     try:
         if args.selftest:
             return selftest(args)
@@ -3804,6 +3851,10 @@ def main(argv=None) -> int:
     except WindowGoneError as exc:
         log(str(exc))
         return 3
+    except KeyboardInterrupt:
+        # Ctrl+C：press() 里的 finally 已经把鼠标放开，这里只负责干净地报一句再退出
+        log("收到 Ctrl+C，已停止（鼠标已释放）。下次可用 F8 或控制台按 q 优雅停止。")
+        return 130
     finally:
         restore_timer_resolution()
 

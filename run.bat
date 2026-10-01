@@ -11,7 +11,8 @@ if not exist "%PY%" (
   exit /b 1
 )
 
-echo 启动 跳一跳 自动脚本（默认前台模式，F8 停止）...
+echo 启动 跳一跳 自动脚本（默认前台模式）
+echo  停止方式：在本窗口按 q（或 Esc），或按全局热键 F8；Ctrl+C 亦可（会先松开鼠标）
 "%PY%" "%~dp0jumpbot.py" %*
 set "EXITCODE=%ERRORLEVEL%"
 echo.
