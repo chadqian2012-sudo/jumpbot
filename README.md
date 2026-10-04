@@ -69,7 +69,30 @@
 | 形态 | 大小 | 说明 |
 | --- | --- | --- |
 | 源码运行 | — | `python jumpbot.py --max-jumps 5000 --daemon` |
-| 打包软件 | **364 MB** | `dist\jumpbot\jumpbot.exe` + `run_long.bat` / `selftest.bat`，免装 Python；GPU 运行时自动检测 |
+| 绿色版（免安装） | **404 MB** | `dist\jumpbot\`：`jumpbot.exe` + `_internal\` + `run_long.bat` / `selftest.bat`，拷走整个文件夹即可用 |
+| **exe 安装包** | **122.7 MB** | `installer\jumpbot-setup-1.0.exe`：双击装好即用，带开始菜单/桌面快捷方式与标准卸载（详见下节） |
+
+### 做成一个 exe 安装包（Inno Setup，2026-10-04）
+
+```powershell
+winget install JRSoftware.InnoSetup                      # 一次性：装编译器（ISCC.exe）
+powershell -ExecutionPolicy Bypass -File tools\installer\build_installer.ps1
+```
+
+产物 `installer\jumpbot-setup-1.0.exe`（**122.7 MB**，LZMA2/max 从 404 MB 载荷压下来，
+编译约 100 秒）。设计要点：
+
+| 项目 | 做法 |
+| --- | --- |
+| 安装位置 | `%LOCALAPPDATA%\Programs\jumpbot`，**每用户安装、不弹 UAC**（bot 要把 `logs/` `debug/` 写在 exe 旁边，装 Program Files 会因权限失败） |
+| 装什么 | `jumpbot.exe` + `_internal\` + `config.json` + 三个 `.bat` + `README.md`；**排除 `logs/`、`debug/`**（实测运行数据能到 49 MB，不该进安装包） |
+| 快捷方式 | 开始菜单 5 个：长跑 / 自检 / 只识别不发输入 / 配置文件夹 / 卸载；桌面图标可选。快捷方式**直接指向 exe 带参数**（不走 .bat，省掉每次闪一个 cmd 窗口） |
+| 卸载 | 标准卸载程序 `unins000.exe`，登记到「应用和功能」，卸载时连同 `logs/`、`debug/` 一起清 |
+| 向导语言 | 中文（`tools/installer/ChineseSimplified.isl`，官方翻译；`.iss` 存成 UTF-8 **带 BOM**，否则 Inno 按 ANSI 读会乱码） |
+
+**实测验证（2026-10-04）**：静默安装到临时目录 → 2233 文件 / 404.7 MB、无 `logs`/`debug` →
+**已安装版本 `--selftest` 全过**（GPU 掩码 5.99ms、GPU vs SIMD 差异 0、detect 链路 OK）→
+开始菜单 5 个中文快捷方式齐全 → 静默卸载后**目录、快捷方式、注册表项全部清除**。
 
 ## 目标与验收口径
 

@@ -1,6 +1,7 @@
 # ---- 构建产物（用 tools/build_app.ps1 现场生成，不入库）----
 dist/
 build/
+installer/
 *.spec.bak
 
 # ---- 运行时数据 ----
