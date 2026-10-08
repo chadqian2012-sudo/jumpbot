@@ -3849,6 +3849,7 @@ def play(args) -> int:
         while index < cfg.max_jumps:
             try:
                 in_flight = False
+                restart_after_record = False
                 if control_checkpoint(cfg, vision):
                     prev_score = None
                     score_streak = 0
@@ -4301,13 +4302,7 @@ def play(args) -> int:
                                         "dead", score, note,
                                         t_acquire_ms, t_landing_ms, t_score_ms,
                                         (time.perf_counter() - t_iter_start) * 1000.0)
-                    if _CONTROL is None or not _CONTROL.pause_requested:
-                        win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
-                    if win is None:
-                        log("死后无法重新开始，停止。")
-                        emit(record)
-                        stop_reason = "无法自动重新开始"
-                        break
+                    restart_after_record = True
 
                 emit(record)
                 index += 1
@@ -4324,6 +4319,16 @@ def play(args) -> int:
                     elapsed_text=time.strftime("%H:%M:%S", time.gmtime(active_time() - started)),
                     round=index, csv=str(csv_path), **accuracy_fields(records),
                 )
+                # Commit the completed jump before the interruptible restart.
+                # A pause here cancels only the new click, not its known death
+                # record; the catch handler sees in_flight=False.
+                if (restart_after_record and index < cfg.max_jumps and
+                        (_CONTROL is None or not _CONTROL.needs_resume)):
+                    win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
+                    if win is None:
+                        log("死后无法重新开始，停止。")
+                        stop_reason = "无法自动重新开始"
+                        break
                 if calib_bands:
                     band_attempts += 1
                     if record.result == "landed":

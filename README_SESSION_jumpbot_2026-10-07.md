@@ -39,6 +39,7 @@
 像素判据移至pixel_center_hit；热键提示使用实际配置，面板处理停止状态。
 最终输入审查发现检查到原生按下之间的竞态，已用RunControl.input_dispatch同步，
 InputController._hold共用原子按下和无条件释放；33项回归覆盖前/后台最后按下竞态及异常释放。
+死亡后的重开也已改为先提交当前跳，再尝试重开，34项测试包含重开中暂停不丢失/重复死亡记录。
 后续以发布分支 `release/windows-pause-v1.2` / `D:\Codex Workspace\jumpbot-release-v1.2` 为候选，
 从远端master c73ca708开始移植已完成CUDA/OpenCL与暂停改动；原目录不重置。
 不要声称Release已完成，先查远端PR/CI/附件；不调k/gamma/瞄准门限凑成绩，不上传完整运行目录。

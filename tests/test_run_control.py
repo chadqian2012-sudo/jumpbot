@@ -335,7 +335,7 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(result['recent100']['hits'], 98)
         self.assertEqual(result['unknown'], 1)
 
-    def simulate_play(self, count, pause_every=0, unknown_every=0):
+    def simulate_play(self, count, pause_every=0, unknown_every=0, pause_restart=False):
         """Entire play caller, synthetic scoreboard, fake input/window/capture."""
         import numpy as np
         J = self.j
@@ -383,12 +383,26 @@ class ApplicationTests(unittest.TestCase):
             owner.clock.sleep(180)
             owner.control.toggle('test resume')
         def landing(*_, **__):
+            if pause_restart and counters['presses'] == 2:
+                return 'fixture_dead', None, None, None, None
             if unknown_every and counters['presses'] % unknown_every == 0:
                 return 'pause_unknown', None, None, None, None
             return 'landed', frame, piece, None, None
         config_path = Path(self.temp.name) / 'config.json'
         config_path.write_text(json.dumps({'k': 2.61, 'gamma': 0}), encoding='utf8')
         self.fake_event(resume)
+        original_playing = J.ensure_playing
+        def playing(*values, **options):
+            if pause_restart and counters['presses'] == 2 and not counters.get('restart_pause'):
+                import csv
+                path = next(Path(self.temp.name).glob('run_*.csv'))
+                with path.open(encoding='utf-8-sig', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+                owner.assertEqual(rows[-1]['result'], 'dead')
+                counters['restart_pause'] = True
+                owner.control.toggle('pause during restart')
+                raise ControlInterrupted('restart cancelled')
+            return original_playing(*values, **options)
         with ExitStack() as stack:
             stack.enter_context(patch.object(J.Config, 'load', lambda *_: cfg))
             stack.enter_context(patch.object(J, 'find_windows', lambda *_: [self.win]))
@@ -401,16 +415,28 @@ class ApplicationTests(unittest.TestCase):
             stack.enter_context(patch.object(J, 'is_blocking_modal', lambda *_: False))
             stack.enter_context(patch.object(J, 'match_ui', lambda *_: None))
             stack.enter_context(patch.object(J, 'wait_landing', landing))
-            stack.enter_context(patch.object(J, 'read_score', lambda *_: counters['score']))
+            stack.enter_context(patch.object(J, 'ensure_playing', playing))
+            stack.enter_context(patch.object(J, 'read_score', lambda *_:
+                                             None if pause_restart and counters['presses'] == 2
+                                             else counters['score']))
             stack.enter_context(patch.object(J, 'LOG_DIR', Path(self.temp.name)))
             args = J.build_parser().parse_args(['--config', str(config_path), '--max-jumps', str(count)])
             self.assertEqual(J.play(args), 0)
         self.assertEqual(counters['presses'], count)
         self.assertEqual(J._STATUS['attempts'], count)
-        self.assertEqual(J._STATUS['deaths'], 0)
+        self.assertEqual(J._STATUS['deaths'], 1 if pause_restart else 0)
         self.assertEqual(J._STATUS['jumps'], count)
         self.assertEqual(J._LAST_STOP_REASON, '达到最大跳跃次数')
         return J._STATUS.copy(), counters
+
+    def test_known_death_is_committed_before_pause_cancels_restart(self):
+        status, counters = self.simulate_play(3, pause_restart=True)
+        self.assertTrue(counters['restart_pause'])
+        self.assertEqual(status['deaths'], 1)
+        self.assertEqual(status['landed'], 2)
+        import csv
+        with next(Path(self.temp.name).glob('run_*.csv')).open(encoding='utf-8-sig', newline='') as stream:
+            self.assertEqual([r['result'] for r in csv.DictReader(stream)], ['landed', 'dead', 'landed'])
 
     def test_play_pause_integration_does_not_add_deaths_or_blind_jumps(self):
         status, _ = self.simulate_play(30, pause_every=3)
