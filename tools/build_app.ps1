@@ -64,8 +64,8 @@ try {
     # Verify the delivered runtime too, after removing optional DLLs.
     & $exe --selftest
     if ($LASTEXITCODE -ne 0) { throw "trimmed app selftest failed" }
-    $licenseArgs = @('-AppDir', $appDir, '-Python', $Python)
-    if (-not $NoGpu) { $licenseArgs += '-Full' }
+    $licenseArgs = @{ AppDir = $appDir; Python = $Python }
+    if (-not $NoGpu) { $licenseArgs.Full = $true }
     & (Join-Path $Root 'tools\collect_licenses.ps1') @licenseArgs
     if (-not (Test-Path -LiteralPath (Join-Path $appDir 'config.json'))) {
         Copy-Item -LiteralPath (Join-Path $Root 'config.json') -Destination (Join-Path $appDir 'config.json')
