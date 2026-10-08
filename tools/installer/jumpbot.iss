@@ -18,32 +18,47 @@
   #define OutputDir "..\..\installer"
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.0"
+  #define AppVersion "1.2"
+#endif
+#ifndef AppVersionInfo
+  #define AppVersionInfo "1.2.0.0"
+#endif
+#ifndef AppFlavor
+  #define AppFlavor "full"
+#endif
+#if AppFlavor == "portable"
+  #define AppTitle "跳一跳自动脚本（兼容轻量版）"
+  #define AppSubdir "jumpbot-portable"
+  #define AppIdentity "{{B5B2F778-6F4B-4B39-A24D-707780C50259}"
+#else
+  #define AppTitle "跳一跳自动脚本"
+  #define AppSubdir "jumpbot"
+  #define AppIdentity "{{8F3A2C41-7B5E-4D19-9C6A-2E48D1F0B7A3}"
 #endif
 
 [Setup]
-AppId={{8F3A2C41-7B5E-4D19-9C6A-2E48D1F0B7A3}
-AppName=跳一跳自动脚本
+AppId={#AppIdentity}
+AppName={#AppTitle}
 AppVersion={#AppVersion}
-AppVerName=跳一跳自动脚本 {#AppVersion}
+AppVerName={#AppTitle} {#AppVersion}
 AppPublisher=chadqian2012-sudo
 AppPublisherURL=https://github.com/chadqian2012-sudo/jumpbot
 AppSupportURL=https://github.com/chadqian2012-sudo/jumpbot
-VersionInfoVersion=1.0.0.0
-VersionInfoDescription=跳一跳自动脚本 安装程序
-DefaultDirName={localappdata}\Programs\jumpbot
-DefaultGroupName=跳一跳自动脚本
+VersionInfoVersion={#AppVersionInfo}
+VersionInfoDescription={#AppTitle} 安装程序
+DefaultDirName={localappdata}\Programs\{#AppSubdir}
+DefaultGroupName={#AppTitle}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir={#OutputDir}
-OutputBaseFilename=jumpbot-setup-{#AppVersion}
+OutputBaseFilename=jumpbot-setup-{#AppVersion}-{#AppFlavor}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayName=跳一跳自动脚本
+UninstallDisplayName={#AppTitle}
 UninstallDisplayIcon={app}\jumpbot.exe
 SetupLogging=yes
 AllowNoIcons=yes
@@ -56,17 +71,19 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; \
-    Excludes: "logs\*,debug\*,logs,debug"; \
+    Excludes: "\logs\*,\debug\*,\logs,\debug,\config.json,\README.md"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{group}\跳一跳自动脚本（长跑）"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; WorkingDir: "{app}"; Comment: "长跑模式：5000 跳上限，掉窗口自动等回来"
 Name: "{group}\自检（不碰游戏）"; Filename: "{app}\jumpbot.exe"; Parameters: "--selftest"; WorkingDir: "{app}"; Comment: "检查依赖 / 模板 / GPU 后端，不发送任何输入"
+Name: "{group}\纯 CPU 模式"; Filename: "{app}\jumpbot.exe"; Parameters: "--backend simd --no-cuda --no-opencl --max-jumps 5000 --daemon"; WorkingDir: "{app}"
 Name: "{group}\只识别不发输入（安全演示）"; Filename: "{app}\jumpbot.exe"; Parameters: "--dry-run --samples 3"; WorkingDir: "{app}"
 Name: "{group}\配置文件夹"; Filename: "{app}"
 Name: "{group}\卸载 跳一跳自动脚本"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\跳一跳自动脚本"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\jumpbot.exe"; Parameters: "--selftest"; Description: "运行自检（推荐，验证依赖与 GPU 后端）"; Flags: postinstall nowait skipifsilent

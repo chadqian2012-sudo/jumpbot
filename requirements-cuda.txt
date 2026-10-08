@@ -1,0 +1,4 @@
+-r requirements-opencl.txt
+cupy-cuda12x>=13,<15
+nvidia-cuda-runtime-cu12>=12.2,<13
+nvidia-cuda-nvrtc-cu12>=12.2,<13

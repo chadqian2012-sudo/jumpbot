@@ -8,13 +8,16 @@
 # Requires: Inno Setup 6 (ISCC.exe). Install with:  winget install JRSoftware.InnoSetup
 param(
     [string]$Root = "D:\Codex Workspace\jumpbot",
-    [string]$Version = "1.0",
+    [string]$Version = "1.2",
+    [ValidateSet('full','portable')][string]$Flavor = "full",
+    [string]$PayloadDir = "",
+    [string]$OutputDir = "",
     [switch]$SkipAppBuild
 )
 $ErrorActionPreference = "Stop"
 
-$payload = Join-Path $Root "dist\jumpbot"
-$outDir = Join-Path $Root "installer"
+$payload = if ($PayloadDir) { $PayloadDir } else { Join-Path $Root "dist\jumpbot" }
+$outDir = if ($OutputDir) { $OutputDir } else { Join-Path $Root "installer" }
 $iss = Join-Path $Root "tools\installer\jumpbot.iss"
 
 if (-not (Test-Path -LiteralPath $payload)) {
@@ -22,7 +25,10 @@ if (-not (Test-Path -LiteralPath $payload)) {
 }
 if (-not $SkipAppBuild) {
     Write-Host "== step 1/2: rebuild app folder (dist\jumpbot) =="
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $Root "tools\build_app.ps1")
+    if ((Split-Path $payload -Leaf) -ne 'jumpbot') { throw 'payload directory must be named jumpbot' }
+    $appArgs = @('-Root', $Root, '-DistRoot', (Split-Path $payload -Parent))
+    if ($Flavor -eq 'portable') { $appArgs += '-NoGpu' }
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $Root "tools\build_app.ps1") @appArgs
     if ($LASTEXITCODE -ne 0) { throw "app build failed" }
 } else {
     Write-Host "== step 1/2: skipped app build (-SkipAppBuild) =="
@@ -43,10 +49,12 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'BelowNormal' } catch {}
 
 Write-Host "== step 2/2: compile installer (LZMA2/max on ~400MB payload, takes a few minutes) =="
-& $iscc "/DPayloadDir=$payload" "/DOutputDir=$outDir" "/DAppVersion=$Version" $iss
+$parsedVersion = [version]$Version
+$numericVersion = '{0}.{1}.{2}.{3}' -f $parsedVersion.Major, $parsedVersion.Minor, ([math]::Max(0,$parsedVersion.Build)), ([math]::Max(0,$parsedVersion.Revision))
+& $iscc "/DPayloadDir=$payload" "/DOutputDir=$outDir" "/DAppVersion=$Version" "/DAppVersionInfo=$numericVersion" "/DAppFlavor=$Flavor" $iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
-$setup = Join-Path $outDir "jumpbot-setup-$Version.exe"
+$setup = Join-Path $outDir "jumpbot-setup-$Version-$Flavor.exe"
 if (-not (Test-Path -LiteralPath $setup)) { throw "installer not produced: $setup" }
 $mb = [math]::Round((Get-Item -LiteralPath $setup).Length / 1MB, 1)
 Write-Host ("== DONE: {0}  ({1} MB) ==" -f $setup, $mb)

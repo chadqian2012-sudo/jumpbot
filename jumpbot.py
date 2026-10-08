@@ -24,6 +24,10 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from contextlib import nullcontext
+
+from run_control import (RunControl, WindowsHotkeyListener, ControlInterrupted,
+                         parse_hotkey, validate_timing)
 
 import cv2
 import numpy as np
@@ -56,6 +60,7 @@ DEBUG_DIR = PROJECT_DIR / "debug"
 STATUS_PATH = DEBUG_DIR / "status.json"
 
 VK_F8 = 0x77
+_CONTROL: RunControl | None = None
 
 
 def log(msg: str) -> None:
@@ -65,6 +70,9 @@ def log(msg: str) -> None:
 
 _STATUS: dict = {}
 _CUDA_ENV_READY = False      # CUDA 运行时路径只需铺一次（否则 PATH 会被反复追加直到爆掉）
+_OPENCL_RUNTIMES: dict = {}  # 进程内复用上下文/程序，Vision 各自持有队列、内核和缓冲区
+_OPENCL_FAILED: set = set()
+_OPENCL_CHECKED: set = set()
 
 
 def status_write(**fields) -> None:
@@ -72,6 +80,13 @@ def status_write(**fields) -> None:
 
     原子写（临时文件 + replace），失败一律吞掉——状态面板绝不能影响主流程。
     """
+    if _CONTROL is not None:
+        fields.update(_CONTROL.snapshot())
+        if fields.get("state") != "stopped" and not _CONTROL.stopped:
+            if _CONTROL.pause_requested:
+                fields["state"] = "paused" if _CONTROL.paused_at is not None else "pausing"
+            elif _CONTROL.needs_resume:
+                fields["state"] = "resuming"
     _STATUS.update(fields)
     _STATUS["updated_at"] = time.time()
     try:
@@ -176,6 +191,10 @@ def restore_timer_resolution() -> None:
         _WINMM = None
 
 
+def effective_cv2_threads(threads: int) -> int:
+    return min(4, os.cpu_count() or 1) if int(threads) == 0 else max(1, int(threads))
+
+
 def tune_cpu(threads: int = 4, priority: str = "above") -> None:
     """CPU 侧加速：控制 OpenCV 线程数 + 提升本进程优先级。
 
@@ -187,7 +206,8 @@ def tune_cpu(threads: int = 4, priority: str = "above") -> None:
       面板自己用 BELOW_NORMAL，绝不和 bot 抢。
     """
     try:
-        cv2.setNumThreads(max(1, int(threads)))
+        threads = effective_cv2_threads(threads)
+        cv2.setNumThreads(threads)
         cv2.setUseOptimized(True)
     except Exception as exc:
         log(f"设置 OpenCV 线程数失败：{exc}")
@@ -422,6 +442,7 @@ def find_windows(title_pattern: str, exe_hint: str = "") -> list:
 
 def force_foreground(hwnd: int, timeout: float = 2.0) -> bool:
     """把窗口切到前台并确认成功（处理 Windows 前台锁定）。"""
+    control_check()
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, 9)
     if user32.GetForegroundWindow() == hwnd:
@@ -429,6 +450,7 @@ def force_foreground(hwnd: int, timeout: float = 2.0) -> bool:
 
     deadline = time.time() + timeout
     while time.time() < deadline:
+        control_check()
         user32.keybd_event(0x12, 0, 0, None)
         user32.keybd_event(0x12, 0, 2, None)
         target_tid = user32.GetWindowThreadProcessId(hwnd, None)
@@ -483,8 +505,32 @@ class InputController:
 
     def __init__(self, background: bool = False):
         self.background = background
+        self.expected_generation = None
 
     def press(self, win: WindowInfo, fx: float, fy: float, hold_s: float) -> None:
+        guard = (_CONTROL.input_operation(self.expected_generation)
+                 if _CONTROL is not None else nullcontext())
+        with guard:
+            self._press(win, fx, fy, hold_s)
+
+    def _hold(self, down, up, hold) -> None:
+        """Share atomic admission and unconditional release across backends."""
+        dispatched = False
+        try:
+            with (_CONTROL.input_dispatch(self.expected_generation)
+                  if _CONTROL is not None else nullcontext()):
+                control_check(self.expected_generation)
+                # DOWN may have reached Windows even if its call is interrupted.
+                # From this point attempt UP for every exit path, including an
+                # exception in native dispatch or context-manager teardown.
+                dispatched = True
+                down()
+            hold()
+        finally:
+            if dispatched:
+                up()
+
+    def _press(self, win: WindowInfo, fx: float, fy: float, hold_s: float) -> None:
         x = int(win.client_rect[0] + fx * win.width)
         y = int(win.client_rect[1] + fy * win.height)
         if self.background:
@@ -495,27 +541,26 @@ class InputController:
             cy = int(fy * win.height)
             lparam = (cy << 16) | (cx & 0xFFFF)
             user32.PostMessageW(win.hwnd, WM_MOUSEMOVE, 0, lparam)
-            user32.PostMessageW(win.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
-            try:
-                time.sleep(hold_s)
-            finally:
-                # 无论正常结束还是被 Ctrl+C / 异常打断，都必须把按键放开：
-                # 卡在按下状态会让游戏一直蓄力，还会把之后所有点击变成拖拽。
-                user32.PostMessageW(win.hwnd, WM_LBUTTONUP, 0, lparam)
+            self._hold(lambda: user32.PostMessageW(win.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam),
+                       lambda: user32.PostMessageW(win.hwnd, WM_LBUTTONUP, 0, lparam),
+                       lambda: time.sleep(hold_s))
         else:
             if os.environ.get("JUMPBOT_NO_INPUT") == "1":
                 log("JUMPBOT_NO_INPUT=1：已阻止本次按键")
                 return
             if not point_is_window(win.hwnd, x, y):
                 log(f"安全闸：目标点 ({x},{y}) 不在窗口 {win.title!r} 上，本次输入已阻止")
+                if _CONTROL is not None:
+                    raise ControlInterrupted("按压点被遮挡（未发送输入）")
                 return
             _send_mouse(0, x, y)
             time.sleep(0.012)
-            _send_mouse(MOUSEEVENTF_LEFTDOWN, x, y)
-            try:
-                hold_precise(hold_s)
-            finally:
-                _send_mouse(MOUSEEVENTF_LEFTUP, x, y)
+            control_check(self.expected_generation)
+            if not point_is_window(win.hwnd, x, y):
+                raise ControlInterrupted("按压点已被遮挡（未发送按下）")
+            self._hold(lambda: _send_mouse(MOUSEEVENTF_LEFTDOWN, x, y),
+                       lambda: _send_mouse(MOUSEEVENTF_LEFTUP, x, y),
+                       lambda: hold_precise(hold_s))
 
     def click(self, win: WindowInfo, fx: float, fy: float) -> None:
         self.press(win, fx, fy, 0.06)
@@ -674,6 +719,9 @@ class Config:
     transfer_c: float = 0.0         # transfer_a>0 时启用该模型，否则回退 k*d+b
     residual_trim_ratio: float = 0.03    # 在线残差修正的限幅（±3%）
     window_wait_s: float = 120.0    # 目标窗口消失后等待它回来的最长时间
+    pause_hotkey: str = "Alt+P"
+    startup_wait_s: float = 0.0     # 首次启动等待用户打开小程序；0 = 无限等待
+    start_delay_s: float = 3.0
     blind_jump_limit: int = 3       # 连续识别失败时，允许“盲跳”推进的次数上限
     modal_dark_threshold: float = 110.0   # 中央区域平均亮度低于此值 = 深色弹窗
     modal_dismiss_point: list = field(default_factory=lambda: [0.127, 0.914])  # 弹窗返回键
@@ -771,10 +819,13 @@ class Config:
     # 掩码后端：cpu(numpy 旧实现) / simd(cv2 uint8，等价但更快) / gpu(CuPy on CUDA)。
     # gpu 需要 nvidia-*-cu12 pip 组件或本地 CUDA Toolkit；不可用时自动回退 simd。
     # 实测（553x1050 帧，RTX 3070 Ti）：cpu 18.1ms / simd 11.5ms / gpu 2.1~4.3ms（含传输）。
-    # auto：启动时实测 gpu/simd 各 3 次，谁快用谁——**这很重要**，实测当别的程序
+    # auto：启动时实测 gpu/simd 各 5 次，GPU 至少快 1.5 倍才用——实测当别的程序
     # 吃满 GPU（例如在全屏游戏里）时 CUDA 内核会排队，masks 从 3.4ms 掉到 188ms。
     masks_backend: str = "auto"
-    cv2_threads: int = 4          # OpenCV 线程数；0.6MP 的图实测 4 线程最快
+    cuda_enabled: bool = True
+    opencl_enabled: bool = True  # 可选 pyopencl；AMD/Intel/NVIDIA 的 OpenCL 1.2+ 驱动
+    opencl_device: str = ""      # 留空实测所有 GPU；也可按名称/厂商子串限定设备
+    cv2_threads: int = 4          # 0=按逻辑 CPU 数自动选择 1~4；可手动指定
     piece_anchor_dy_ratio: float = 0.019  # 棋子锚点相对包围盒底边的下移量（占画面高）
     landing_color_tol: int = 100          # 顶面颜色相似度容差（L1，用于滤掉棋子阴影）
     landing_method: str = "auto"          # auto=优先用顶面色过滤阴影，失败回退方块掩码
@@ -828,6 +879,17 @@ class Config:
         for key, value in (overrides or {}).items():
             if value is not None and hasattr(cfg, key):
                 setattr(cfg, key, value)
+        env_backend = os.environ.get("JUMPBOT_MASKS_BACKEND")
+        if env_backend:
+            cfg.masks_backend = env_backend
+        env_device = os.environ.get("JUMPBOT_OPENCL_DEVICE")
+        if env_device:
+            cfg.opencl_device = env_device
+        if cfg.masks_backend not in ("auto", "cpu", "simd", "gpu", "cuda", "opencl"):
+            raise ValueError(f"未知掩码后端：{cfg.masks_backend}")
+        parse_hotkey(cfg.pause_hotkey)
+        cfg.startup_wait_s = validate_timing(cfg.startup_wait_s, "startup_wait_s")
+        cfg.start_delay_s = validate_timing(cfg.start_delay_s, "start_delay_s")
         return cfg
 
     def save(self, path: Path) -> None:
@@ -1198,6 +1260,15 @@ class Vision:
         self.piece: Piece | None = None
         self._gpu_state: bool | None = None      # None=未尝试, True=可用, False=不可用
         self._cp = None
+        self._gpu_kernel = None
+        self._gpu_hsv_tables = None
+        self._gpu_buffers = None                # 只保留当前帧尺寸的设备缓冲区
+        self._cl_state: bool | None = None
+        self._cl = None
+        self._cl_candidates = []
+        self._cl_runtime = None
+        self._cl_buffers: dict = {}
+        self._last_mask_backend = None
         self._auto_backend: str | None = None    # masks_backend="auto" 时的实测结果
 
     def reset_prior(self) -> None:
@@ -1207,46 +1278,38 @@ class Vision:
     # ---------- 掩码 ----------
 
     def _pick_backend(self, frame: np.ndarray) -> str:
-        """auto 模式：实测 gpu / simd 各 5 次取中位，**gpu 必须明显更快**才用它。
-
-        为什么必须实测且要留余量：GPU 不是任何时刻都更快。实测别的程序吃满 GPU 时
-        （全屏游戏在跑），CUDA 内核算不上排队，masks 会在 9ms~150ms 之间剧烈抖动。
-        所以规则是 gpu_中位 × 1.5 ≤ simd_中位 才选 gpu；运行期还会用滚动中位监测，
-        一旦 GPU 变慢就切回 SIMD（见 _note_backend_timing）。
-        """
+        """比较 CPU/CUDA/OpenCL 的真实端到端耗时，并核对设备输出后再启用。"""
         if self._auto_backend is not None:
             return self._auto_backend
+        cpu = "simd" if self.cfg.masks_simd else "cpu"
+        expected = self._masks_impl(cpu, frame)
+        funcs = [(cpu, lambda f: self._masks_impl(cpu, f)),
+                 ("gpu", self._masks_gpu), ("opencl", self._masks_opencl)]
         cand = []
-        simd_ms = None
-        try:
-            # 用 _masks_impl 而不是直接调 _masks_simd：这样测的就是"真正会被用到的实现"
-            # （masks_simd=False 时会走 numpy 旧路径），避免测出来的耗时与实际不符。
-            self._masks_impl("simd", frame)                # 预热
+        for name, fn in funcs:
+            candidate_masks = fn(frame)                 # 初始化/编译/预热不计时
+            if candidate_masks is None:
+                continue
+            if any(not np.array_equal(a, b) for a, b in zip(expected, candidate_masks)):
+                log(f"{name} 掩码核对失败，本次禁用该后端")
+                if name == "gpu":
+                    self._gpu_state = False
+                elif name == "opencl":
+                    self._cl_state = False
+                continue
             samples = []
             for _ in range(5):
                 t0 = time.perf_counter()
-                self._masks_impl("simd", frame)
+                if fn(frame) is None:
+                    break
                 samples.append((time.perf_counter() - t0) * 1000)
-            simd_ms = sorted(samples)[len(samples) // 2]
-            cand.append(("simd", simd_ms))
-        except Exception as exc:
-            log(f"SIMD 掩码不可用：{exc}")
-        if self._masks_gpu(frame) is not None:            # 内部含初始化 + 预热
-            samples = []
-            for _ in range(5):
-                t0 = time.perf_counter()
-                self._masks_gpu(frame)
-                samples.append((time.perf_counter() - t0) * 1000)
-            gpu_ms = sorted(samples)[len(samples) // 2]
-            cand.append(("gpu", gpu_ms))
+            if len(samples) == 5:
+                cand.append((name, sorted(samples)[2]))
+        simd_ms = next(ms for name, ms in cand if name == cpu)
         self._simd_ref_ms = simd_ms
-        gpu_cand = next((ms for n, ms in cand if n == "gpu"), None)
-        if gpu_cand is not None and simd_ms is not None and gpu_cand * 1.5 <= simd_ms:
-            self._auto_backend = "gpu"
-        elif simd_ms is not None:
-            self._auto_backend = "simd"
-        else:
-            self._auto_backend = "gpu" if gpu_cand is not None else "cpu"
+        accelerators = [(n, ms) for n, ms in cand if n != cpu and ms * 1.5 <= simd_ms]
+        self._auto_backend = min(accelerators, key=lambda x: x[1])[0] if accelerators else cpu
+        self._gpu_ms_buf = []
         detail = "、".join(f"{n} {ms:.2f}ms" for n, ms in cand) or "都不可用"
         log(f"掩码后端自动选择：{self._auto_backend}（实测 {detail}）")
         status_write(mask_backend=self._auto_backend, mask_bench_ms=detail)
@@ -1254,7 +1317,7 @@ class Vision:
 
     def _note_backend_timing(self, backend: str, ms: float) -> None:
         """auto 模式下监测所选后端：GPU 被别的程序抢走时（实测可慢 20 倍）切回 SIMD。"""
-        if backend != "gpu":
+        if backend not in ("gpu", "opencl") or self._auto_backend != backend:
             return
         buf = getattr(self, "_gpu_ms_buf", None)
         if buf is None:
@@ -1267,15 +1330,18 @@ class Vision:
             ref = getattr(self, "_simd_ref_ms", None)
             limit = max(2.0 * ref, 30.0) if ref else 30.0
             if med > limit:
-                log(f"GPU 掩码变慢（滚动中位 {med:.0f}ms > {limit:.0f}ms，"
+                log(f"{backend} 掩码变慢（滚动中位 {med:.0f}ms > {limit:.0f}ms，"
                     f"可能被其他程序占用），切换回 SIMD")
-                self._auto_backend = "simd"
+                self._auto_backend = "simd" if self.cfg.masks_simd else "cpu"
                 self._gpu_ms_buf = []
-                status_write(mask_backend="simd",
-                             mask_bench_ms=f"GPU 退化到 {med:.0f}ms，已切回 SIMD")
+                status_write(mask_backend=self._auto_backend,
+                             mask_bench_ms=f"{backend} 退化到 {med:.0f}ms，已切回 CPU")
 
     def _init_gpu(self) -> bool:
         """按需初始化 CuPy（含 CUDA 运行时路径自动发现）。失败返回 False 并永久回退。"""
+        if not self.cfg.cuda_enabled or os.environ.get("JUMPBOT_DISABLE_CUDA") == "1":
+            self._gpu_state = False
+            return False
         if self._gpu_state is not None:
             return self._gpu_state
         self._gpu_state = False
@@ -1332,10 +1398,10 @@ class Vision:
         return self._gpu_state
 
     def _masks_gpu(self, frame: np.ndarray):
-        """GPU(CuPy) 掩码实现：与 _masks_simd **逐像素等价**（整数运算，无浮点误差）。
+        """单个融合 CUDA 内核：HSV 转换沿用 OpenCV 的整数查表/舍入规则。
 
-        开销 = CPU 端 cvtColor + 上传 HSV(1.7MB) + GPU 计算 + 下载两个掩码(1.2MB)，
-        实测 2~4ms（CPU SIMD 11.5ms）。所有比较都在 int16 上做，避免 uint8 回绕。
+        只上传 BGR 帧和背景行，设备缓冲区按帧尺寸复用，两个掩码一次阻塞下载。
+        返回的是本帧新分配的 CPU 数组，下一帧不会覆盖调用者保留的结果。
         """
         if not self._init_gpu():
             return None
@@ -1343,42 +1409,299 @@ class Vision:
         cp = self._cp
         try:
             h, w = frame.shape[:2]
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             bg = estimate_background_rows(frame)
             bg_u8 = np.clip(bg, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
-            bg_row_hsv = cv2.cvtColor(bg_u8, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.int16)
-            g_bg_row = cp.asarray(bg_u8)                      # 只有 (h,1,3)=3KB
-
-            g = cp.asarray(hsv)
-            gh = g[:, :, 0].astype(cp.int16)
-            gs = g[:, :, 1].astype(cp.int16)
-            gv = g[:, :, 2].astype(cp.int16)
-            gbh = cp.asarray(bg_row_hsv[:, 0]).reshape(-1, 1).astype(cp.int16)
-            gbs = cp.asarray(bg_row_hsv[:, 1]).reshape(-1, 1).astype(cp.int16)
-            gbv = cp.asarray(bg_row_hsv[:, 2]).reshape(-1, 1).astype(cp.int16)
-
-            canvas = cp.asarray(self._canvas_mask(frame))
-            diff = cp.abs(cp.asarray(frame).astype(cp.int16)
-                          - cp.broadcast_to(g_bg_row, frame.shape).astype(cp.int16)
-                          ).sum(axis=2) > cfg.block_color_delta
-            darker = gv < (gbv - cfg.block_dark_delta)
-            hue_diff = (cp.abs(gh - gbh) > cfg.block_hue_delta) & (gs > cfg.block_hue_sat_min)
-            sat_vivid = (gs - gbs) > cfg.block_sat_delta
-            sat_pale = (gbs - gs) > cfg.block_pale_delta
-            pure_white = (gs < cfg.block_white_sat_max) & (gv > cfg.block_white_val_min)
-            block = darker | hue_diff | sat_vivid | sat_pale | pure_white | diff
-            if cfg.block_bright_delta > 0:
-                block |= ((gv - gbv) > cfg.block_bright_delta) & (gs <= gbs)
-            piece = (((gs > cfg.piece_sat_min) & (gv < cfg.piece_val_max))
-                     | ((gv < 110) & (gs > 25))) \
-                & (gh >= cfg.piece_hue_min) & (gh <= cfg.piece_hue_max)
-            block_mask = cp.asnumpy((block.astype(cp.uint8) * 255) & canvas)
-            piece_mask = cp.asnumpy((piece.astype(cp.uint8) * 255) & canvas)
-            cp.cuda.Stream.null.synchronize()
-            return piece_mask, block_mask
+            if self._gpu_kernel is None:
+                # OpenCV RGB2HSV_b: hsv_shift=12，查表项使用 cvRound（ties-to-even）。
+                # 保留整数 HSV 语义，避免浮点转换在阈值边缘改变识别结果。
+                divisors = np.arange(1, 256, dtype=np.float64)
+                tables = np.zeros((2, 256), np.int32)
+                tables[0, 1:] = np.rint((255 << 12) / divisors).astype(np.int32)
+                tables[1, 1:] = np.rint((180 << 12) / (6.0 * divisors)).astype(np.int32)
+                self._gpu_hsv_tables = cp.asarray(tables)
+                self._gpu_kernel = cp.RawKernel(r'''
+                // Adapted from OpenCV RGB2HSV_b (Apache-2.0); see THIRD_PARTY_NOTICES.md.
+                __device__ __forceinline__ void jumpbot_bgr_hsv(
+                    const unsigned char* bgr, const int* tables,
+                    int& hue, int& sat, int& val)
+                {
+                    int blue = bgr[0], green = bgr[1], red = bgr[2];
+                    val = max(blue, max(green, red));
+                    int delta = val - min(blue, min(green, red));
+                    sat = (delta * tables[val] + 2048) >> 12;
+                    hue = val == red ? green - blue
+                        : val == green ? blue - red + 2 * delta
+                        : red - green + 4 * delta;
+                    hue = (hue * tables[256 + delta] + 2048) >> 12;
+                    if (hue < 0) hue += 180;
+                }
+                extern "C" __global__ void jumpbot_masks(
+                    const unsigned char* bgr, const unsigned char* bg,
+                    const int* tables, unsigned char* out,
+                    int n, int width, int top, int bottom,
+                    double color_delta, double dark_delta, double hue_delta,
+                    double hue_sat_min, double sat_delta, double pale_delta,
+                    double white_sat_max, double white_val_min, double bright_delta,
+                    double piece_sat_min, double piece_val_max,
+                    double piece_hue_min, double piece_hue_max)
+                {
+                    int i = blockIdx.x * blockDim.x + threadIdx.x;
+                    if (i >= n) return;
+                    int row = i / width;
+                    if (row < top || row >= bottom) {
+                        out[i] = out[n + i] = 0;
+                        return;
+                    }
+                    int p = 3 * i, b = 3 * row;
+                    int hue, sat, val, bh, bs, bv;
+                    jumpbot_bgr_hsv(bgr + p, tables, hue, sat, val);
+                    jumpbot_bgr_hsv(bg + b, tables, bh, bs, bv);
+                    // 先提升为有符号整数，再相减；uint8 差/三通道和不会回绕。
+                    int db = (int)bgr[p] - bg[b];
+                    int dg = (int)bgr[p + 1] - bg[b + 1];
+                    int dr = (int)bgr[p + 2] - bg[b + 2];
+                    int dh = hue - bh;
+                    int diff = (db < 0 ? -db : db) + (dg < 0 ? -dg : dg)
+                             + (dr < 0 ? -dr : dr);
+                    bool block = val < bv - dark_delta
+                        || ((dh < 0 ? -dh : dh) > hue_delta && sat > hue_sat_min)
+                        || sat - bs > sat_delta || bs - sat > pale_delta
+                        || (sat < white_sat_max && val > white_val_min)
+                        || diff > color_delta
+                        || (bright_delta > 0 && val - bv > bright_delta && sat <= bs);
+                    bool piece = ((sat > piece_sat_min && val < piece_val_max)
+                                  || (val < 110 && sat > 25))
+                                 && hue >= piece_hue_min && hue <= piece_hue_max;
+                    out[i] = piece ? 255 : 0;
+                    out[n + i] = block ? 255 : 0;
+                }
+                ''', "jumpbot_masks", options=("--std=c++11",))
+            if self._gpu_buffers is None or self._gpu_buffers[0] != (h, w):
+                self._gpu_buffers = ((h, w), cp.empty((h, w, 3), cp.uint8),
+                                     cp.empty((h, 3), cp.uint8),
+                                     cp.empty((2, h, w), cp.uint8))
+            _shape, g_bgr, g_bg, g_masks = self._gpu_buffers
+            g_bgr.set(np.ascontiguousarray(frame))
+            g_bg.set(bg_u8.reshape(h, 3))
+            # 与 _canvas_mask 的 Python 切片语义一致，含负数/越界比率。
+            top = int(round(cfg.top_bar_ratio * h))
+            bottom = int(round((1.0 - cfg.bottom_bar_ratio) * h))
+            top, bottom, _step = slice(top, bottom).indices(h)
+            thresholds = tuple(np.float64(x) for x in (
+                cfg.block_color_delta, cfg.block_dark_delta, cfg.block_hue_delta,
+                cfg.block_hue_sat_min, cfg.block_sat_delta, cfg.block_pale_delta,
+                cfg.block_white_sat_max, cfg.block_white_val_min, cfg.block_bright_delta,
+                cfg.piece_sat_min, cfg.piece_val_max, cfg.piece_hue_min, cfg.piece_hue_max))
+            n = h * w
+            self._gpu_kernel(((n + 255) // 256,), (256,),
+                             (g_bgr, g_bg, self._gpu_hsv_tables, g_masks, np.int32(n), np.int32(w),
+                              np.int32(top), np.int32(bottom), *thresholds))
+            masks = g_masks.get()                # 当前流阻塞下载；无需额外全局同步
+            return masks[0], masks[1]
         except Exception as exc:
             log(f"GPU 掩码计算出错，回退 CPU：{exc}")
             self._gpu_state = False
+            self._gpu_buffers = None
+            return None
+
+    def _init_opencl(self) -> bool:
+        """可选 OpenCL 1.2 后端；无库/驱动/合格设备时保持 CPU 可用。"""
+        if not self.cfg.opencl_enabled or os.environ.get("JUMPBOT_DISABLE_OPENCL") == "1":
+            self._cl_state = False
+            return False
+        if self._cl_state is not None:
+            return self._cl_state
+        self._cl_state = False
+        try:
+            import pyopencl as cl
+            self._cl = cl
+            devices = []
+            for platform in cl.get_platforms():
+                try:
+                    devices.extend(platform.get_devices(device_type=cl.device_type.GPU))
+                except cl.Error:
+                    continue
+            selector = self.cfg.opencl_device.casefold().strip()
+            cache_dir = DEBUG_DIR / "opencl_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            for device in devices:
+                name = f"{device.vendor} {device.name}"
+                if selector and selector not in name.casefold():
+                    continue
+                version = re.search(r"OpenCL (\d+)\.(\d+)", device.version)
+                if (not device.available or not device.compiler_available or version is None
+                        or tuple(map(int, version.groups())) < (1, 2)):
+                    continue
+                key = device.int_ptr
+                if key in _OPENCL_FAILED:
+                    continue
+                try:
+                    # 某些驱动的首次编译会直接终止进程（无法由 try/except 捕获）。
+                    # 先在禁输入子进程预热并核对；失败/超时仅禁用该设备。
+                    if key not in _OPENCL_CHECKED and os.environ.get("JUMPBOT_OPENCL_PROBE") != "1":
+                        cmd = [sys.executable]
+                        if not _is_frozen():
+                            cmd.append(str(Path(__file__).resolve()))
+                        cmd += ["--_opencl-check", device.name]
+                        env = dict(os.environ, JUMPBOT_NO_INPUT="1", JUMPBOT_DISABLE_CUDA="1",
+                                   JUMPBOT_OPENCL_PROBE="1")
+                        check = subprocess.run(cmd, env=env, capture_output=True, timeout=20,
+                                               encoding="utf-8", errors="replace",
+                                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                        if check.returncode != 0:
+                            raise RuntimeError(f"隔离自检退出码 {check.returncode}；"
+                                               f"{(check.stdout + check.stderr)[-500:]}")
+                        _OPENCL_CHECKED.add(key)
+                    if key not in _OPENCL_RUNTIMES:
+                        context = cl.Context(devices=[device])
+                        # 整数阈值：不要求 fp64、CUDA Toolkit 或某个显卡厂商扩展。
+                        source = r'''
+                        // OpenCV RGB2HSV_b adaptation; Apache-2.0 (THIRD_PARTY_NOTICES.md).
+                        typedef struct { int h; int s; int v; } Hsv;
+                        inline Hsv jumpbot_bgr_hsv(__global const uchar* p,
+                                                  __constant const int* tables)
+                        {
+                            int b = p[0], g = p[1], r = p[2];
+                            Hsv hsv;
+                            hsv.v = max(b, max(g, r));
+                            int delta = hsv.v - min(b, min(g, r));
+                            hsv.s = (delta * tables[hsv.v] + 2048) >> 12;
+                            int hue = hsv.v == r ? g - b
+                                : hsv.v == g ? b - r + 2 * delta : r - g + 4 * delta;
+                            hue = (hue * tables[256 + delta] + 2048) >> 12;
+                            hsv.h = hue < 0 ? hue + 180 : hue;
+                            return hsv;
+                        }
+                        __kernel void jumpbot_masks(__global const uchar* bgr,
+                            __global const uchar* bg, __constant const int* tables,
+                            __constant const int* t, __global uchar* out,
+                            int n, int width, int top, int bottom)
+                        {
+                            int i = get_global_id(0);
+                            if (i >= n) return;
+                            int row = i / width;
+                            if (row < top || row >= bottom) {
+                                out[i] = out[n + i] = 0;
+                                return;
+                            }
+                            int p = 3 * i, b = 3 * row;
+                            Hsv c = jumpbot_bgr_hsv(bgr + p, tables);
+                            Hsv base = jumpbot_bgr_hsv(bg + b, tables);
+                            int db = (int)bgr[p] - bg[b];
+                            int dg = (int)bgr[p + 1] - bg[b + 1];
+                            int dr = (int)bgr[p + 2] - bg[b + 2];
+                            int diff = abs(db) + abs(dg) + abs(dr);
+                            int dh = c.h - base.h;
+                            int block = base.v - c.v > t[1]
+                                || (abs(dh) > t[2] && c.s > t[3])
+                                || c.s - base.s > t[4] || base.s - c.s > t[5]
+                                || (c.s < t[6] && c.v > t[7]) || diff > t[0]
+                                || (t[13] && c.v - base.v > t[8] && c.s <= base.s);
+                            int piece = ((c.s > t[9] && c.v < t[10])
+                                         || (c.v < 110 && c.s > 25))
+                                        && c.h >= t[11] && c.h <= t[12];
+                            out[i] = piece ? 255 : 0;
+                            out[n + i] = block ? 255 : 0;
+                        }
+                        '''
+                        program = cl.Program(context, source).build(
+                            options=["-cl-std=CL1.2"], cache_dir=str(cache_dir))
+                        divisors = np.arange(1, 256, dtype=np.float64)
+                        tables = np.zeros((2, 256), np.int32)
+                        tables[0, 1:] = np.rint((255 << 12) / divisors).astype(np.int32)
+                        tables[1, 1:] = np.rint((180 << 12) / (6 * divisors)).astype(np.int32)
+                        table_buffer = cl.Buffer(context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                                                 hostbuf=tables)
+                        _OPENCL_RUNTIMES[key] = (context, program, table_buffer, name, source)
+                    context, program, tables, name, source = _OPENCL_RUNTIMES[key]
+                    runtime = {"key": key, "context": context, "program": program,
+                               "queue": cl.CommandQueue(context),
+                               "kernel": cl.Kernel(program, "jumpbot_masks"),
+                               "tables": tables, "name": name, "source": source}
+                    self._cl_candidates.append(runtime)
+                except Exception as exc:
+                    _OPENCL_FAILED.add(key)
+                    log(f"OpenCL 设备 {name} 不可用，跳过：{exc}")
+            self._cl_state = bool(self._cl_candidates)
+            if not self._cl_state:
+                log("OpenCL 未找到可用 GPU，回退 CPU")
+        except Exception as exc:
+            log(f"OpenCL 后端不可用，回退 CPU：{exc}")
+        return self._cl_state
+
+    def _run_opencl(self, runtime: dict, frame: np.ndarray):
+        cl, cfg = self._cl, self.cfg
+        h, w = frame.shape[:2]
+        bg = np.clip(estimate_background_rows(frame), 0, 255).astype(np.uint8)
+        # 左侧都是整数，>t 等价于 >floor(t)，<t 等价于 <ceil(t)。
+        # 这样也兼容小数配置，内核不需要双精度浮点扩展。
+        t = np.array((math.floor(cfg.block_color_delta), math.floor(cfg.block_dark_delta),
+                      math.floor(cfg.block_hue_delta), math.floor(cfg.block_hue_sat_min),
+                      math.floor(cfg.block_sat_delta), math.floor(cfg.block_pale_delta),
+                      math.ceil(cfg.block_white_sat_max), math.floor(cfg.block_white_val_min),
+                      math.floor(cfg.block_bright_delta), math.floor(cfg.piece_sat_min),
+                      math.ceil(cfg.piece_val_max), math.ceil(cfg.piece_hue_min),
+                      math.floor(cfg.piece_hue_max), int(cfg.block_bright_delta > 0)), dtype=np.int32)
+        key, context, queue = runtime["key"], runtime["context"], runtime["queue"]
+        buffers = self._cl_buffers.get(key)
+        if buffers is None or buffers[0] != (h, w):
+            mf = cl.mem_flags
+            buffers = ((h, w), cl.Buffer(context, mf.READ_ONLY, size=h*w*3),
+                       cl.Buffer(context, mf.READ_ONLY, size=h*3),
+                       cl.Buffer(context, mf.READ_ONLY, size=t.nbytes),
+                       cl.Buffer(context, mf.WRITE_ONLY, size=h*w*2))
+            self._cl_buffers[key] = buffers
+        _shape, bgr_buffer, bg_buffer, t_buffer, out_buffer = buffers
+        # 保留本地引用直到阻塞下载完成；异步上传的输入不会提前释放。
+        bgr = np.ascontiguousarray(frame)
+        cl.enqueue_copy(queue, bgr_buffer, bgr, is_blocking=False)
+        cl.enqueue_copy(queue, bg_buffer, bg, is_blocking=False)
+        cl.enqueue_copy(queue, t_buffer, t, is_blocking=False)
+        top = int(round(cfg.top_bar_ratio * h))
+        bottom = int(round((1 - cfg.bottom_bar_ratio) * h))
+        top, bottom, _step = slice(top, bottom).indices(h)
+        n = h * w
+        runtime["kernel"](queue, (n,), None, bgr_buffer, bg_buffer, runtime["tables"],
+                          t_buffer, out_buffer, np.int32(n), np.int32(w),
+                          np.int32(top), np.int32(bottom))
+        result = np.empty((2, h, w), dtype=np.uint8)
+        cl.enqueue_copy(queue, result, out_buffer, is_blocking=True)
+        return result[0], result[1]
+
+    def _masks_opencl(self, frame: np.ndarray):
+        """对可用 GPU 逐像素核对并实测选卡；每次返回独立的 CPU 结果。"""
+        if not self._init_opencl():
+            return None
+        try:
+            if self._cl_runtime is None:
+                expected = self._masks_simd(frame)
+                candidates = []
+                for runtime in self._cl_candidates:
+                    try:
+                        got = self._run_opencl(runtime, frame)
+                        if any(not np.array_equal(a, b) for a, b in zip(expected, got)):
+                            raise ValueError("OpenCL 输出与 CPU 逐像素核对失败")
+                        samples = []
+                        for _ in range(3):
+                            t0 = time.perf_counter()
+                            self._run_opencl(runtime, frame)
+                            samples.append(time.perf_counter() - t0)
+                        candidates.append((sorted(samples)[1], runtime))
+                    except Exception as exc:
+                        self._cl_buffers.pop(runtime["key"], None)
+                        log(f"OpenCL 设备 {runtime['name']} 执行失败，跳过：{exc}")
+                if not candidates:
+                    self._cl_state = False
+                    return None
+                _ms, self._cl_runtime = min(candidates, key=lambda x: x[0])
+                chosen = self._cl_runtime["key"]
+                self._cl_buffers = {chosen: self._cl_buffers[chosen]}
+                log(f"OpenCL 掩码设备：{self._cl_runtime['name']}")
+            return self._run_opencl(self._cl_runtime, frame)
+        except Exception as exc:
+            log(f"OpenCL 掩码计算出错，回退 CPU：{exc}")
+            self._cl_state = False
+            self._cl_buffers.clear()
             return None
 
     def _masks_simd(self, frame: np.ndarray):
@@ -1392,13 +1715,17 @@ class Vision:
         """
         cfg = self.cfg
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        # 连续通道避免每次 cv2 算子重新复制 strided 的 HSV 子视图。
+        hue, sat, val = cv2.split(hsv)
 
         bg = estimate_background_rows(frame)
         bg_u8 = np.clip(bg, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
         bg_full = np.ascontiguousarray(np.broadcast_to(bg_u8, frame.shape))
-        bg_hsv = cv2.cvtColor(bg_full, cv2.COLOR_BGR2HSV)
-        bg_h, bg_s, bg_v = bg_hsv[:, :, 0], bg_hsv[:, :, 1], bg_hsv[:, :, 2]
+        # 背景每行同色：只转换 h 个像素，避免转换整张展开的背景。
+        bg_row_hsv = cv2.cvtColor(bg_u8, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+        bg_h, bg_s, bg_v = (np.ascontiguousarray(np.broadcast_to(bg_row_hsv[:, c:c+1],
+                                                               frame.shape[:2]))
+                          for c in range(3))
 
         # darker: val < bg_v - delta
         darker = cv2.compare(val, cv2.subtract(bg_v, cfg.block_dark_delta),
@@ -1423,7 +1750,7 @@ class Vision:
                 cv2.compare(sat, bg_s, cv2.CMP_LE),
             )
         else:
-            bright = np.zeros_like(darker)
+            bright = None
 
         diff = cv2.absdiff(frame, bg_full)
         ch_b, ch_g, ch_r = cv2.split(diff)
@@ -1434,7 +1761,8 @@ class Vision:
         canvas = self._canvas_mask(frame)
         block_mask = darker
         for extra in (hue_diff, sat_vivid, sat_pale, pure_white, bright, color_far):
-            cv2.bitwise_or(block_mask, extra, dst=block_mask)
+            if extra is not None:
+                cv2.bitwise_or(block_mask, extra, dst=block_mask)
         cv2.bitwise_and(block_mask, canvas, dst=block_mask)
 
         piece_mask = cv2.bitwise_or(
@@ -1480,12 +1808,20 @@ class Vision:
         return self._masks_impl(backend, frame)
 
     def _masks_impl(self, backend: str, frame: np.ndarray):
-        if backend == "gpu":
-            gpu = self._masks_gpu(frame)
+        if backend in ("gpu", "cuda", "opencl"):
+            gpu = self._masks_opencl(frame) if backend == "opencl" else self._masks_gpu(frame)
             if gpu is not None:
+                self._last_mask_backend = "opencl" if backend == "opencl" else "gpu"
                 return gpu
-        if self.cfg.masks_simd:
+            if self.cfg.masks_backend == "auto":
+                self._auto_backend = "simd" if self.cfg.masks_simd else "cpu"
+                self._gpu_ms_buf = []
+            status_write(mask_backend="simd" if self.cfg.masks_simd else "cpu",
+                         mask_bench_ms=f"{backend} 不可用，已回退 CPU")
+        if backend != "cpu" and self.cfg.masks_simd:
+            self._last_mask_backend = "simd"
             return self._masks_simd(frame)
+        self._last_mask_backend = "cpu"
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         sat = hsv[:, :, 1]
         val = hsv[:, :, 2]
@@ -2044,13 +2380,17 @@ class WindowGoneError(RuntimeError):
     """目标窗口暂时找不到（可能是被关掉或最小化到托盘）。"""
 
 
-def resolve_window(cfg: Config, wait_s: float = 0.0) -> WindowInfo:
+def resolve_window(cfg: Config, wait_s: float = 0.0, draining: bool = False) -> WindowInfo:
     """查找目标窗口；wait_s > 0 时会在窗口暂时消失期间等待它回来。"""
     deadline = time.time() + max(wait_s, 0.0)
     logged = False
     wait_start = time.time()
     next_report = wait_start + 5.0
     while True:
+        if not draining:
+            control_check()
+        elif poll_stop_key():
+            raise ControlInterrupted("用户停止")
         windows = find_windows(cfg.window_title_pattern, cfg.window_exe_hint)
         if windows:
             if len(windows) > 1:
@@ -2058,6 +2398,8 @@ def resolve_window(cfg: Config, wait_s: float = 0.0) -> WindowInfo:
                 for wi in windows:
                     log("  - " + wi.describe())
             return windows[0]
+        if draining and _CONTROL is not None and _CONTROL.pause_requested:
+            raise WindowGoneError("暂停收尾期间窗口消失（不等待、不判死亡）")
         if time.time() >= deadline:
             raise WindowGoneError(
                 f"未找到标题匹配 {cfg.window_title_pattern!r} 的窗口。"
@@ -2074,7 +2416,7 @@ def resolve_window(cfg: Config, wait_s: float = 0.0) -> WindowInfo:
             status_write(state="waiting_window", game_state=None, alive=True,
                          waited_s=waited, stop_reason="正在等待游戏窗口")
             next_report = time.time() + 5.0
-        time.sleep(0.5)
+        cooperative_sleep(0.5, draining=draining)
 
 
 SWP_NOZORDER = 0x0004
@@ -2092,6 +2434,7 @@ def ensure_window_size(win: WindowInfo, cfg: Config) -> WindowInfo:
     做法：按"外框 = 客户区 + 边框"换算后调 SetWindowPos，迭代收敛到精确尺寸
     （不能靠用户拖边框，差几个像素阈值照样对不上）。policy=warn 只提示不改，off 不管。
     """
+    control_check()
     try:
         policy = str(getattr(cfg, "window_size_policy", "auto")).lower()
         if policy == "off":
@@ -2109,6 +2452,7 @@ def ensure_window_size(win: WindowInfo, cfg: Config) -> WindowInfo:
         hwnd = wintypes.HWND(win.hwnd)
         before = (win.width, win.height)
         for _ in range(4):
+            control_check()
             wr = wintypes.RECT()
             cr = wintypes.RECT()
             if not user32.GetWindowRect(hwnd, ctypes.byref(wr)):
@@ -2122,7 +2466,7 @@ def ensure_window_size(win: WindowInfo, cfg: Config) -> WindowInfo:
             user32.SetWindowPos(hwnd, None, wr.left, wr.top,
                                 ow + (tw - cw), oh + (th - ch),
                                 SWP_NOZORDER | SWP_NOACTIVATE)
-            time.sleep(0.25)
+            cooperative_sleep(0.25)
         new = resolve_window(cfg, 0.5)
         after = (new.width, new.height)
         if after != before:
@@ -2134,6 +2478,8 @@ def ensure_window_size(win: WindowInfo, cfg: Config) -> WindowInfo:
         status_write(window={"hwnd": new.hwnd, "pid": new.pid, "title": new.title,
                              "client": list(new.client_rect)})
         return new
+    except ControlInterrupted:
+        raise
     except Exception as exc:
         # 尺寸守卫绝不能把主流程搞挂：出问题就按原窗口继续
         log(f"窗口尺寸校正失败（忽略，按当前尺寸继续）：{exc}")
@@ -2173,15 +2519,16 @@ def selftest(args) -> int:
     cv2.rectangle(frame, (150, 600), (330, 760), (90, 120, 95), -1)     # 假方块
     cv2.rectangle(frame, (250, 430), (420, 560), (235, 235, 235), -1)   # 假白块
     cv2.circle(frame, (280, 520), 12, (60, 45, 40), -1)                  # 假棋子
-    bench = {}
-    for backend in ("cpu", "simd", "gpu"):
+    bench, outputs, actual = {}, {}, {}
+    for backend in ("cpu", "simd", "gpu", "opencl"):
         c = Config(**{**cfg.__dict__, "masks_backend": backend, "masks_simd": backend != "cpu"})
         v = Vision(c)
         v.masks(frame)          # 预热：GPU 首次调用要建上下文 + JIT 编译内核（约 1 秒）
         t0 = time.perf_counter()
         for _ in range(10):
-            v.masks(frame)
+            outputs[backend] = v.masks(frame)
         bench[backend] = (time.perf_counter() - t0) / 10 * 1000
+        actual[backend] = v._last_mask_backend
     # auto：启动时真正走的路径 → 报出它会选谁（GPU 被别人占用时会选 simd）
     c_auto = Config(**{**cfg.__dict__, "masks_backend": "auto"})
     v_auto = Vision(c_auto)
@@ -2191,17 +2538,22 @@ def selftest(args) -> int:
         v_auto.masks(frame)
     auto_ms = (time.perf_counter() - t0) / 10 * 1000
     log(f"auto 后端：选择 {v_auto._auto_backend}，实测 {auto_ms:.2f} ms")
-    cpu_m, sim_m, gpu_m = bench["cpu"], bench["simd"], bench["gpu"]
-    log(f"masks 计时（合成帧）：cpu {cpu_m:.2f}ms / simd {sim_m:.2f}ms / gpu {gpu_m:.2f}ms")
+    details = []
+    ps, bs = outputs["simd"]
+    for backend in ("cpu", "simd", "gpu", "opencl"):
+        label = f"{bench[backend]:.2f}ms"
+        if actual[backend] != backend:
+            label = f"不可用（回退 {actual[backend]} {label}）"
+        details.append(f"{backend} {label}")
+        if actual[backend] != backend:
+            continue
+        pg, bg = outputs[backend]
+        diff_p, diff_b = int((ps != pg).sum()), int((bs != bg).sum())
+        log(f"真实 {backend} vs SIMD 掩码差异：piece={diff_p} block={diff_b}（应为 0）")
+        if diff_p or diff_b:
+            ok = False
+    log("masks 计时（合成帧）：" + " / ".join(details))
     c_simd = Config(**{**cfg.__dict__, "masks_backend": "simd", "masks_simd": True})
-    c_gpu = Config(**{**cfg.__dict__, "masks_backend": "gpu"})
-    ps, bs = Vision(c_simd).masks(frame)
-    pg, bg = Vision(c_gpu).masks(frame)
-    diff_p, diff_b = int((ps != pg).sum()), int((bs != bg).sum())
-    log(f"GPU vs SIMD 掩码差异：piece={diff_p} block={diff_b}（应为 0；"
-        f"若 GPU 不可用会自动回退，此时两者必然相同）")
-    if diff_p or diff_b:
-        ok = False
     piece, target, _pm, _bm = Vision(c_simd).detect(frame)
     log(f"detect 链路：piece={'有' if piece else '无'} target={'有' if target else '无'}")
     log("自检结果：" + ("全部通过 ✓" if ok else "有项目未通过 ✗"))
@@ -2491,6 +2843,10 @@ def poll_stop_key() -> bool:
     global _STOP_REQUESTED
     if user32.GetAsyncKeyState(VK_F8) & 0x8000:
         _STOP_REQUESTED = True
+    if _CONTROL is not None:
+        if _STOP_REQUESTED:
+            _CONTROL.stop("用户停止（F8 / q / Esc）")
+        return _CONTROL.stopped
     return _STOP_REQUESTED
 
 
@@ -2523,9 +2879,13 @@ def _console_key_watcher() -> None:
                     return
                 if ch in CONSOLE_STOP_KEYS:
                     _STOP_REQUESTED = True
+                    if _CONTROL is not None:
+                        _CONTROL.stop("用户按控制台停止键")
                     key = {"\x1b": "Esc"}.get(ch, ch)
                     log(f"收到控制台停止键 {key!r}，正在停止（松开鼠标后退出；等价于 F8）…")
                     return
+                if ch in ("p", "P") and _CONTROL is not None:
+                    _CONTROL.toggle("console P")
             time.sleep(0.05)
     except Exception:
         # 没有真正的控制台时 kbhit() 会失败——这不是错误，静默退出即可
@@ -2540,6 +2900,161 @@ def start_console_watcher() -> None:
         thread.start()
     except Exception as exc:
         log(f"控制台按键监听未启动（不影响 F8）：{exc}")
+
+
+def control_check(generation=None) -> None:
+    if _CONTROL is not None:
+        poll_stop_key()
+        _CONTROL.check(generation)
+
+
+def cooperative_sleep(seconds: float, draining: bool = False) -> None:
+    """Interrupt waits, but never shorten an owned mouse hold for a pause."""
+    if _CONTROL is None:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if draining:
+            if poll_stop_key():
+                raise ControlInterrupted("用户停止")
+        else:
+            control_check()
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def active_time() -> float:
+    return _CONTROL.active_time() if _CONTROL is not None else time.monotonic()
+
+
+def control_event(**fields) -> None:
+    """Separate control events: never add non-jump rows to the jump CSV."""
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        fields["timestamp"] = time.time()
+        with (DEBUG_DIR / f"control_{os.getpid()}.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(fields, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def control_ready_window(cfg: Config, initial: bool = False,
+                         timeout_s: float | None = None) -> WindowInfo:
+    """Wait without input, acknowledge pause, then activate/count down freshly."""
+    if _CONTROL is None:
+        return resolve_window(cfg)
+    control = _CONTROL
+    timeout = cfg.startup_wait_s if timeout_s is None else timeout_s
+    wait_start = active_time()
+    deadline = wait_start + timeout if timeout > 0 else None
+    generation = control.generation
+    countdown = None
+    countdown_hwnd = None
+    next_report = 0.0
+    log(f"等待你手动打开微信「跳一跳」；{control.hotkey} 暂停/恢复，F8 / q / Esc 停止")
+    while True:
+        if poll_stop_key():
+            raise ControlInterrupted(control.stop_reason)
+        if control.pause_requested:
+            new_pause = control.paused_at is None
+            control.acknowledge_pause()
+            if new_pause or time.monotonic() >= next_report:
+                status_write(state="paused", alive=True, stop_reason=f"已暂停；{control.hotkey} / 控制台 P 恢复",
+                             countdown_s=None, stuck_s=0)
+                next_report = time.monotonic() + 1.0
+            if new_pause and control.paused_at is not None:
+                log(f"已暂停，鼠标已释放；可以做其他事情。{control.hotkey} / 控制台 P 恢复，F8 停止")
+            control.changed.wait(0.05)
+            control.changed.clear()
+            countdown = None
+            continue
+        if generation != control.generation:
+            generation = control.generation
+            countdown = None
+        candidates = find_windows(cfg.window_title_pattern, cfg.window_exe_hint)
+        if not candidates:
+            countdown = None
+            if deadline is not None and active_time() >= deadline:
+                raise WindowGoneError("等待用户打开「跳一跳」超时")
+            if time.monotonic() >= next_report:
+                status_write(state="waiting_window", alive=True, countdown_s=None,
+                             game_state=None, waited_s=int(active_time() - wait_start),
+                             stop_reason="等待用户手动打开小游戏", startup_wait=initial)
+                next_report = time.monotonic() + 1.0
+            time.sleep(0.05)
+            continue
+        win = candidates[0]
+        if countdown is None or countdown_hwnd != win.hwnd:
+            try:
+                control.check(generation)
+                win = ensure_window_size(win, cfg)
+                if not force_foreground(win.hwnd):
+                    status_write(state="waiting_window", alive=True,
+                                 stop_reason="游戏窗口不能切回前台，等待重试")
+                    time.sleep(0.1)
+                    continue
+            except ControlInterrupted:
+                continue
+            countdown_hwnd = win.hwnd
+            countdown = time.monotonic() + cfg.start_delay_s
+            log(f"游戏窗口已就绪：{cfg.start_delay_s:g} 秒后开跑（{control.hotkey} 暂停，F8 取消）")
+        if foreground_hwnd() != win.hwnd:
+            countdown = None
+            time.sleep(0.05)
+            continue
+        remaining = max(0.0, countdown - time.monotonic())
+        status_write(state="countdown" if initial else "resuming", alive=True,
+                     countdown_s=round(remaining, 1), stop_reason="倒计时后重新识别画面",
+                     window={"hwnd": win.hwnd, "pid": win.pid, "title": win.title,
+                             "client": list(win.client_rect)})
+        if remaining <= 0:
+            try:
+                control.finish_resume(generation)
+                return win
+            except ControlInterrupted:
+                countdown = None
+                continue
+        time.sleep(0.05)
+
+
+def control_checkpoint(cfg: Config, vision: Vision | None = None) -> bool:
+    if _CONTROL is None:
+        return False
+    if poll_stop_key():
+        raise ControlInterrupted(_CONTROL.stop_reason)
+    if _CONTROL.needs_resume:
+        control_ready_window(cfg)
+        if vision is not None:
+            vision.reset_prior()
+        return True
+    return False
+
+
+def hud_center_hit(record) -> int | None:
+    """Only the recorded HUD decision is hit truth; geometry is diagnostic."""
+    if record.result == "landed":
+        if "[center x" in record.note:
+            return 1
+        if "[miss]" in record.note:
+            return 0
+    return None
+
+
+def accuracy_fields(records) -> dict:
+    def count(rows):
+        landed = sum(r.result == "landed" for r in rows)
+        labels = [hud_center_hit(r) for r in rows]
+        hit, miss = labels.count(1), labels.count(0)
+        attempts = sum(r.result != "stopped" for r in rows)
+        dead = sum(r.result in ("dead", "died") for r in rows)
+        return dict(attempts=attempts, landed=landed, hits=hit, misses=miss,
+                    unknown=max(0, attempts - hit - miss - dead), judged=hit + miss,
+                    hit_rate=100.0 * hit / (hit + miss) if hit + miss else None,
+                    landing_rate=100.0 * landed / attempts if attempts else None,
+                    judgement_coverage=100.0 * (hit + miss) / attempts if attempts else None)
+    result = count(records)
+    result["recent100"] = count(list(records)[-100:])
+    return result
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -2665,8 +3180,20 @@ def wait_landing(cap: Capturer, win: WindowInfo, vision: Vision, cfg: Config,
         # 窗口在跳跃过程中基本不动，改成每 5 次解析一次；万一窗口真的移动了，
         # 抓帧区域会偏，识别失败 → 下一轮立即重新解析（自愈，不会累积错误）。
         if win is None or poll_i % 5 == 0:
-            win = resolve_window(cfg, cfg.window_wait_s)
+            if _CONTROL is not None:
+                try:
+                    win = resolve_window(cfg, 0 if _CONTROL.pause_requested else cfg.window_wait_s,
+                                         draining=True)
+                except WindowGoneError:
+                    if _CONTROL.pause_requested:
+                        return "pause_unknown", None, None, None, None
+                    raise
+            else:
+                win = resolve_window(cfg, cfg.window_wait_s)
         poll_i += 1
+        if (_CONTROL is not None and _CONTROL.pause_requested
+                and foreground_hwnd() != win.hwnd):
+            return "pause_unknown", None, None, None, None
         frame = cap.grab(win)
         small = _small_gray(frame, cfg)
         diff = frame_diff(last_small, small)
@@ -2813,6 +3340,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
     for attempt in range(limit):
         if poll_stop_key():
             return None
+        control_check()
         win = resolve_window(cfg, cfg.window_wait_s)
         if foreground and foreground_hwnd() != win.hwnd:
             force_foreground(win.hwnd)
@@ -2830,7 +3358,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
             if state is not None:
                 state["fresh"] = True
             prev_center = None
-            time.sleep(1.4)
+            cooperative_sleep(1.4)
             continue
         if is_blocking_modal(frame, cfg):
             status_write(game_state="blocked_modal", state="acquiring")
@@ -2838,7 +3366,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
                 log("检测到遮挡弹窗（深色面板），点击返回键关闭")
             ctrl.click(win, cfg.modal_dismiss_point[0], cfg.modal_dismiss_point[1])
             prev_center = None
-            time.sleep(1.0)
+            cooperative_sleep(1.0)
             continue
 
         piece, target, _piece_mask, block_mask = vision.detect(frame)
@@ -2851,7 +3379,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
                 log(f"识别仍失败（已重试 {attempt} 次，{fail_note}），继续等待…")
             prev_center = None
             vision.reset_prior()   # 连续失败时清掉先验，避免一直锁定在同一个错误位置
-            time.sleep(0.30)
+            cooperative_sleep(0.30)
             continue
 
         center = (target.x, target.y)
@@ -2861,7 +3389,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
             return win, frame, piece, target, block_mask
         # 首帧只作为一致性基准，再抓一帧确认
         prev_center = center
-        time.sleep(cfg.acquire_poll_ms / 1000.0)
+        cooperative_sleep(cfg.acquire_poll_ms / 1000.0)
     # 重试用尽：把现场帧存下来，便于事后定位是哪种场景识别不了
     if last_frame is not None:
         try:
@@ -2895,6 +3423,7 @@ def ensure_playing(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputContro
     """
     blind_attempts = 0
     for attempt in range(8):
+        control_check()
         win = resolve_window(cfg)
         if foreground and foreground_hwnd() != win.hwnd:
             force_foreground(win.hwnd)
@@ -2905,7 +3434,7 @@ def ensure_playing(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputContro
             if verbose:
                 log(f"检测到界面按钮 {name}（相似度 {score:.2f}），点击 {cx:.0f},{cy:.0f}")
             ctrl.click(win, cx / win.width, cy / win.height)
-            time.sleep(1.4)
+            cooperative_sleep(1.4)
             if state is not None:
                 state["fresh"] = True
             continue
@@ -2916,20 +3445,20 @@ def ensure_playing(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputContro
                 log(f"已进入可玩状态（第 {attempt + 1} 次尝试）")
             return win
         if not allow_fallback_click:
-            time.sleep(0.4)
+            cooperative_sleep(0.4)
             continue
         if piece is not None:
             # 棋子认出来了（说明可能还在游戏中），只等不点。
-            time.sleep(0.5)
+            cooperative_sleep(0.5)
             continue
         blind_attempts += 1
         if blind_attempts < 2:
-            time.sleep(0.5)
+            cooperative_sleep(0.5)
             continue
         if verbose:
             log(f"连续 {blind_attempts} 帧既无棋子也无目标，按“再玩一局”兜底坐标点击一次")
         ctrl.click(win, cfg.restart_point[0], cfg.restart_point[1])
-        time.sleep(1.3)
+        cooperative_sleep(1.3)
     return None
 
 
@@ -3156,6 +3685,9 @@ def play(args) -> int:
             "k": args.k,
             "gamma": args.gamma,
             "max_jumps": args.max_jumps,
+            "pause_hotkey": getattr(args, "pause_hotkey", None),
+            "startup_wait_s": getattr(args, "startup_wait_s", None),
+            "start_delay_s": getattr(args, "start_delay_s", None),
         },
     )
     if args.no_adaptive:
@@ -3196,7 +3728,8 @@ def play(args) -> int:
                   "k_after", "error_px", "result", "score", "note",
                   "achieved_px", "center_hit",
                   "t_acquire_ms", "t_landing_ms", "t_score_ms", "t_loop_ms",
-                  "err_src", "err_dot_px", "aim_dot", "bias_pct"]
+                  "err_src", "err_dot_px", "aim_dot", "bias_pct",
+                  "mask_backend", "pause_total_s", "active_elapsed_s", "pixel_center_hit"]
 
     def open_csv() -> None:
         nonlocal csv_file, csv_writer
@@ -3217,13 +3750,17 @@ def play(args) -> int:
             "" if record.error_px is None else f"{record.error_px:.1f}",
             record.result, "" if record.score is None else record.score, record.note,
             ("" if record.error_px is None else f"{record.dist_px + record.error_px:.1f}"),
-            ("" if record.error_px is None else int(abs(record.error_px) < 12.0)),
+            "" if hud_center_hit(record) is None else hud_center_hit(record),
             f"{record.t_acquire_ms:.0f}", f"{record.t_landing_ms:.0f}",
             f"{record.t_score_ms:.0f}", f"{record.t_loop_ms:.0f}",
             record.err_src,
             "" if record.err_dot_px is None else f"{record.err_dot_px:.1f}",
             record.aim_dot,
             f"{record.bias_pct:g}",
+            vision._auto_backend if cfg.masks_backend == "auto" else cfg.masks_backend,
+            _CONTROL.snapshot()["pause_total_s"] if _CONTROL is not None else 0,
+            round(active_time() - started, 3),
+            "" if record.error_px is None else int(abs(record.error_px) < cfg.center_hit_tolerance_px),
         ])
         csv_file.flush()
 
@@ -3266,17 +3803,25 @@ def play(args) -> int:
             bias_levels = [0.0]
         log(f"偏置扫描已启用：档位 {bias_levels}（百分比，相对沿轴距离），"
             f"每档 {args.bias_per_level} 跳；判据用分数（像素级误差测量已证伪）")
-    started = time.time()
+    started = active_time()
     stop_reason = "达到最大跳跃次数"
 
     try:
-        win = resolve_window(cfg)
-        win = ensure_window_size(win, cfg)
-        log("目标窗口：" + win.describe())
-        if foreground:
-            ok = force_foreground(win.hwnd)
-            log(f"切前台：{'成功' if ok else '失败'}")
-        win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
+        while True:
+            win = control_ready_window(cfg, initial=True,
+                                       timeout_s=getattr(args, "_next_startup_wait_s", None))
+            try:
+                if _CONTROL is not None:
+                    ctrl.expected_generation = _CONTROL.generation
+                log("目标窗口：" + win.describe())
+                # control_ready_window has already sized/activated/count-downed
+                # the window. Do not repeat foreground operations at startup.
+                win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
+                break
+            except ControlInterrupted:
+                if poll_stop_key():
+                    raise
+                vision.reset_prior()
         if win is None:
             log("无法进入可玩状态：请确认游戏窗口可见且没有被遮挡。")
             _LAST_STOP_REASON = "无法进入可玩状态"
@@ -3298,461 +3843,528 @@ def play(args) -> int:
             f"重试上限={cfg.detect_retry_limit}")
 
         index = 0
-        last_progress_ts = time.time()
+        started = active_time()
+        last_progress_ts = active_time()
         next_stall_warn = last_progress_ts + 90.0
         while index < cfg.max_jumps:
-            # 卡死看门狗：跳跃是 2~3 秒一次，超过 90 秒没有任何一跳完成，
-            # 说明卡在某个等待里（窗口消失/被遮挡/识别不出来）。这里定期把
-            # 现场写进日志和状态面板，避免"看起来莫名冻住"。
-            if time.time() > next_stall_warn:
-                gap = int(time.time() - last_progress_ts)
-                log(f"警告：已 {gap} 秒没有完成一次跳跃（当前 {index} 跳）；"
-                    f"若长时间无变化请按 F8 停止并检查窗口是否被遮挡/关闭")
-                status_write(stuck_s=gap, stop_reason=f"已 {gap} 秒无进展（Watchdog）")
-                next_stall_warn = time.time() + 90.0
-            if time.time() - started > cfg.max_runtime_s:
-                stop_reason = "达到最长运行时间"
-                break
-            if f8_pressed():
-                stop_reason = "按下 F8 手动停止"
-                break
-            win = resolve_window(cfg, cfg.window_wait_s)
-            # 每跳前守卫：用户在跑的过程中把窗口拖小了，这里当场调回去（不会在飞行途中动窗口）
-            win = ensure_window_size(win, cfg)
-            if foreground and foreground_hwnd() != win.hwnd:
-                if not force_foreground(win.hwnd):
-                    log("窗口失去前台且无法切回，停止。")
-                    stop_reason = "窗口被其他程序抢占前台"
+            try:
+                in_flight = False
+                restart_after_record = False
+                if control_checkpoint(cfg, vision):
+                    prev_score = None
+                    score_streak = 0
+                    stall_count = blind_jumps = skip_count = 0
+                    last_progress_ts = active_time()
+                    next_stall_warn = last_progress_ts + 90.0
+                if _CONTROL is not None:
+                    ctrl.expected_generation = _CONTROL.generation
+                # 卡死看门狗：跳跃是 2~3 秒一次，超过 90 秒没有任何一跳完成，
+                # 说明卡在某个等待里（窗口消失/被遮挡/识别不出来）。这里定期把
+                # 现场写进日志和状态面板，避免"看起来莫名冻住"。
+                if active_time() > next_stall_warn:
+                    gap = int(active_time() - last_progress_ts)
+                    log(f"警告：已 {gap} 秒没有完成一次跳跃（当前 {index} 跳）；"
+                        f"若长时间无变化请按 F8 停止并检查窗口是否被遮挡/关闭")
+                    status_write(stuck_s=gap, stop_reason=f"已 {gap} 秒无进展（Watchdog）")
+                    next_stall_warn = active_time() + 90.0
+                if active_time() - started > cfg.max_runtime_s:
+                    stop_reason = "达到最长运行时间"
                     break
-            status_write(state="acquiring",
-                         window={"hwnd": win.hwnd, "pid": win.pid, "title": win.title,
-                                 "client": list(win.client_rect)})
-            t_iter_start = time.perf_counter()
-            aim_dot_flag = 0          # 本跳瞄点是否用了游戏中心白点（写进 CSV 的 aim_dot）
-            acquired = acquire_frame(cap, cfg, vision, ctrl, foreground, run_state)
-            t_acquire_ms = (time.perf_counter() - t_iter_start) * 1000.0
-            if acquired is None:
-                # 先确认不是用户按了 F8：acquire_frame 里 poll_stop_key() 命中时也返回 None，
-                # 早期版本会把它当成"识别失败"继续盲跳一次——等于急停之后又补按了一下鼠标。
                 if f8_pressed():
                     stop_reason = "按下 F8 手动停止"
                     break
-                # 有界盲跳：识别彻底失败时，用“上次成功的按压时长”盲跳一次推进局面。
-                # 死亡可以自动重开，而整轮停止会丢掉后续所有进度——所以盲跳比停下更优。
-                blind_jumps += 1
-                if blind_jumps <= cfg.blind_jump_limit:
-                    hold_ms = last_good_hold_ms if last_good_hold_ms > 0 else k * 270.0
-                    hold_ms = clamp(hold_ms, cfg.press_duration_min_ms, cfg.press_duration_max_ms)
-                    log(f"识别连续失败，执行第 {blind_jumps}/{cfg.blind_jump_limit} 次盲跳"
-                        f"（按压 {hold_ms:.0f}ms，用上次成功值）")
-                    if foreground:
-                        px = int(win.client_rect[0] + cfg.press_point[0] * win.width)
-                        py = int(win.client_rect[1] + cfg.press_point[1] * win.height)
-                        if not point_is_window(win.hwnd, px, py):
-                            log("按压点被遮挡，跳过盲跳")
-                            time.sleep(1.5)
-                            continue
-                    ctrl.press(win, cfg.press_point[0], cfg.press_point[1], hold_ms / 1000.0)
-                    vision.reset_prior()
-                    time.sleep(0.4)
-                    continue
-                stop_reason = "连续识别失败且盲跳用尽（安全策略：停止）"
-                log(stop_reason)
-                break
-            win, frame, piece, target, block_mask = acquired
-            blind_jumps = 0
-            if target.dot is not None:
-                # 每个跳跃只打一条：本跳的瞄点被"游戏自带的中心白点"校正过。
-                aim_dot_flag = 1
-                log(f"#{index + 1} 瞄点用中心白点校正：({target.dot[0]:.0f},{target.dot[1]:.0f})"
-                    f" 面积 {target.dot[2]}")
-
-            # 跳跃方向被游戏锁死为两个等距轴向，按沿轴投影长度算按压时长
-            axis, along, cross = axis_components(
-                target.x - piece.x, target.y - piece.y, cfg.axis_slope
-            )
-            cross_ratio = cross / max(abs(along), 1.0)
-            # find_target 内部已经做了分级放宽（特殊小方块、贴邻/宽方块场景），
-            # 这里只做最后一道“明显不合理才拦”的兜底校验，不要比它更严。
-            min_dist = cfg.min_jump_dist_ratio * win.width * 0.4
-            max_dist = cfg.max_jump_dist_ratio * win.width
-            problem = None
-            if along <= 0:
-                problem = f"沿轴距离非正({along:.0f})"
-            elif not (min_dist <= along <= max_dist):
-                problem = f"沿轴距离异常({along:.0f}px，合理 {min_dist:.0f}~{max_dist:.0f})"
-            elif cross_ratio > cfg.axis_max_cross_ratio + 0.20:
-                problem = f"偏离轴向过大(cross/along={cross_ratio:.2f})"
-            if problem:
-                skip_count += 1
-                log(f"第 {index + 1} 跳校验未通过：{problem}，本次不发按键"
-                    f"（{skip_count}/{cfg.detect_retry_limit}）")
-                if skip_count >= cfg.detect_retry_limit:
-                    stop_reason = "识别结果持续异常（安全策略：未盲按，已停止）"
+                win = resolve_window(cfg, cfg.window_wait_s)
+                # 每跳前守卫：用户在跑的过程中把窗口拖小了，这里当场调回去（不会在飞行途中动窗口）
+                win = ensure_window_size(win, cfg)
+                if foreground and foreground_hwnd() != win.hwnd:
+                    if not force_foreground(win.hwnd):
+                        log("窗口失去前台且无法切回，停止。")
+                        stop_reason = "窗口被其他程序抢占前台"
+                        break
+                status_write(state="acquiring",
+                             window={"hwnd": win.hwnd, "pid": win.pid, "title": win.title,
+                                     "client": list(win.client_rect)})
+                t_iter_start = time.perf_counter()
+                aim_dot_flag = 0          # 本跳瞄点是否用了游戏中心白点（写进 CSV 的 aim_dot）
+                acquired = acquire_frame(cap, cfg, vision, ctrl, foreground, run_state)
+                t_acquire_ms = (time.perf_counter() - t_iter_start) * 1000.0
+                if acquired is None:
+                    # 先确认不是用户按了 F8：acquire_frame 里 poll_stop_key() 命中时也返回 None，
+                    # 早期版本会把它当成"识别失败"继续盲跳一次——等于急停之后又补按了一下鼠标。
+                    if f8_pressed():
+                        stop_reason = "按下 F8 手动停止"
+                        break
+                    # 有界盲跳：识别彻底失败时，用“上次成功的按压时长”盲跳一次推进局面。
+                    # 死亡可以自动重开，而整轮停止会丢掉后续所有进度——所以盲跳比停下更优。
+                    blind_jumps += 1
+                    if blind_jumps <= cfg.blind_jump_limit:
+                        hold_ms = last_good_hold_ms if last_good_hold_ms > 0 else k * 270.0
+                        hold_ms = clamp(hold_ms, cfg.press_duration_min_ms, cfg.press_duration_max_ms)
+                        log(f"识别连续失败，执行第 {blind_jumps}/{cfg.blind_jump_limit} 次盲跳"
+                            f"（按压 {hold_ms:.0f}ms，用上次成功值）")
+                        if foreground:
+                            px = int(win.client_rect[0] + cfg.press_point[0] * win.width)
+                            py = int(win.client_rect[1] + cfg.press_point[1] * win.height)
+                            if not point_is_window(win.hwnd, px, py):
+                                log("按压点被遮挡，跳过盲跳")
+                                time.sleep(1.5)
+                                continue
+                        ctrl.press(win, cfg.press_point[0], cfg.press_point[1], hold_ms / 1000.0)
+                        vision.reset_prior()
+                        time.sleep(0.4)
+                        continue
+                    stop_reason = "连续识别失败且盲跳用尽（安全策略：停止）"
                     log(stop_reason)
                     break
-                time.sleep(0.25)
-                continue
-            skip_count = 0
-            direction = axis
-            dist = along
-            # 粘连块（顶面估计不可信）补偿实验：命中率明显偏低的那一类，按比例缩短按压。
-            if (cfg.low_ratio_trim_ratio > 0 and target.bbox[2] > 0
-                    and target.top_width < cfg.low_ratio_gate * target.bbox[2]):
-                trimmed = dist * (1.0 - cfg.low_ratio_trim_ratio)
-                log(f"粘连块补偿：沿轴 {dist:.0f}px → {trimmed:.0f}px"
-                    f"（-{cfg.low_ratio_trim_ratio * 100:.1f}%）")
-                dist = trimmed
-            if calib_bands:
-                k = calib_bands[band_index][0]
-            # 偏置扫描：把"沿轴距离"乘上 (1+bias/100)。这等价于给按压时长加一个
-            # 与距离成比例的受控偏置——用来测"游戏中心判定区间的中心在哪"，
-            # 而这是唯一能用权威判据（分数）测出系统性偏置的办法（像素级误差
-            # 测量已全部被证伪，见 README「落点误差的'真值'路线破产」）。
-            bias_pct = 0.0
-            if bias_levels:
-                per = max(1, int(args.bias_per_level))
-                bias_pct = bias_levels[(index // per) % len(bias_levels)]
-                dist *= (1.0 + bias_pct / 100.0)
-                if index % per == 0:
-                    log(f"[扫描] 第 {index // per + 1} 段：距离偏置 {bias_pct:+g}%"
-                        f"（每段 {per} 跳，档位 {args.bias_levels}）")
-            k_before = k
-            if cfg.transfer_a > 0.01:
-                hold_ms = (dist - cfg.transfer_c) / cfg.transfer_a
-            else:
-                hold_ms = k * dist + cfg.b
-            hold_ms *= (1.0 + cfg.press_bias_ratio)
-            if cfg.gamma > 0:
-                trim = 1.0 + clamp(-0.3 * err_ema,
-                                   -cfg.residual_trim_ratio, cfg.residual_trim_ratio)
-                hold_ms *= trim
-            hold_ms = clamp(hold_ms, cfg.press_duration_min_ms, cfg.press_duration_max_ms)
-            if args.save_debug:
-                cv2.imwrite(
-                    str(debug_dir / f"jump_{index + 1:03d}_before.png"),
-                    annotate(frame, piece, target, hold_ms, f"#{index + 1} k={k:.3f}"),
+                win, frame, piece, target, block_mask = acquired
+                blind_jumps = 0
+                if target.dot is not None:
+                    # 每个跳跃只打一条：本跳的瞄点被"游戏自带的中心白点"校正过。
+                    aim_dot_flag = 1
+                    log(f"#{index + 1} 瞄点用中心白点校正：({target.dot[0]:.0f},{target.dot[1]:.0f})"
+                        f" 面积 {target.dot[2]}")
+
+                # 跳跃方向被游戏锁死为两个等距轴向，按沿轴投影长度算按压时长
+                axis, along, cross = axis_components(
+                    target.x - piece.x, target.y - piece.y, cfg.axis_slope
                 )
-                cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_raw.png"), frame)
-
-            # 安全闸：确认按压点确实落在游戏窗口上。若被别的窗口（例如微信分享面板）
-            # 盖住，就只等待、绝不按键——实测盲按会点到游戏内分享按钮，弹出的微信分享面板
-            # 无法用点外部的方式关闭，只能人工处理。
-            if foreground:
-                px = int(win.client_rect[0] + cfg.press_point[0] * win.width)
-                py = int(win.client_rect[1] + cfg.press_point[1] * win.height)
-                if not point_is_window(win.hwnd, px, py):
-                    log("按压点被其他窗口遮挡（可能是微信分享面板/弹窗），等待中，不发送按键")
-                    status_write(state="blocked_modal", game_state="blocked_modal",
-                                 stop_reason="按压点被其他窗口遮挡，正在等待（不发送按键）")
-                    time.sleep(1.5)
-                    continue
-            ctrl.press(win, cfg.press_point[0], cfg.press_point[1], hold_ms / 1000.0)
-            status_write(state="landing", last_hold_ms=round(hold_ms),
-                         last_dist_px=round(dist, 1))
-            # 跳跃会大幅改变画面，旧的位置先验必然失效，先清掉再等落地
-            vision.reset_prior()
-            # want_target 只在要存调试图时打开：长跑模式不需要落地方块的目标点，
-            # 省掉每跳一次 find_target（16.5ms）。
-            status, frame2, piece2, target2, block_mask2 = wait_landing(
-                cap, win, vision, cfg, want_target=args.save_debug)
-            t_landing_ms = (time.perf_counter() - t_iter_start) * 1000.0 - t_acquire_ms - hold_ms
-            score = read_score(frame2, cfg) if frame2 is not None else None
-            # 落地的瞬间 HUD 往往还没刷新，直接读会读到上一跳的旧分：
-            # 这会让增量变成两跳之和（表现为 +3 之类怪值），也会让卡死判据误触发。
-            # 因此读到与上次相同就重新抓帧重读几次。
-            # 读不出来（None）同样要重读：实测 2026-10-01 第 3973 跳落地确认超时，
-            # 恰好那几帧 HUD 读数为 None，导致"分数增长"这条最终裁决拿不到证据，
-            # 被误判成死亡（实际游戏一直在得分：130026→130038→130056…）。
-            if prev_score is not None and (score is None or score == prev_score):
-                # 第一次重读只等很短（HUD 通常 100ms 内刷新），后面才用 250ms，
-                # 这样"分数滞后"这个高频情形不会再白等 250ms。
-                for attempt_i in range(3):
-                    time.sleep((cfg.score_reread_first_ms if attempt_i == 0 else 250.0) / 1000.0)
-                    fresh = cap.grab(resolve_window(cfg, cfg.window_wait_s))
-                    reread = read_score(fresh, cfg)
-                    if reread is None:
-                        continue
-                    score = reread
-                    frame2 = fresh
-                    if reread != prev_score:
-                        # 读到与上一跳不同的分数 = HUD 确实刷新了（可能是落地得分，
-                        # 也可能是新一局的低分），可以据此裁决，无需再等。
+                cross_ratio = cross / max(abs(along), 1.0)
+                # find_target 内部已经做了分级放宽（特殊小方块、贴邻/宽方块场景），
+                # 这里只做最后一道“明显不合理才拦”的兜底校验，不要比它更严。
+                min_dist = cfg.min_jump_dist_ratio * win.width * 0.4
+                max_dist = cfg.max_jump_dist_ratio * win.width
+                problem = None
+                if along <= 0:
+                    problem = f"沿轴距离非正({along:.0f})"
+                elif not (min_dist <= along <= max_dist):
+                    problem = f"沿轴距离异常({along:.0f}px，合理 {min_dist:.0f}~{max_dist:.0f})"
+                elif cross_ratio > cfg.axis_max_cross_ratio + 0.20:
+                    problem = f"偏离轴向过大(cross/along={cross_ratio:.2f})"
+                if problem:
+                    skip_count += 1
+                    log(f"第 {index + 1} 跳校验未通过：{problem}，本次不发按键"
+                        f"（{skip_count}/{cfg.detect_retry_limit}）")
+                    if skip_count >= cfg.detect_retry_limit:
+                        stop_reason = "识别结果持续异常（安全策略：未盲按，已停止）"
+                        log(stop_reason)
                         break
-            timestamp = time.strftime("%H:%M:%S")
-            t_score_ms = ((time.perf_counter() - t_iter_start) * 1000.0
-                          - t_acquire_ms - hold_ms - t_landing_ms)
-
-            if status == "stopped":
-                stop_reason = "按下 F8 手动停止"
-                emit(JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
-                                "stopped", None, "F8 急停"))
-                break
-
-            # 落地确认超时 ≠ 死亡：浅色方块（快递箱、便利店屋顶等）与淡背景颜色接近时，
-            # `_foot_on_block` 会因为方块掩码里没有脚下那块而一直判不了落地，2.6s 后超时。
-            # 实测 2026-10-01 #723：判定死亡，但 HUD 分数 19215→19247(+32) 还在继续涨，
-            # 说明棋子明明落在快递箱上拿了中心加分。这里用**分数增长**做最终裁决：
-            # 分数涨了就是落地（只是没测到误差），分数没动才算真死。
-            #
-            # 2026-10-01 13:40 修：原来这里还要求 `piece2 is not None`，于是
-            # "超时那一帧镜头未稳、棋子检测不到，但 0.25s 后重读的分数已经涨了"
-            # 这种情形会被误判死亡 —— 实测 01:33:38 那次：分数 8066→8098(+32，满连击
-            # 中心命中)，CSV 却记 dead，紧接着 #1373 又以同一条命继续跳。
-            # 分数是权威信号，不该被一个辅助的棋子检测挡住。
-            delayed_landing = (
-                status != "landed" and prev_score is not None
-                and score is not None and score > prev_score
-            )
-            if status == "landed" and piece2 is not None or delayed_landing:
-                err = None
-                err_src = ""
-                err_dot = None
-                if delayed_landing:
-                    log(f"#{index + 1} 落地确认超时（{status}），但分数 "
-                        f"{prev_score}→{score} 说明已落地，按落地处理（不判死）")
-                elif cfg.landing_method == "flow" and piece2 is not None:
-                    detail = measure_landing_error_flow(frame, frame2, target, piece2, cfg, direction)
-                    if detail is not None:
-                        err, run_width = detail
-                        err_src = "flow"
-                elif block_mask2 is not None and piece2 is not None:
-                    detail = measure_landing_error(
-                        frame2, block_mask2, piece2, cfg, direction,
-                        expected_width=target.top_width,
-                    )
-                    if detail is not None:
-                        err, run_width, center_x = detail
-                        err_src = "mask"
-                        # 真值校正：落地方块上若有游戏自带的中心白点，直接用它当中心——
-                        # 实测（2026-10-01）掩码法的中心估计在"抬高台面"类方块上会偏
-                        # 20~25px，符号都能反（16 个现场帧：真值均值 +22.6px，掩码法 -3.9px）。
-                        # 这是唯一能让落点误差变成可信信号的办法。
-                        if cfg.center_dot_max_offset_px > 0:
-                            anchor_y = piece2.y + cfg.piece_anchor_dy_ratio * frame2.shape[0]
-                            dot = find_dot_near(frame2, center_x, anchor_y + 18.0,
-                                                cfg.center_dot_landing_radius_px, cfg)
-                            if dot is not None:
-                                ux, uy = direction[0], direction[1]
-                                # 白点值单独记，**不覆盖** err：落地时棋子把白点挡住，
-                                # 实测这批值里约一半与游戏判分矛盾（见 JumpRecord 注释）。
-                                err_dot = (piece2.x - dot[0]) * ux + (anchor_y - dot[1]) * uy
-                # 信号 A（诊断用）：用落点误差预测连击，用于和真实分数对照
-                if err is not None and abs(err) < cfg.center_hit_tolerance_px:
-                    err_streak += 1
-                    predicted_score += 2 * err_streak
+                    time.sleep(0.25)
+                    continue
+                skip_count = 0
+                direction = axis
+                dist = along
+                # 粘连块（顶面估计不可信）补偿实验：命中率明显偏低的那一类，按比例缩短按压。
+                if (cfg.low_ratio_trim_ratio > 0 and target.bbox[2] > 0
+                        and target.top_width < cfg.low_ratio_gate * target.bbox[2]):
+                    trimmed = dist * (1.0 - cfg.low_ratio_trim_ratio)
+                    log(f"粘连块补偿：沿轴 {dist:.0f}px → {trimmed:.0f}px"
+                        f"（-{cfg.low_ratio_trim_ratio * 100:.1f}%）")
+                    dist = trimmed
+                if calib_bands:
+                    k = calib_bands[band_index][0]
+                # 偏置扫描：把"沿轴距离"乘上 (1+bias/100)。这等价于给按压时长加一个
+                # 与距离成比例的受控偏置——用来测"游戏中心判定区间的中心在哪"，
+                # 而这是唯一能用权威判据（分数）测出系统性偏置的办法（像素级误差
+                # 测量已全部被证伪，见 README「落点误差的'真值'路线破产」）。
+                bias_pct = 0.0
+                if bias_levels:
+                    per = max(1, int(args.bias_per_level))
+                    bias_pct = bias_levels[(index // per) % len(bias_levels)]
+                    dist *= (1.0 + bias_pct / 100.0)
+                    if index % per == 0:
+                        log(f"[扫描] 第 {index // per + 1} 段：距离偏置 {bias_pct:+g}%"
+                            f"（每段 {per} 跳，档位 {args.bias_levels}）")
+                k_before = k
+                if cfg.transfer_a > 0.01:
+                    hold_ms = (dist - cfg.transfer_c) / cfg.transfer_a
                 else:
-                    err_streak = 0
-                    predicted_score += 1
-
-                # 信号 B（真值）：读分已实测 19/19 正确。delta==1 → 普通落点；
-                # delta==min(2*连击数,32) → 命中中心；其它 → 不计入统计。
-                #
-                # 抗级联设计（实测过：一次 delta=0 的滞后读数会让连击计数错位，
-                # 之后所有判定全变 unknown）：
-                #   - delta<=0（HUD 未刷新）→ 重读一次，仍为 0 则跳过，且**不重置连击**
-                #   - delta 异常大（HUD 显示错乱）→ 跳过，不重置连击
-                #   - 偶数 delta 但与本跳预期不符（连击计数已错位）→ 由 delta 反推连击数重新同步
-                note_center = "score=n/a"
-                delta_this_jump = None       # 本跳的真实分差（用于卡死判据）
-                if score is not None:
-                    if prev_score is None:
-                        note_center = "score基准"
-                    elif score >= prev_score:
-                        delta = score - prev_score
-                        delta_this_jump = delta
-                        # 实测规律：连击加成为 min(2×连续中心数, 32)，+32 封顶
-                        expect_center = min(2 * (score_streak + 1), cfg.score_bonus_cap)
-                        if delta <= 0 or delta > 200:
-                            score_unknown += 1
-                            note_center = f"读数异常(+{delta})"
-                        elif delta == 1:
-                            score_streak = 0
-                            score_misses += 1
-                            note_center = "miss"
-                        elif delta == expect_center:
-                            score_streak += 1
-                            score_hits += 1
-                            note_center = f"center x{score_streak}"
-                        elif delta >= 4 and delta % 2 == 0 and delta <= cfg.score_bonus_cap:
-                            # 计数错位：由增量反推连击数（偶数增量必为命中）
-                            score_streak = min(delta // 2, cfg.score_bonus_cap // 2)
-                            score_hits += 1
-                            note_center = f"center x{score_streak}(重同步)"
-                        else:
-                            score_unknown += 1
-                            note_center = f"unknown(+{delta})"   # 保连击，避免级联失真
-                    else:
-                        score_streak = 0        # 分数变小 = 换局/重开
-                        note_center = "score重置"
-                    prev_score = score
-                    life_score = score
-                    best_life_score = max(best_life_score, score)
-                    best_score_streak = max(best_score_streak, score_streak)
-                if (args.save_debug and frame2 is not None and err is not None
-                        and run_state["fresh"]):
-                    score_dir = DEBUG_DIR / "score"
-                    score_dir.mkdir(parents=True, exist_ok=True)
-                    roi = crop_score_roi(frame2, cfg)
-                    if roi is not None:
-                        cv2.imwrite(
-                            str(score_dir / f"j{index + 1:03d}_s{predicted_score:04d}.png"), roi
-                        )
-                k_after = k
-                if err is not None and cfg.gamma > 0:
-                    ratio = err / max(dist, 1.0)
-                    if abs(err) < 0.35 * run_width:  # 测量可信才用于调参（过大视为噪声）
-                        # 指数平滑，抑制单帧测量噪声带来的抖动
-                        err_ema = 0.55 * err_ema + 0.45 * ratio
-                        step = clamp(-cfg.gamma * err_ema, -cfg.max_step_ratio, cfg.max_step_ratio)
-                        k_after = clamp(k * (1.0 + step), k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
-                k = k_after
-                last_good_hold_ms = hold_ms
-                alive_in_round += 1
-                if alive_in_round > best_alive:
-                    best_alive = alive_in_round
-                    best_k = k
-                consecutive_deaths = 0
-                note = f"err={err:.1f}px" if err is not None else "err=n/a"
-                note += f" pred={predicted_score}"
-                note += f" score={score} [{note_center}]"
-                # 目标几何写进备注：事后用它按“方块类型/大小”关联真实命中率，
-                # 不需要保存每一帧图（落点误差测量已证明与真值几乎无关，只有分数可信）。
-                if target is not None:
-                    tb = target.bbox
-                    note += (f" tb={int(tb[0])},{int(tb[1])},{int(tb[2])},{int(tb[3])}"
-                             f" tw={target.top_width:.0f}")
-                # 未命中（真实分数判据判为普通落点）时留现场帧：这是唯一能解释
-                # “为什么这一跳没进中心”的证据，且频率只有百分之几，不会撑爆磁盘。
-                if note_center == "miss" and frame is not None:
-                    try:
-                        miss_dir = DEBUG_DIR / "miss"
-                        miss_dir.mkdir(parents=True, exist_ok=True)
-                        stamp = time.strftime("%Y%m%d_%H%M%S")
-                        cv2.imwrite(str(miss_dir / f"miss_{stamp}_before.png"), frame)
-                        if frame2 is not None:
-                            cv2.imwrite(str(miss_dir / f"miss_{stamp}_after.png"), frame2)
-                    except Exception:
-                        pass
-                if calib_bands and err is not None:
-                    calib_samples.append((hold_ms, dist + err, dist, k))
-                    log(f"[标定] k={k:.3f} t={hold_ms:.0f}ms  d={dist:.0f}px  "
-                        f"L={dist + err:.0f}px  err={err:+.1f}px")
+                    hold_ms = k * dist + cfg.b
+                hold_ms *= (1.0 + cfg.press_bias_ratio)
+                if cfg.gamma > 0:
+                    trim = 1.0 + clamp(-0.3 * err_ema,
+                                       -cfg.residual_trim_ratio, cfg.residual_trim_ratio)
+                    hold_ms *= trim
+                hold_ms = clamp(hold_ms, cfg.press_duration_min_ms, cfg.press_duration_max_ms)
                 if args.save_debug:
                     cv2.imwrite(
-                        str(debug_dir / f"jump_{index + 1:03d}_after.png"),
-                        annotate(frame2, piece2, target2, None, f"#{index + 1} {note}"),
+                        str(debug_dir / f"jump_{index + 1:03d}_before.png"),
+                        annotate(frame, piece, target, hold_ms, f"#{index + 1} k={k:.3f}"),
                     )
-                    cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_raw_after.png"), frame2)
-                log(
-                    f"#{index + 1} d={dist:.1f}px hold={hold_ms:.0f}ms {note} "
-                    f"k {k_before:.3f}->{k:.3f} score={score} "
-                    + ("piece=(未检出)" if piece2 is None
-                       else f"piece=({piece2.x:.0f},{piece2.y:.0f})")
-                )
-                record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, err,
-                                    "landed", score, note,
-                                    t_acquire_ms, t_landing_ms, t_score_ms,
-                                    (time.perf_counter() - t_iter_start) * 1000.0,
-                                    err_src, err_dot, aim_dot_flag, bias_pct)
-                # 卡死判据：**连续多跳真实分数都没涨**才算“按键没生效”。
-                # （早期用“棋子落点位置不变”判断，但镜头本来就会把棋子摆回相近位置，
-                #   会误杀正常运行——实测在 175 跳时被误判过一次。）
-                # 注意：必须用“本跳分差”，不能用 score 与 prev_score 比较——后者在本跳
-                # 已被更新为同一个值，会导致每次跳跃都判定为卡死（实测 3 跳就误停）。
-                if delta_this_jump is not None and delta_this_jump <= 0:
-                    stall_count += 1
-                else:
-                    stall_count = 0
-                if stall_count >= 3:
-                    # 注意：这里**不能**盲点“返回键”自救——游戏里那个坐标附近是分享按钮，
-                    # 实测会弹出微信分享面板，比卡死更难恢复。只在 acquire_frame 里
-                    # 确认检测到深色弹窗时才点击关闭。
-                    log(f"连续 {stall_count} 跳分数没有变化，判定按键未生效（游戏画面无响应），停止运行")
-                    log("提示：请检查游戏窗口是否有遮挡弹窗，必要时手动关闭后重开脚本。")
-                    emit(record)
-                    stop_reason = "游戏画面无响应（按键未生效）"
-                    break
-            else:
-                deaths += 1
-                consecutive_deaths += 1
-                alive_in_round = 0
-                err_streak = 0
-                score_streak = 0
-                predicted_score = 0
-                prev_score = None
-                note = f"未落地({status})"
-                if cfg.gamma > 0:
-                    if records and records[-1].error_px is not None:
-                        sign = 1.0 if records[-1].error_px > 0 else -1.0
-                        k = clamp(k * (1.0 - 0.03 * sign), k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
-                        note += "，按上次误差方向微调"
-                    else:
-                        k = clamp(k * 1.03, k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
-                if consecutive_deaths >= 3:
-                    k = best_k
-                    consecutive_deaths = 0
-                    note += "，连续死亡 3 次，回退历史最优 k"
-                if args.save_debug and frame2 is not None:
-                    cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_dead.png"), frame2)
-                # 死亡现场一律留存（不限 --save-debug）：跳跃前的目标帧 + 落地帧，
-                # 便于事后判断是“选错目标”还是“按压时长/事件丢失”导致的超差。
-                try:
-                    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-                    stamp = time.strftime("%Y%m%d_%H%M%S")
-                    if frame is not None:
-                        cv2.imwrite(str(DEBUG_DIR / f"dead_{stamp}_before.png"), frame)
-                    if frame2 is not None:
-                        cv2.imwrite(str(DEBUG_DIR / f"dead_{stamp}_after.png"), frame2)
-                except Exception:
-                    pass
-                log(f"#{index + 1} 死亡（{status}），累计死亡 {deaths}，k={k:.3f} {note}")
-                status_write(state="dead", game_state="game_over", deaths=deaths,
-                             best_life_score=best_life_score, last_result="dead")
-                record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
-                                    "dead", score, note,
-                                    t_acquire_ms, t_landing_ms, t_score_ms,
-                                    (time.perf_counter() - t_iter_start) * 1000.0)
-                win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
-                if win is None:
-                    log("死后无法重新开始，停止。")
-                    emit(record)
-                    stop_reason = "无法自动重新开始"
+                    cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_raw.png"), frame)
+
+                # 安全闸：确认按压点确实落在游戏窗口上。若被别的窗口（例如微信分享面板）
+                # 盖住，就只等待、绝不按键——实测盲按会点到游戏内分享按钮，弹出的微信分享面板
+                # 无法用点外部的方式关闭，只能人工处理。
+                if foreground:
+                    px = int(win.client_rect[0] + cfg.press_point[0] * win.width)
+                    py = int(win.client_rect[1] + cfg.press_point[1] * win.height)
+                    if not point_is_window(win.hwnd, px, py):
+                        log("按压点被其他窗口遮挡（可能是微信分享面板/弹窗），等待中，不发送按键")
+                        status_write(state="blocked_modal", game_state="blocked_modal",
+                                     stop_reason="按压点被其他窗口遮挡，正在等待（不发送按键）")
+                        time.sleep(1.5)
+                        continue
+                ctrl.press(win, cfg.press_point[0], cfg.press_point[1], hold_ms / 1000.0)
+                in_flight = True
+                status_write(state="landing", last_hold_ms=round(hold_ms),
+                             last_dist_px=round(dist, 1))
+                # 跳跃会大幅改变画面，旧的位置先验必然失效，先清掉再等落地
+                vision.reset_prior()
+                # want_target 只在要存调试图时打开：长跑模式不需要落地方块的目标点，
+                # 省掉每跳一次 find_target（16.5ms）。
+                status, frame2, piece2, target2, block_mask2 = wait_landing(
+                    cap, win, vision, cfg, want_target=args.save_debug)
+                t_landing_ms = (time.perf_counter() - t_iter_start) * 1000.0 - t_acquire_ms - hold_ms
+                score = read_score(frame2, cfg) if frame2 is not None else None
+                # 落地的瞬间 HUD 往往还没刷新，直接读会读到上一跳的旧分：
+                # 这会让增量变成两跳之和（表现为 +3 之类怪值），也会让卡死判据误触发。
+                # 因此读到与上次相同就重新抓帧重读几次。
+                # 读不出来（None）同样要重读：实测 2026-10-01 第 3973 跳落地确认超时，
+                # 恰好那几帧 HUD 读数为 None，导致"分数增长"这条最终裁决拿不到证据，
+                # 被误判成死亡（实际游戏一直在得分：130026→130038→130056…）。
+                if (status not in ("pause_unknown", "stopped") and prev_score is not None
+                        and (score is None or score == prev_score)):
+                    # 第一次重读只等很短（HUD 通常 100ms 内刷新），后面才用 250ms，
+                    # 这样"分数滞后"这个高频情形不会再白等 250ms。
+                    for attempt_i in range(3):
+                        time.sleep((cfg.score_reread_first_ms if attempt_i == 0 else 250.0) / 1000.0)
+                        if _CONTROL is not None:
+                            try:
+                                fresh_win = resolve_window(cfg, 0, draining=True)
+                            except WindowGoneError:
+                                if not _CONTROL.pause_requested:
+                                    raise
+                                status = "pause_unknown"
+                                frame2 = None
+                                score = None
+                                break
+                            if (_CONTROL.pause_requested and foreground_hwnd() != fresh_win.hwnd):
+                                status = "pause_unknown"
+                                frame2 = None
+                                score = None
+                                break
+                        else:
+                            fresh_win = resolve_window(cfg, cfg.window_wait_s)
+                        fresh = cap.grab(fresh_win)
+                        reread = read_score(fresh, cfg)
+                        if reread is None:
+                            continue
+                        score = reread
+                        frame2 = fresh
+                        if reread != prev_score:
+                            # 读到与上一跳不同的分数 = HUD 确实刷新了（可能是落地得分，
+                            # 也可能是新一局的低分），可以据此裁决，无需再等。
+                            break
+                timestamp = time.strftime("%H:%M:%S")
+                t_score_ms = ((time.perf_counter() - t_iter_start) * 1000.0
+                              - t_acquire_ms - hold_ms - t_landing_ms)
+
+                if status == "stopped":
+                    stop_reason = "按下 F8 手动停止"
+                    emit(JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
+                                    "stopped", None, "F8 急停"))
                     break
 
-            emit(record)
-            index += 1
-            last_progress_ts = time.time()
-            next_stall_warn = last_progress_ts + 90.0
-            status_write(
-                state="playing", game_state="playing",
-                jumps=index, landed=max(index - deaths, 0), deaths=deaths,
-                hits=score_hits, misses=score_misses, unknown=score_unknown,
-                streak=score_streak, best_streak=best_score_streak,
-                score=score, life_score=life_score, best_life_score=best_life_score,
-                k=round(k, 4), last_note=record.note, last_result=record.result,
-                last_index=index, last_time=record.timestamp,
-                elapsed_text=time.strftime("%H:%M:%S", time.gmtime(time.time() - started)),
-                round=index, csv=str(csv_path),
-            )
-            if calib_bands:
-                band_attempts += 1
-                if record.result == "landed":
-                    band_left -= 1
-                exhausted = band_left <= 0
-                too_many = band_attempts >= calib_bands[band_index][1] * 3
-                if exhausted or too_many:
-                    if too_many and not exhausted:
-                        log(f"该档尝试 {band_attempts} 次仍只采到 "
-                            f"{calib_bands[band_index][1] - band_left} 个有效样本，跳过剩余")
-                    band_index += 1
-                    if band_index >= len(calib_bands):
-                        stop_reason = "标定采样完成"
+                # 落地确认超时 ≠ 死亡：浅色方块（快递箱、便利店屋顶等）与淡背景颜色接近时，
+                # `_foot_on_block` 会因为方块掩码里没有脚下那块而一直判不了落地，2.6s 后超时。
+                # 实测 2026-10-01 #723：判定死亡，但 HUD 分数 19215→19247(+32) 还在继续涨，
+                # 说明棋子明明落在快递箱上拿了中心加分。这里用**分数增长**做最终裁决：
+                # 分数涨了就是落地（只是没测到误差），分数没动才算真死。
+                #
+                # 2026-10-01 13:40 修：原来这里还要求 `piece2 is not None`，于是
+                # "超时那一帧镜头未稳、棋子检测不到，但 0.25s 后重读的分数已经涨了"
+                # 这种情形会被误判死亡 —— 实测 01:33:38 那次：分数 8066→8098(+32，满连击
+                # 中心命中)，CSV 却记 dead，紧接着 #1373 又以同一条命继续跳。
+                # 分数是权威信号，不该被一个辅助的棋子检测挡住。
+                delayed_landing = (
+                    status != "landed" and prev_score is not None
+                    and score is not None and score > prev_score
+                )
+                if (status == "pause_unknown" or (_CONTROL is not None
+                        and _CONTROL.pause_requested and status != "landed" and not delayed_landing)):
+                    record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
+                                        "unknown", score, "暂停收尾：无法可靠核对，不判死亡",
+                                        t_acquire_ms, t_landing_ms, t_score_ms,
+                                        (time.perf_counter() - t_iter_start) * 1000.0)
+                    emit(record)
+                    index += 1
+                    in_flight = False
+                    prev_score = None
+                    score_unknown += 1
+                    status_write(jumps=index, **accuracy_fields(records))
+                    continue
+                if status == "landed" and piece2 is not None or delayed_landing:
+                    err = None
+                    err_src = ""
+                    err_dot = None
+                    if delayed_landing:
+                        log(f"#{index + 1} 落地确认超时（{status}），但分数 "
+                            f"{prev_score}→{score} 说明已落地，按落地处理（不判死）")
+                    elif cfg.landing_method == "flow" and piece2 is not None:
+                        detail = measure_landing_error_flow(frame, frame2, target, piece2, cfg, direction)
+                        if detail is not None:
+                            err, run_width = detail
+                            err_src = "flow"
+                    elif block_mask2 is not None and piece2 is not None:
+                        detail = measure_landing_error(
+                            frame2, block_mask2, piece2, cfg, direction,
+                            expected_width=target.top_width,
+                        )
+                        if detail is not None:
+                            err, run_width, center_x = detail
+                            err_src = "mask"
+                            # 真值校正：落地方块上若有游戏自带的中心白点，直接用它当中心——
+                            # 实测（2026-10-01）掩码法的中心估计在"抬高台面"类方块上会偏
+                            # 20~25px，符号都能反（16 个现场帧：真值均值 +22.6px，掩码法 -3.9px）。
+                            # 这是唯一能让落点误差变成可信信号的办法。
+                            if cfg.center_dot_max_offset_px > 0:
+                                anchor_y = piece2.y + cfg.piece_anchor_dy_ratio * frame2.shape[0]
+                                dot = find_dot_near(frame2, center_x, anchor_y + 18.0,
+                                                    cfg.center_dot_landing_radius_px, cfg)
+                                if dot is not None:
+                                    ux, uy = direction[0], direction[1]
+                                    # 白点值单独记，**不覆盖** err：落地时棋子把白点挡住，
+                                    # 实测这批值里约一半与游戏判分矛盾（见 JumpRecord 注释）。
+                                    err_dot = (piece2.x - dot[0]) * ux + (anchor_y - dot[1]) * uy
+                    # 信号 A（诊断用）：用落点误差预测连击，用于和真实分数对照
+                    if err is not None and abs(err) < cfg.center_hit_tolerance_px:
+                        err_streak += 1
+                        predicted_score += 2 * err_streak
+                    else:
+                        err_streak = 0
+                        predicted_score += 1
+
+                    # 信号 B（真值）：读分已实测 19/19 正确。delta==1 → 普通落点；
+                    # delta==min(2*连击数,32) → 命中中心；其它 → 不计入统计。
+                    #
+                    # 抗级联设计（实测过：一次 delta=0 的滞后读数会让连击计数错位，
+                    # 之后所有判定全变 unknown）：
+                    #   - delta<=0（HUD 未刷新）→ 重读一次，仍为 0 则跳过，且**不重置连击**
+                    #   - delta 异常大（HUD 显示错乱）→ 跳过，不重置连击
+                    #   - 偶数 delta 但与本跳预期不符（连击计数已错位）→ 由 delta 反推连击数重新同步
+                    note_center = "score=n/a"
+                    delta_this_jump = None       # 本跳的真实分差（用于卡死判据）
+                    if score is not None:
+                        if prev_score is None:
+                            note_center = "score基准"
+                        elif score >= prev_score:
+                            delta = score - prev_score
+                            delta_this_jump = delta
+                            # 实测规律：连击加成为 min(2×连续中心数, 32)，+32 封顶
+                            expect_center = min(2 * (score_streak + 1), cfg.score_bonus_cap)
+                            if delta <= 0 or delta > 200:
+                                score_unknown += 1
+                                note_center = f"读数异常(+{delta})"
+                            elif delta == 1:
+                                score_streak = 0
+                                score_misses += 1
+                                note_center = "miss"
+                            elif delta == expect_center:
+                                score_streak += 1
+                                score_hits += 1
+                                note_center = f"center x{score_streak}"
+                            elif delta >= 4 and delta % 2 == 0 and delta <= cfg.score_bonus_cap:
+                                # 计数错位：由增量反推连击数（偶数增量必为命中）
+                                score_streak = min(delta // 2, cfg.score_bonus_cap // 2)
+                                score_hits += 1
+                                note_center = f"center x{score_streak}(重同步)"
+                            else:
+                                score_unknown += 1
+                                note_center = f"unknown(+{delta})"   # 保连击，避免级联失真
+                        else:
+                            score_streak = 0        # 分数变小 = 换局/重开
+                            note_center = "score重置"
+                        prev_score = score
+                        life_score = score
+                        best_life_score = max(best_life_score, score)
+                        best_score_streak = max(best_score_streak, score_streak)
+                    if (args.save_debug and frame2 is not None and err is not None
+                            and run_state["fresh"]):
+                        score_dir = DEBUG_DIR / "score"
+                        score_dir.mkdir(parents=True, exist_ok=True)
+                        roi = crop_score_roi(frame2, cfg)
+                        if roi is not None:
+                            cv2.imwrite(
+                                str(score_dir / f"j{index + 1:03d}_s{predicted_score:04d}.png"), roi
+                            )
+                    k_after = k
+                    if err is not None and cfg.gamma > 0:
+                        ratio = err / max(dist, 1.0)
+                        if abs(err) < 0.35 * run_width:  # 测量可信才用于调参（过大视为噪声）
+                            # 指数平滑，抑制单帧测量噪声带来的抖动
+                            err_ema = 0.55 * err_ema + 0.45 * ratio
+                            step = clamp(-cfg.gamma * err_ema, -cfg.max_step_ratio, cfg.max_step_ratio)
+                            k_after = clamp(k * (1.0 + step), k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
+                    k = k_after
+                    last_good_hold_ms = hold_ms
+                    alive_in_round += 1
+                    if alive_in_round > best_alive:
+                        best_alive = alive_in_round
+                        best_k = k
+                    consecutive_deaths = 0
+                    note = f"err={err:.1f}px" if err is not None else "err=n/a"
+                    note += f" pred={predicted_score}"
+                    note += f" score={score} [{note_center}]"
+                    # 目标几何写进备注：事后用它按“方块类型/大小”关联真实命中率，
+                    # 不需要保存每一帧图（落点误差测量已证明与真值几乎无关，只有分数可信）。
+                    if target is not None:
+                        tb = target.bbox
+                        note += (f" tb={int(tb[0])},{int(tb[1])},{int(tb[2])},{int(tb[3])}"
+                                 f" tw={target.top_width:.0f}")
+                    # 未命中（真实分数判据判为普通落点）时留现场帧：这是唯一能解释
+                    # “为什么这一跳没进中心”的证据，且频率只有百分之几，不会撑爆磁盘。
+                    if note_center == "miss" and frame is not None:
+                        try:
+                            miss_dir = DEBUG_DIR / "miss"
+                            miss_dir.mkdir(parents=True, exist_ok=True)
+                            stamp = time.strftime("%Y%m%d_%H%M%S")
+                            cv2.imwrite(str(miss_dir / f"miss_{stamp}_before.png"), frame)
+                            if frame2 is not None:
+                                cv2.imwrite(str(miss_dir / f"miss_{stamp}_after.png"), frame2)
+                        except Exception:
+                            pass
+                    if calib_bands and err is not None:
+                        calib_samples.append((hold_ms, dist + err, dist, k))
+                        log(f"[标定] k={k:.3f} t={hold_ms:.0f}ms  d={dist:.0f}px  "
+                            f"L={dist + err:.0f}px  err={err:+.1f}px")
+                    if args.save_debug:
+                        cv2.imwrite(
+                            str(debug_dir / f"jump_{index + 1:03d}_after.png"),
+                            annotate(frame2, piece2, target2, None, f"#{index + 1} {note}"),
+                        )
+                        cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_raw_after.png"), frame2)
+                    log(
+                        f"#{index + 1} d={dist:.1f}px hold={hold_ms:.0f}ms {note} "
+                        f"k {k_before:.3f}->{k:.3f} score={score} "
+                        + ("piece=(未检出)" if piece2 is None
+                           else f"piece=({piece2.x:.0f},{piece2.y:.0f})")
+                    )
+                    record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, err,
+                                        "landed", score, note,
+                                        t_acquire_ms, t_landing_ms, t_score_ms,
+                                        (time.perf_counter() - t_iter_start) * 1000.0,
+                                        err_src, err_dot, aim_dot_flag, bias_pct)
+                    # 卡死判据：**连续多跳真实分数都没涨**才算“按键没生效”。
+                    # （早期用“棋子落点位置不变”判断，但镜头本来就会把棋子摆回相近位置，
+                    #   会误杀正常运行——实测在 175 跳时被误判过一次。）
+                    # 注意：必须用“本跳分差”，不能用 score 与 prev_score 比较——后者在本跳
+                    # 已被更新为同一个值，会导致每次跳跃都判定为卡死（实测 3 跳就误停）。
+                    if delta_this_jump is not None and delta_this_jump <= 0:
+                        stall_count += 1
+                    else:
+                        stall_count = 0
+                    if stall_count >= 3:
+                        # 注意：这里**不能**盲点“返回键”自救——游戏里那个坐标附近是分享按钮，
+                        # 实测会弹出微信分享面板，比卡死更难恢复。只在 acquire_frame 里
+                        # 确认检测到深色弹窗时才点击关闭。
+                        log(f"连续 {stall_count} 跳分数没有变化，判定按键未生效（游戏画面无响应），停止运行")
+                        log("提示：请检查游戏窗口是否有遮挡弹窗，必要时手动关闭后重开脚本。")
+                        emit(record)
+                        stop_reason = "游戏画面无响应（按键未生效）"
                         break
-                    band_left = calib_bands[band_index][1]
-                    band_attempts = 0
-                    log(f"标定进入下一档 k={calib_bands[band_index][0]:.3f}"
-                        f"（{band_left} 跳）")
+                else:
+                    deaths += 1
+                    consecutive_deaths += 1
+                    alive_in_round = 0
+                    err_streak = 0
+                    score_streak = 0
+                    predicted_score = 0
+                    prev_score = None
+                    note = f"未落地({status})"
+                    if cfg.gamma > 0:
+                        if records and records[-1].error_px is not None:
+                            sign = 1.0 if records[-1].error_px > 0 else -1.0
+                            k = clamp(k * (1.0 - 0.03 * sign), k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
+                            note += "，按上次误差方向微调"
+                        else:
+                            k = clamp(k * 1.03, k0 * cfg.min_k_ratio, k0 * cfg.max_k_ratio)
+                    if consecutive_deaths >= 3:
+                        k = best_k
+                        consecutive_deaths = 0
+                        note += "，连续死亡 3 次，回退历史最优 k"
+                    if args.save_debug and frame2 is not None:
+                        cv2.imwrite(str(debug_dir / f"jump_{index + 1:03d}_dead.png"), frame2)
+                    # 死亡现场一律留存（不限 --save-debug）：跳跃前的目标帧 + 落地帧，
+                    # 便于事后判断是“选错目标”还是“按压时长/事件丢失”导致的超差。
+                    try:
+                        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+                        stamp = time.strftime("%Y%m%d_%H%M%S")
+                        if frame is not None:
+                            cv2.imwrite(str(DEBUG_DIR / f"dead_{stamp}_before.png"), frame)
+                        if frame2 is not None:
+                            cv2.imwrite(str(DEBUG_DIR / f"dead_{stamp}_after.png"), frame2)
+                    except Exception:
+                        pass
+                    log(f"#{index + 1} 死亡（{status}），累计死亡 {deaths}，k={k:.3f} {note}")
+                    status_write(state="dead", game_state="game_over", deaths=deaths,
+                                 best_life_score=best_life_score, last_result="dead")
+                    record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
+                                        "dead", score, note,
+                                        t_acquire_ms, t_landing_ms, t_score_ms,
+                                        (time.perf_counter() - t_iter_start) * 1000.0)
+                    restart_after_record = True
+
+                emit(record)
+                index += 1
+                in_flight = False
+                last_progress_ts = active_time()
+                next_stall_warn = last_progress_ts + 90.0
+                status_write(
+                    state="playing", game_state="playing",
+                    jumps=index, deaths=deaths,
+                    streak=score_streak, best_streak=best_score_streak,
+                    score=score, life_score=life_score, best_life_score=best_life_score,
+                    k=round(k, 4), last_note=record.note, last_result=record.result,
+                    last_index=index, last_time=record.timestamp,
+                    elapsed_text=time.strftime("%H:%M:%S", time.gmtime(active_time() - started)),
+                    round=index, csv=str(csv_path), **accuracy_fields(records),
+                )
+                # Commit the completed jump before the interruptible restart.
+                # A pause here cancels only the new click, not its known death
+                # record; the catch handler sees in_flight=False.
+                if (restart_after_record and index < cfg.max_jumps and
+                        (_CONTROL is None or not _CONTROL.needs_resume)):
+                    win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
+                    if win is None:
+                        log("死后无法重新开始，停止。")
+                        stop_reason = "无法自动重新开始"
+                        break
+                if calib_bands:
+                    band_attempts += 1
+                    if record.result == "landed":
+                        band_left -= 1
+                    exhausted = band_left <= 0
+                    too_many = band_attempts >= calib_bands[band_index][1] * 3
+                    if exhausted or too_many:
+                        if too_many and not exhausted:
+                            log(f"该档尝试 {band_attempts} 次仍只采到 "
+                                f"{calib_bands[band_index][1] - band_left} 个有效样本，跳过剩余")
+                        band_index += 1
+                        if band_index >= len(calib_bands):
+                            stop_reason = "标定采样完成"
+                            break
+                        band_left = calib_bands[band_index][1]
+                        band_attempts = 0
+                        log(f"标定进入下一档 k={calib_bands[band_index][0]:.3f}"
+                            f"（{band_left} 跳）")
+            except ControlInterrupted as exc:
+                if poll_stop_key():
+                    stop_reason = "用户停止（F8 / q / Esc）"
+                    break
+                if in_flight:
+                    emit(JumpRecord(index + 1, time.strftime("%H:%M:%S"), k_before,
+                                    dist, hold_ms, k, None, "unknown", None,
+                                    "控制中断：当前跳无法核对，不判死亡"))
+                    index += 1
+                    score_unknown += 1
+                    prev_score = None
+                    status_write(jumps=index, **accuracy_fields(records))
+                vision.reset_prior()
+                log(f"暂停/安全中断：{exc}；重新识别后继续")
+                time.sleep(0.05)
+                continue
+    except ControlInterrupted:
+        stop_reason = "用户停止（F8 / q / Esc）"
     except KeyboardInterrupt:
         stop_reason = "用户中断（Ctrl+C）"
     finally:
@@ -3803,10 +4415,10 @@ def play(args) -> int:
             log(f"写回 k 失败：{exc}")
     _LAST_STOP_REASON = stop_reason
     status_write(state="stopped", alive=False, stop_reason=stop_reason,
-                 jumps=len(records), deaths=deaths, hits=score_hits,
-                 misses=score_misses, unknown=score_unknown,
+                 jumps=len(records), deaths=deaths,
                  best_streak=best_score_streak, best_life_score=best_life_score,
-                 elapsed_text=time.strftime("%H:%M:%S", time.gmtime(time.time() - started)))
+                 elapsed_text=time.strftime("%H:%M:%S", time.gmtime(active_time() - started)),
+                 **accuracy_fields(records))
     return 0
 
 
@@ -3816,6 +4428,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
+    parser.add_argument("--pause-hotkey", default=None, help="暂停/恢复热键，默认 Alt+P")
+    parser.add_argument("--startup-wait-s", type=float, default=None,
+                        help="等待用户打开小游戏的秒数，0=无限等待")
+    parser.add_argument("--start-delay-s", type=float, default=None,
+                        help="启动/恢复前倒计时秒数，默认 3")
+    parser.add_argument("--backend", choices=["auto", "gpu", "cuda", "opencl", "simd", "cpu"],
+                        default=None, help="本次运行的掩码后端（不改配置文件）")
+    parser.add_argument("--no-cuda", action="store_true", help="禁用 CUDA，仍可用 OpenCL/CPU")
+    parser.add_argument("--no-opencl", action="store_true", help="禁用 OpenCL，仍可用 CUDA/CPU")
+    parser.add_argument("--opencl-device", default="", help="按名称/厂商子串选择 OpenCL GPU")
     parser.add_argument("--probe", action="store_true", help="只抓一帧保存，验证窗口与截图")
     parser.add_argument("--selftest", action="store_true",
                         help="部署自检：依赖/模板/GPU 后端/掩码一致性（不碰游戏窗口）")
@@ -3872,9 +4494,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def opencl_device_check(selector: str) -> int:
+    """内部驱动预热入口，明确禁止输入，不初始化 CUDA、不定位游戏窗口。"""
+    setup_stdio()
+    os.environ["JUMPBOT_NO_INPUT"] = "1"
+    os.environ["JUMPBOT_DISABLE_CUDA"] = "1"
+    os.environ["JUMPBOT_OPENCL_PROBE"] = "1"
+    cfg = Config(opencl_device=selector, cuda_enabled=False)
+    vision = Vision(cfg)
+    frame = np.random.default_rng(42).integers(0, 256, (1050, 553, 3), dtype=np.uint8)
+    result = vision._masks_opencl(frame)
+    if result is None:
+        return 3
+    expected = vision._masks_simd(frame)
+    return 0 if all(np.array_equal(a, b) for a, b in zip(expected, result)) else 4
+
+
 def main(argv=None) -> int:
+    global _CONTROL, _STOP_REQUESTED
+    listener = None
     # 打包后单文件 exe 复用：python 面板以 `jumpbot.exe --panel ...` 启动
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if len(raw_argv) == 2 and raw_argv[0] == "--_opencl-check":
+        return opencl_device_check(raw_argv[1])
     # 打包后 sys.executable 就是本 exe：CuPy / cuda.pathfinder 等库会派生
     # `python -m <module>`（偶尔 `-c`）去做动态库探测，这里让 exe 表现得像 python，
     # 否则子进程会因"无法识别的参数"直接失败，导致 GPU 后端在打包版里起不来。
@@ -3896,6 +4538,14 @@ def main(argv=None) -> int:
     ensure_user_config()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.backend:
+        os.environ["JUMPBOT_MASKS_BACKEND"] = args.backend
+    if args.no_cuda:
+        os.environ["JUMPBOT_DISABLE_CUDA"] = "1"
+    if args.no_opencl:
+        os.environ["JUMPBOT_DISABLE_OPENCL"] = "1"
+    if args.opencl_device:
+        os.environ["JUMPBOT_OPENCL_DEVICE"] = args.opencl_device
     _cfg_for_tune = None
     try:
         _cfg_for_tune = Config.load(Path(args.config))
@@ -3903,7 +4553,7 @@ def main(argv=None) -> int:
         pass
     tune_cpu(threads=getattr(_cfg_for_tune, "cv2_threads", 4), priority="above")
     # 命令行窗口里按键即可停止（q / Q / Esc），与 F8 等价；无控制台时自动跳过
-    start_console_watcher()
+    _STOP_REQUESTED = False
     try:
         if args.selftest:
             return selftest(args)
@@ -3919,6 +4569,19 @@ def main(argv=None) -> int:
             return dry_run(args)
         if args.probe or args.samples or args.click_xy:
             return probe(args)
+        live_cfg = Config.load(Path(args.config), {
+            "pause_hotkey": args.pause_hotkey,
+            "startup_wait_s": args.startup_wait_s,
+            "start_delay_s": args.start_delay_s,
+        })
+        _CONTROL = RunControl(live_cfg.pause_hotkey, notify=control_event)
+        listener = WindowsHotkeyListener(_CONTROL, poll_stop_key)
+        if listener.start():
+            log(f"全局暂停/恢复：{live_cfg.pause_hotkey}；控制台 P 也可切换；停止键保持不变")
+        else:
+            log(f"暂停热键未启用：{_CONTROL.hotkey_error}。保持暂停，不发输入；"
+                "可在本控制台按 P 继续，或修改 --pause-hotkey 后重启。")
+        start_console_watcher()
         if not args.no_dashboard:
             spawn_dashboard()      # 实时状态面板（独立控制台窗口，失败不影响运行）
         if args.daemon:
@@ -3927,11 +4590,24 @@ def main(argv=None) -> int:
     except WindowGoneError as exc:
         log(str(exc))
         return 3
+    except ControlInterrupted as exc:
+        log(f"控制操作已取消：{exc}")
+        status_write(state="stopped", alive=False, stop_reason=str(exc))
+        return 0
+    except ValueError as exc:
+        log(f"配置无效：{exc}")
+        return 2
     except KeyboardInterrupt:
         # Ctrl+C：press() 里的 finally 已经把鼠标放开，这里只负责干净地报一句再退出
         log("收到 Ctrl+C，已停止（鼠标已释放）。下次可用 F8 或控制台按 q 优雅停止。")
         return 130
     finally:
+        _STOP_REQUESTED = True
+        if _CONTROL is not None:
+            _CONTROL.stop("进程退出")
+        if listener is not None:
+            listener.close()
+        _CONTROL = None
         restore_timer_resolution()
 
 
@@ -3947,7 +4623,6 @@ def run_daemon(args) -> int:
     # "一轮正常跑完"时在读取处抛 UnboundLocalError（实测 2026-10-01 500 跳一轮后
     # daemon 直接崩溃退出，日志里没有 [daemon] 本轮结束 那行）。
     global _LAST_STOP_REASON
-    cfg = Config.load(Path(args.config))
     rounds = 0
     while True:
         try:
@@ -3962,7 +4637,7 @@ def run_daemon(args) -> int:
             rounds += 1            # 只把"真正跑完的轮次"计入 --daemon-max-rounds
         reason = _LAST_STOP_REASON
         log(f"[daemon] 本轮结束：{reason or '窗口不在'}（rc={rc}，已完成 {rounds} 轮）")
-        if ("F8" in reason) or ("中断" in reason):
+        if poll_stop_key() or ("F8" in reason) or ("中断" in reason) or ("用户停止" in reason):
             log("[daemon] 用户主动停止，daemon 一并退出")
             return rc
         if args.daemon_max_rounds and rounds >= args.daemon_max_rounds:
@@ -3971,38 +4646,10 @@ def run_daemon(args) -> int:
         if rc not in (0, 3):
             log("[daemon] 不可恢复错误，退出")
             return rc
-        wait_text = (f"最多 {args.daemon_wait_s:.0f} 秒" if args.daemon_wait_s > 0
-                     else "一直等，按 F8 退出")
-        log(f"[daemon] 等待「跳一跳」窗口出现（{wait_text}）…")
-        # 用轮询而不是一次 resolve_window(wait_s)：这样①每 2 秒给状态面板写心跳，
-        # ②等待期间按 F8 也能立刻退出。
-        wait_start = time.time()
-        # daemon_wait_s <= 0 表示一直等（不超时），适合"人不在电脑前"的长跑场景。
-        deadline = (wait_start + args.daemon_wait_s) if args.daemon_wait_s > 0 else None
-        win = None
-        while deadline is None or time.time() < deadline:
-            if f8_pressed():
-                log("[daemon] 收到 F8，退出 daemon")
-                status_write(state="stopped", alive=False, stop_reason="用户按 F8 停止")
-                return 0
-            candidates = find_windows(cfg.window_title_pattern, cfg.window_exe_hint)
-            if candidates:
-                win = candidates[0]
-                break
-            status_write(state="waiting_window", game_state=None, alive=True,
-                         stop_reason="正在等待游戏窗口",
-                         waited_s=int(time.time() - wait_start))
-            time.sleep(2.0)
-        if win is None:
-            log("[daemon] 等待窗口超时，退出（重新打开小游戏后重跑即可）")
-            status_write(state="stopped", alive=False, stop_reason="等待窗口超时")
-            return 3
-        log(f"[daemon] 窗口已就绪：{win.describe()}；3 秒后开始第 {rounds + 1} 轮（F8 取消）")
-        for _ in range(30):
-            if f8_pressed():
-                log("[daemon] 收到 F8，退出 daemon")
-                return 0
-            time.sleep(0.1)
+        # The next play owns its wait/pause/countdown gate; do not duplicate it
+        # here (otherwise daemon waits could not acknowledge a pause).
+        args._next_startup_wait_s = args.daemon_wait_s
+        log("[daemon] 下一轮等待由统一暂停/启动控制接管；窗口不在时只等用户打开")
 
 
 if __name__ == "__main__":
