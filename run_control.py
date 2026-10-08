@@ -132,6 +132,19 @@ class RunControl:
             with self.lock:
                 self.inputs -= 1
 
+    @contextmanager
+    def input_dispatch(self, generation=None):
+        """Linearize admission and native DOWN against pause/stop requests.
+
+        Hold this only for the native dispatch, never for the mouse hold or
+        screenshot/recognition. Once dispatched, UP must remain unconditional.
+        """
+        with self.lock:
+            self.check(generation)
+            if self.needs_resume or self.paused_at is not None:
+                raise ControlInterrupted("恢复尚未完成")
+            yield
+
     def snapshot(self):
         with self.lock:
             paused_s = self.paused_total

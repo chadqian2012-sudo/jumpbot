@@ -88,6 +88,22 @@ try:
     assert calls.get('prior_reset') and not control.needs_resume
     assert abs(control.active_time() - frozen_active) < 1e-6, (control.active_time(), frozen_active)
     assert control.snapshot()['pause_total_s'] >= 183
+    calls['mouse'].clear()
+    final_checks = []
+    def late_pause(*values):
+        final_checks.append(1)
+        if len(final_checks) == 2:
+            control.toggle('fixture last target check')
+        return True
+    J.point_is_window = late_pause
+    ctrl.expected_generation = control.generation
+    try:
+        ctrl.press(win, .5, .72, .5)
+    except J.ControlInterrupted:
+        pass
+    else:
+        raise AssertionError('late pause dispatched DOWN')
+    assert calls['mouse'] == [0]
     control.toggle('fixture pause again')
     control.stop('fixture stop')
     try:
@@ -99,7 +115,7 @@ try:
     print(json.dumps(dict(frozen=True, game_input=False, config_defaults=True,
                           startup_wait=True, countdown=True, pause_hold_release=True,
                           paused_no_input=True, long_pause=True, fresh_resume=True,
-                          stop_priority=True), ensure_ascii=False))
+                          atomic_down=True, stop_priority=True), ensure_ascii=False))
 finally:
     for name, value in saved.items():
         setattr(J, name, value)

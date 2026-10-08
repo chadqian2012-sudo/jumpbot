@@ -513,6 +513,23 @@ class InputController:
         with guard:
             self._press(win, fx, fy, hold_s)
 
+    def _hold(self, down, up, hold) -> None:
+        """Share atomic admission and unconditional release across backends."""
+        dispatched = False
+        try:
+            with (_CONTROL.input_dispatch(self.expected_generation)
+                  if _CONTROL is not None else nullcontext()):
+                control_check(self.expected_generation)
+                # DOWN may have reached Windows even if its call is interrupted.
+                # From this point attempt UP for every exit path, including an
+                # exception in native dispatch or context-manager teardown.
+                dispatched = True
+                down()
+            hold()
+        finally:
+            if dispatched:
+                up()
+
     def _press(self, win: WindowInfo, fx: float, fy: float, hold_s: float) -> None:
         x = int(win.client_rect[0] + fx * win.width)
         y = int(win.client_rect[1] + fy * win.height)
@@ -524,13 +541,9 @@ class InputController:
             cy = int(fy * win.height)
             lparam = (cy << 16) | (cx & 0xFFFF)
             user32.PostMessageW(win.hwnd, WM_MOUSEMOVE, 0, lparam)
-            user32.PostMessageW(win.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
-            try:
-                time.sleep(hold_s)
-            finally:
-                # 无论正常结束还是被 Ctrl+C / 异常打断，都必须把按键放开：
-                # 卡在按下状态会让游戏一直蓄力，还会把之后所有点击变成拖拽。
-                user32.PostMessageW(win.hwnd, WM_LBUTTONUP, 0, lparam)
+            self._hold(lambda: user32.PostMessageW(win.hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam),
+                       lambda: user32.PostMessageW(win.hwnd, WM_LBUTTONUP, 0, lparam),
+                       lambda: time.sleep(hold_s))
         else:
             if os.environ.get("JUMPBOT_NO_INPUT") == "1":
                 log("JUMPBOT_NO_INPUT=1：已阻止本次按键")
@@ -545,11 +558,9 @@ class InputController:
             control_check(self.expected_generation)
             if not point_is_window(win.hwnd, x, y):
                 raise ControlInterrupted("按压点已被遮挡（未发送按下）")
-            _send_mouse(MOUSEEVENTF_LEFTDOWN, x, y)
-            try:
-                hold_precise(hold_s)
-            finally:
-                _send_mouse(MOUSEEVENTF_LEFTUP, x, y)
+            self._hold(lambda: _send_mouse(MOUSEEVENTF_LEFTDOWN, x, y),
+                       lambda: _send_mouse(MOUSEEVENTF_LEFTUP, x, y),
+                       lambda: hold_precise(hold_s))
 
     def click(self, win: WindowInfo, fx: float, fy: float) -> None:
         self.press(win, fx, fy, 0.06)

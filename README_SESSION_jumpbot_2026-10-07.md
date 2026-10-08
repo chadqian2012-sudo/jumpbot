@@ -37,6 +37,8 @@
 但不能称F8物理测试通过。取消未生成run-evidence.json，原始CSV/input-audit/control记录保留。
 最终精简消除重复启动前台/窗口守卫、合并统计写入；CSV中心命中改用HUD真值，
 像素判据移至pixel_center_hit；热键提示使用实际配置，面板处理停止状态。
+最终输入审查发现检查到原生按下之间的竞态，已用RunControl.input_dispatch同步，
+InputController._hold共用原子按下和无条件释放；33项回归覆盖前/后台最后按下竞态及异常释放。
 后续以发布分支 `release/windows-pause-v1.2` / `D:\Codex Workspace\jumpbot-release-v1.2` 为候选，
 从远端master c73ca708开始移植已完成CUDA/OpenCL与暂停改动；原目录不重置。
 不要声称Release已完成，先查远端PR/CI/附件；不调k/gamma/瞄准门限凑成绩，不上传完整运行目录。

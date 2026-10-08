@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -113,6 +114,28 @@ class ControlTests(unittest.TestCase):
         c.stop()
         self.assertTrue(c.stopped)
 
+    def test_native_dispatch_serializes_concurrent_pause_commit(self):
+        c = RunControl()
+        started, done = threading.Event(), threading.Event()
+        def request():
+            started.set()
+            c.toggle()
+            done.set()
+        with c.input_operation(c.generation):
+            with c.input_dispatch(c.generation):
+                thread = threading.Thread(target=request)
+                thread.start()
+                self.assertTrue(started.wait(1))
+                self.assertFalse(done.wait(.02))
+                self.assertFalse(c.pause_requested)
+            thread.join(1)
+            self.assertTrue(done.is_set())
+            self.assertTrue(c.pause_requested)
+        c.acknowledge_pause()
+        with self.assertRaises(ControlInterrupted):
+            with c.input_dispatch():
+                self.fail('dispatch while paused')
+
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows integration')
 class ApplicationTests(unittest.TestCase):
@@ -220,6 +243,41 @@ class ApplicationTests(unittest.TestCase):
             ctrl.press(self.win, .5, .72, .6)
         self.assertEqual(len(events), 3)
 
+    def test_pause_after_final_target_check_does_not_dispatch_down(self):
+        J = self.j
+        events, checks = [], []
+        def point(*_):
+            checks.append(1)
+            if len(checks) == 2:
+                self.control.toggle('last-target-check race')
+            return True
+        self.stack.enter_context(patch.dict(os.environ, {'JUMPBOT_NO_INPUT': '0'}))
+        self.stack.enter_context(patch.object(J, 'point_is_window', point))
+        self.stack.enter_context(patch.object(J, '_send_mouse', lambda flags, *xy: events.append(flags)))
+        ctrl = J.InputController()
+        ctrl.expected_generation = self.control.generation
+        with self.assertRaises(ControlInterrupted):
+            ctrl.press(self.win, .5, .72, .6)
+        self.assertEqual(events, [0])
+        self.assertEqual(self.control.inputs, 0)
+
+    def test_background_move_pause_does_not_dispatch_down(self):
+        J = self.j
+        events = []
+        def post(_hwnd, message, *_):
+            events.append(message)
+            if message == J.WM_MOUSEMOVE:
+                self.control.toggle('background dispatch race')
+            return True
+        self.stack.enter_context(patch.dict(os.environ, {'JUMPBOT_NO_INPUT': '0'}))
+        self.stack.enter_context(patch.object(J.user32, 'PostMessageW', post))
+        ctrl = J.InputController(background=True)
+        ctrl.expected_generation = self.control.generation
+        with self.assertRaises(ControlInterrupted):
+            ctrl.press(self.win, .5, .72, .6)
+        self.assertEqual(events, [J.WM_MOUSEMOVE])
+        self.assertEqual(self.control.inputs, 0)
+
     def test_hold_exception_still_releases(self):
         J = self.j
         events = []
@@ -230,6 +288,21 @@ class ApplicationTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             J.InputController().press(self.win, .5, .72, .6)
         self.assertEqual(events[-1], J.MOUSEEVENTF_LEFTUP)
+        self.assertEqual(self.control.inputs, 0)
+
+    def test_down_dispatch_exception_still_attempts_release(self):
+        J = self.j
+        events = []
+        def send(flags, *xy):
+            events.append(flags)
+            if flags == J.MOUSEEVENTF_LEFTDOWN:
+                raise KeyboardInterrupt
+        self.stack.enter_context(patch.dict(os.environ, {'JUMPBOT_NO_INPUT': '0'}))
+        self.stack.enter_context(patch.object(J, 'point_is_window', lambda *_: True))
+        self.stack.enter_context(patch.object(J, '_send_mouse', send))
+        with self.assertRaises(KeyboardInterrupt):
+            J.InputController().press(self.win, .5, .72, .6)
+        self.assertEqual(events, [0, J.MOUSEEVENTF_LEFTDOWN, J.MOUSEEVENTF_LEFTUP])
         self.assertEqual(self.control.inputs, 0)
 
     def test_pause_landing_loss_is_unknown_not_death(self):
