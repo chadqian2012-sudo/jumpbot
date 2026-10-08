@@ -12,6 +12,68 @@
 
 ## 1. 现状快照（以磁盘与远端实测为准，非记忆）
 
+### 2026-10-08：暂停/手动启动与新驱动检查（尚未发布）
+
+当前源码已加入 `run_control.py` 的独立暂停/停止状态和原生 RegisterHotKey，
+默认 Alt+P、无限等待用户手动打开窗口、3 秒启动/恢复倒计时。暂停时不发新输入，
+已持有的按压正常释放；丢失画面的落地核对记录 unknown、不判死亡。
+恢复清掉旧目标/帧/位置先验并重同步分数；暂停和恢复准备不计有效运行时间。
+面板增加暂停状态、热键、暂停累计、最近100跳及覆盖率。
+主 README 顶部有最新行为、配置、验收入口和证据边界。
+
+新 NVIDIA 驱动 617.42 已实测：CuPy14.2、实际CUDA12.9、驱动API13.4，
+源码与1.1旧冻结包 GPU/OpenCL 自检通过。500/1000/2000 CUDA 合成帧压测零差异、
+设备内存稳定；515历史帧/35边界/两GPU全颜色HSV/回退通过。
+23项控制测试通过，其中3500跳模拟长跑不是实机成绩；576帧回归和12跳控制重放通过。
+新日志的 HUD note 是判定真值，离线报告不能跨暂停用人工增分重建命中。
+
+2026-10-08 21:46 开始首轮CPU SIMD实机验收，记录在
+`build/acceptance-20261008-cpu/` 与同名前缀 console.log。软件自己的探测确认窗口
+553×1050；电脑操作辅助组件初始化仍失败，所以未验证人工跨应用/关窗/移窗场景。
+22:02后用户确认已暂停，并明确要求停止升级轮次、精简代码、打包发布。
+实际记录379跳：日志落地379/379、HUD命中355/367=96.73%、覆盖96.83%，
+命中95%Wilson区间94.37%~98.12%。末段有读分异常与分数重置，不声称正式三轮验收通过。
+用户按F8后未观察到退出事件，最终取消由本会话启动的测试会话；暂停前鼠标正常释放，
+但不能称F8物理测试通过。取消未生成run-evidence.json，原始CSV/input-audit/control记录保留。
+最终精简消除重复启动前台/窗口守卫、合并统计写入；CSV中心命中改用HUD真值，
+像素判据移至pixel_center_hit；热键提示使用实际配置，面板处理停止状态。
+后续以发布分支 `release/windows-pause-v1.2` / `D:\Codex Workspace\jumpbot-release-v1.2` 为候选，
+从远端master c73ca708开始移植已完成CUDA/OpenCL与暂停改动；原目录不重置。
+不要声称Release已完成，先查远端PR/CI/附件；不调k/gamma/瞄准门限凑成绩，不上传完整运行目录。
+
+### 2026-10-07 续接更新：CUDA 优化
+
+**最新续接：跨设备加速/安装包 1.1**。已正式加入 PyOpenCL 整数融合内核，
+在 NVIDIA RTX 3070 Ti Laptop 与 Intel Iris Xe 上验证；AMD 无本机实测。
+CPU SIMD 掩码 14.31→10.91ms（-23.8%），Intel OpenCL 13.05→4.13ms（对照为原 SIMD）。
+5 个后端在 515 张干净帧上掩码/棋子/目标相同，35 组边界通过，两款 OpenCL GPU
+各自穷举 1677 万种颜色与 OpenCV 相同。缺库/禁用/错误/设备不匹配回退通过。
+自检、576 帧回归、自动/Intel/CPU 各 12 跳重放通过。`auto` 会比较 CPU/CUDA/OpenCL，
+OpenCL 多卡核对并实测选卡，驱动首次编译做隔离预检；CPU 线程数 0=自动选 1~4。
+交付目录为 `dist-accelerated/jumpbot` 和 `dist-portable/jumpbot`，
+安装包为 `installer-accelerated/jumpbot-setup-1.1-full.exe` 与
+`installer-portable/jumpbot-setup-1.1-portable.exe`，旧产物保留，安装时保留已有配置。
+最终统一交付在 `release/1.1/`：完整/轻量两份安装包（124.25 / 33.92 MiB）和
+两份免安装 ZIP（200.14 / 49.52 MiB），附交付说明与 SHA256SUMS。
+ZIP 已解压到独立 build 验证目录，完整软件真实 CUDA/OpenCL 掩码零差异，
+轻量软件禁 CUDA 后真实 Intel OpenCL 掩码零差异，自检均通过。
+安装包编译日志确认同时包含根配置和 `_internal/config.json`；根配置仅首次安装时写入。
+两份安装包版本资源为 1.1.0.0，未做代码签名；未执行覆盖旧软件的安装/卸载。
+`.gitignore` 的安装产物规则已限定根目录，避免把 `tools/installer/` 的构建源码一并忽略。
+代码/数据详见主 README 最上方、`tools/bench_backends.py` 与 `build/backends_benchmark.json`。
+下段 CUDA 是前一阶段快照；本次同样未实机长跑，也未提交/上传远端。
+
+后续会话已将 CUDA 掩码改为单个融合 `RawKernel`，包含与 OpenCV 整数规则相同的 BGR→HSV。
+同进程交错 A/B（旧提交 `fdfcd9b`）掩码 3.866→1.920ms（2.01×），完整 detect
+15.555→12.693ms（-18.4%）。515 张干净历史帧的掩码/棋子/目标零差异，75 个合成边界通过，
+1677 万种颜色 HSV 穷举零差异，1000 帧设备内存稳定，异常回退/非默认流检查通过。
+三条门禁均通过：576 帧回归成功数仍 492，读分 20/20、界面 5/5，重放 12/12。
+新增 `tools/bench_cuda.py`，详细证据见主 README 开头和 `build/cuda_benchmark.json`。
+优化版独立打包到 `dist-cuda/jumpbot/`，旧 `dist/jumpbot/` 及其日志保留。
+打包版最终自检真实 GPU 掩码 1.79ms，GPU vs SIMD 差异 0；用 `run_long.bat` 启动。
+下方 Git/产物/性能数据为原交接快照；本次改动尚未提交或上传远端。
+当前默认仍为 `auto`，k=2.61 / gamma=0 等精度配置未改；本次未进行新的实机长跑验收。
+
 ### 1.1 文件与目录
 
 | 路径 | 大小 | 说明 |
@@ -51,10 +113,8 @@
 > ⚠️ **本地与远端历史分叉**：`github.com`（git 主机）在本机不可达（curl 都是 000/超时），
 > 而 `api.github.com`、`uploads.github.com` 正常，所以远端那 3 个提交是**用 REST API 的 Git Data 接口**
 > （blob → tree → commit → 更新 ref）打上去的，SHA 与本地不同但**内容一致**。
-> 等 `github.com` 恢复后对齐一次即可：
-> ```powershell
-> cd "D:\Codex Workspace\jumpbot"; git fetch origin; git reset --soft origin/master
-> ```
+> 2026-10-08 发布约束：不能按旧建议 reset 现有目录来“对齐”。先核对两边内容，
+> 保留本地加速改动，从远端 master 建发布分支移植已审查变化；不强推、不重置工作目录。
 
 ### 1.4 当前生效配置（`config.json` 关键项）
 

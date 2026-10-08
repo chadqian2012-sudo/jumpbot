@@ -14,11 +14,23 @@ WITH_GPU = os.environ.get("JUMPBOT_WITH_GPU", "1") == "1"
 datas = [
     (str(ROOT / "templates"), "templates"),
     (str(ROOT / "config.json"), "."),
+    (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(ROOT / "LICENSE-OpenCV.txt"), "."),
     (str(ROOT / "tools" / "dashboard.py"), "tools"),
     (str(ROOT / "tools" / "_scorelog.py"), "tools"),
 ]
 binaries = []
 hiddenimports = ["mss", "mss.windows"]
+
+# Portable OpenCL is independent of NVIDIA/CUDA and remains in -NoGpu builds.
+try:
+    from PyInstaller.utils.hooks import collect_all
+    cl_datas, cl_binaries, cl_imports = collect_all("pyopencl")
+    datas += cl_datas
+    binaries += cl_binaries
+    hiddenimports += cl_imports
+except Exception as exc:
+    print(f"[spec] optional OpenCL not bundled: {exc}")
 
 if WITH_GPU:
     try:
@@ -69,7 +81,8 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["matplotlib", "pandas", "scipy", "tkinter", "PyQt5", "PySide2", "IPython"],
+    excludes=["matplotlib", "pandas", "scipy", "tkinter", "PyQt5", "PySide2", "IPython"]
+             + ([] if WITH_GPU else ["cupy", "cupy_backends", "cupyx", "cuda", "nvidia"]),
     noarchive=False,
 )
 pyz = PYZ(a.pure)

@@ -80,7 +80,24 @@ def iter_labels(rows):
     for row in rows:
         score = as_int(row.get("score"))
         label = None
-        if (row.get("result") or "") == "landed" and score is not None:
+        result = (row.get("result") or "").strip()
+        if "mask_backend" in row:
+            # New logs record the live HUD judgement after every resync. Never
+            # infer a delta across a pause: intervening human input is not ours.
+            note = row.get("note") or ""
+            center = re.search(r"\[center x(\d+)(?:\(重同步\))?\]", note)
+            if result == "landed" and center:
+                label, streak = 1, int(center.group(1))
+            elif result == "landed" and "[miss]" in note:
+                label, streak = 0, 0
+            else:
+                label = -1 if result == "landed" else None
+                streak = 0
+            prev_score = score if result == "landed" else None
+        elif result != "landed":
+            prev_score = None
+            streak = 0
+        elif score is not None:
             if prev_score is None:
                 pass
             elif score < prev_score:

@@ -1,7 +1,191 @@
 # 跳一跳 屏幕识别自动脚本（自适应版）
 
 在 Windows 上截取微信小游戏「跳一跳」窗口画面，用 OpenCV 识别棋子与目标方块，
-模拟鼠标按住蓄力完成自动跳跃，并按落点误差在线修正按压系数 k。
+模拟鼠标按住蓄力完成自动跳跃。当前配置按压系数固定为 k=2.61，在线自适应关闭。
+
+## Windows 暂停与手动启动（2026-10-08，待发布）
+
+本节是当前源码的新行为；旧的 1.1 安装包尚不包含暂停功能，不能用旧包代替本次验收。
+
+- 普通/daemon 启动先等待用户手动打开「跳一跳」，不搜索微信、不代开小程序。
+  默认无限等待；发现窗口后倒计时 3 秒。离线识别和 `--selftest` 不等待游戏。
+- Alt+P 全局切换暂停/恢复，控制台 P 也可切换；F8、q、Esc、Ctrl+C 保持停止用途。
+  等面板显示「已暂停」再切换应用。已有按压会正常释放，当前跳有界核对后暂停。
+- 已暂停时不切前台、不调整窗口、不抓帧识别、不自动重开，只保留低频心跳。
+  再按 Alt+P 才恢复：重新找窗口、倒计时、清除旧目标与位置先验、同步分数。
+  暂停时间和恢复准备不计入运行上限或看门狗；人工操作不计为脚本命中。
+- 注册热键失败时明确报错并保持暂停，不会静默开跑。可在控制台按 P 明确继续，
+  或通过 `--pause-hotkey Alt+Shift+P` 修改热键后重启。热键不能与停止键冲突。
+
+配置/CLI：`pause_hotkey="Alt+P"` / `--pause-hotkey`；
+`startup_wait_s=0` / `--startup-wait-s`（0 无限）；
+`start_delay_s=3` / `--start-delay-s`。缺字段的旧配置使用这些默认值。
+面板显示等待、倒计时、准备暂停、已暂停、恢复中、有效热键和累计暂停时间，
+并显示累计及最近 100 跳的 HUD 判定统计和覆盖率。
+
+2026-10-08 新驱动核验：RTX 3070 Ti Laptop / NVIDIA 617.42 / CuPy 14.2.0，
+驱动 API 报 CUDA 13.4，实际加载运行时为 CUDA 12.9。真实 CUDA 三轮各处理
+500/1000/2000 张合成帧，全部与 SIMD 零像素差异，活跃设备内存始终 2,909,696 字节，
+均值约 3.37/3.34/3.48ms。源码和既有完整 1.1 冻结软件的实际 GPU/OpenCL 自检通过。
+515 张历史帧、35 组合边界、NVIDIA/Intel 全颜色 HSV 一致性和故障回退检查通过。
+这些证明当前机器驱动兼容，不代表其它驱动、AMD 硬件或实机命中率已通过。
+
+无输入检查：`python -m unittest discover -s tests -v`；
+`python tools/check_cuda_driver.py --out build/cuda-driver-check.json`；
+`python tools/regress.py`；`python tools/replay_test.py`。
+控制测试包括 3500 跳模拟长跑与可控时钟长暂停，另有 Windows 原生热键注册、
+冲突、清理和本线程消息投递测试。原生消息投递不是物理长按测试。
+
+实机验收记录器 `tools/live_acceptance.py` 仅显式 `--execute-live` 才允许输入，
+沿用主程序的闭环识别/输入逻辑，不代开小程序。它记录鼠标/前台调用，
+每 50 跳通过自己的热键监听线程请求暂停（首个暂停 95 秒，其余 3 秒），
+并明确区分程序化热键测试与人工跨窗口/物理键测试。测试器不会恢复用户另外发出的暂停。
+任一轮门槛不可达时会停止，不继续升级轮次。不要用它的自动恢复测试代替日常手动暂停。
+
+2026-10-08 用户在 379 跳时确认暂停，并明确要求停止长跑、精简代码后打包发布。
+因此本次发布不宣称完成原定 500→1000→2000 共3500跳验收：此前实机记录为379跳，
+日志判定379次落地、0次死亡，HUD中心355/367=96.73%，判定覆盖率96.83%。
+命中率95% Wilson区间94.37%~98.12%，不等于已证明长期命中率≥95%。
+末段有读分异常/分数重置，保留为不可判定并记录限制；该记录发生在最终精简前。
+完成7次程序化暂停/恢复（含95秒长暂停），另一次人工Alt+P在按压中请求暂停，
+已有按压正常释放后进入已暂停。未完成全部人工跨窗口、物理长按、移窗/关窗/重开场景。
+用户按F8后旧测试进程仍保持暂停，未观察到F8退出事件；最终由会话取消结束，
+不把它记为F8实机验收通过。离线停止优先级测试通过不替代这项物理验证。
+
+最终精简、冻结软件、独立解压的软件及最终提交另行验证；发布记录须写明实际结果。
+不可判定跳跃不计为成功落地，报告给出覆盖率及95% Wilson区间。
+新CSV `center_hit` 是HUD真值（空值表示不可判定），像素诊断移到 `pixel_center_hit`；
+旧日志同名列仍是像素诊断，报告依据HUD note而非该列判分，兼容旧日志。
+
+## 跨设备加速与兼容版本（2026-10-07 续接）
+
+当前正式链路包含 **NumPy CPU / 优化 OpenCV SIMD / CuPy CUDA / PyOpenCL**。
+OpenCL 内核只使用 OpenCL 1.2 的整数功能，不要求 fp64 或厂商扩展，可在具备相应驱动的
+AMD、Intel、NVIDIA GPU 上尝试运行。实际验证设备为 RTX 3070 Ti Laptop 和 Intel Iris Xe；
+本机没有 AMD GPU，不能声称已在 AMD 硬件验收。程序仍面向 Windows x64。
+
+`auto` 会测量 CPU、CUDA、OpenCL 的端到端耗时并核对输出：加速器必须至少快 1.5 倍才采用。
+多张 OpenCL GPU 也会逐张核对并实测选择，支持 `opencl_device` 名称/厂商子串过滤。
+每 300 帧复测；运行时退化或失败会回退 CPU。驱动首次编译在禁输入子进程中预检，
+失败或 20 秒超时会跳过该设备。未安装可选库、没有显卡驱动、没有匹配设备也可用 CPU。
+自检计时和面板状态区分实际后端与回退，不把 CPU 回退误报成 GPU 成功。
+
+CPU SIMD 新路径将 HSV 拆为连续通道，减少 cv2 对跨步子视图的隐式复制；
+背景 HSV 只转换每行一个像素再展开，关闭亮块分支时不再创建/合并全零掩码。
+`cv2_threads=0` 会按 CPU 线程数选 1~4 个 OpenCV 线程，也可指定固定值。
+显式 `cpu` 现在始终使用 NumPy 原路径；原先 `masks_simd=true` 会令 `cpu` 实际执行 SIMD 的问题已修正。
+
+两种交付目录：
+
+| 目录 | 内容 | 使用场景 |
+| --- | --- | --- |
+| `dist-portable/jumpbot/` | OpenCL + CPU，不包含 CuPy/CUDA 运行库 | Intel/AMD/无独显，或需要小体积版本 |
+| `dist-accelerated/jumpbot/` | CUDA + OpenCL + CPU | NVIDIA，或需要全部后端 |
+
+默认启动 `run_long.bat`；强制 CPU 启动 `run_cpu.bat`；无输入检查 `selftest.bat`。
+旧 `dist/jumpbot/` 和上轮 `dist-cuda/jumpbot/` 保留，不会自动更新旧安装的软件。
+OpenCL 用的是显卡驱动提供的运行时，未安装驱动时会用 CPU，无需安装完整 CUDA Toolkit。
+
+本次运行可覆盖后端但不改配置：
+
+```powershell
+jumpbot.exe --selftest
+jumpbot.exe --selftest --no-cuda --opencl-device Intel
+jumpbot.exe --selftest --no-cuda --no-opencl
+jumpbot.exe --backend opencl --opencl-device Intel --max-jumps 500 --daemon
+jumpbot.exe --backend simd --no-cuda --no-opencl --max-jumps 500 --daemon
+```
+
+源码环境：基础 CPU 用 `requirements.txt`；OpenCL 用 `requirements-opencl.txt`；
+全后端用 `requirements-cuda.txt`。可选模块不可用不影响启动。
+设备检查/回退/全量帧/交错计时由 `tools/bench_backends.py` 覆盖，
+数据输出 `build/backends_benchmark.json`，对照快照为 `build/reference_portable/jumpbot.py`。
+交错计时（8 张代表帧、各路 120 次，包含预处理和传输；表中对照都是本次修改前的 SIMD）：
+
+| 路径 | 掩码前→后 | 完整识别前→后 |
+| --- | --- | --- |
+| 优化 CPU SIMD | 14.31→10.91ms（-23.8%） | 26.75→22.11ms（-17.4%） |
+| NVIDIA OpenCL | 13.28→2.70ms | 25.30→14.86ms |
+| Intel Iris Xe OpenCL | 13.05→4.13ms（3.16×） | 25.73→15.93ms |
+
+验证：5 个实际后端在 515 张干净历史帧上的掩码、棋子、目标与瞄点完全相同；
+35 组合边界、尺寸往返、非连续输入及返回结果生命周期通过。
+NVIDIA 与 Intel 各自穷举全部 16,777,216 种 BGR 颜色，HSV 逐通道与 OpenCV 一致。
+缺少可选库、显式 GPU 执行失败、禁用全部加速、无匹配设备时均能正确回退。
+最终自检、576 帧关键回归（识别成功仍 492、读分 20/20、界面 5/5）通过；
+自动、Intel OpenCL、CPU 三种模式分别重放 12 跳，落地和起跳确认全部通过。
+这些属于离线验证与当前机器的识别耗时，未增加新的实机命中率或单跳节奏结论。
+
+安装包版本 1.1：`installer-accelerated/jumpbot-setup-1.1-full.exe` 和
+`installer-portable/jumpbot-setup-1.1-portable.exe`。两版安装目录/卸载 ID 独立，
+升级时保留已有 `config.json`；不包含调试缓存和运行日志。
+完整加速版沿用原 jumpbot 安装身份，轻量版安装到 `jumpbot-portable`。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\installer\build_installer.ps1 -SkipAppBuild -Flavor full -Version 1.1 -PayloadDir "D:\Codex Workspace\jumpbot\dist-accelerated\jumpbot" -OutputDir "D:\Codex Workspace\jumpbot\installer-accelerated"
+powershell -ExecutionPolicy Bypass -File tools\installer\build_installer.ps1 -SkipAppBuild -Flavor portable -Version 1.1 -PayloadDir "D:\Codex Workspace\jumpbot\dist-portable\jumpbot" -OutputDir "D:\Codex Workspace\jumpbot\installer-portable"
+```
+
+OpenCL 的平台和驱动要求参考 [Khronos OpenCL](https://www.khronos.org/opencl/)，
+Python 接口参考 [PyOpenCL](https://documen.tician.de/pyopencl/runtime.html)。
+
+## CUDA 融合内核优化（2026-10-07 第一阶段）
+
+本段保留第一阶段实测记录；OpenCL 后续正式接入和交付入口以上节为准。
+
+第一阶段默认仍为 `masks_backend="auto"`：实测 GPU 至少快 1.5 倍才使用，每 300 帧复测；
+GPU 负载退化或计算失败时回退 CPU SIMD。CPU NumPy / OpenCV SIMD / CuPy CUDA 都保留。
+当时 OpenCL（UMat）仅在 `tools/bench_vision.py` 中供实验；当前 OpenCV 未编译 CUDA，
+`cv2.cuda` 尚未接入正式链路。
+
+这次把 BGR→HSV、颜色/亮度阈值、画布裁切、棋子与方块掩码融合为一个 CuPy `RawKernel`。
+HSV 使用 OpenCV `RGB2HSV_b` 的整数查表和舍入规则；只上传 BGR 和背景行，
+两个掩码合并为一次阻塞下载。设备缓冲区按尺寸复用，返回的 CPU 掩码独立属于本帧。
+背景边带中位数/线性拟合仍在 CPU 上；连通域、目标选择、读分与控制判据保持原实现。
+自检会明确区分真实 CUDA 与 CPU 回退，避免 GPU 不可用时也报“GPU 核对通过”。
+
+**同一进程交错 A/B（RTX 3070 Ti Laptop、CuPy 14.2.0、OpenCV 4.14.0、4 线程）**：
+对照为本地提交 `fdfcd9b` 的 `_masks_gpu`，8 张代表帧、每路 120 次、预热后计时。
+以下时间包含 CPU 预处理、数据上传、CUDA 执行和结果下载，均非单纯内核提交时间。
+
+| 项目 | 优化前中位 | 优化后中位 | 优化前 p90 | 优化后 p90 |
+| --- | --- | --- | --- | --- |
+| CUDA 掩码 | 3.866 ms | **1.920 ms（2.01×）** | 4.859 ms | 2.226 ms |
+| 完整 detect | 15.555 ms | **12.693 ms（耗时 -18.4%）** | 28.936 ms | 26.390 ms |
+
+这只能证明当前机器、当前录制帧和当时负载下的识别提速。游戏飞行动画不受 CUDA 加速影响；
+本次没有进行新的实机 500 跳命中率或单跳节奏测试，不能把掩码 2× 外推成游戏速度 2×。
+
+**验证证据**：515 张干净历史帧（剔除 61 张派生/标注图）的两种掩码、棋子、目标、瞄点
+与旧实现全部相同；掩码也与 SIMD 逐像素一致。75 个合成边界/尺寸切换/非连续输入用例通过。
+全部 **16,777,216 种 uint8 BGR 颜色**转换后的 H/S/V 与本机 OpenCV 逐通道一致。
+1000 帧缓冲复用测试中，设备池活动内存 **2,909,696 → 2,909,696 bytes**；
+非默认 CUDA 流和注入内核异常后的自动回退均通过。
+三条门禁：`--selftest` 通过；`regress.py` 576 帧（成功 492 / 无目标 30 / 可疑 21，
+与基线相同）、读分 20/20、界面 5/5、关键帧全过；重放落地/起跳确认均 12/12。
+`pyflakes` 零告警；全局名启发式扫描仅有历史已知的两处局部遮蔽误报。
+
+复现命令（全程禁止真实游戏输入）：
+
+```powershell
+& "D:\Codex Workspace\.venv\Scripts\python.exe" tools\bench_cuda.py --reference fdfcd9b --verify-hsv --out build\cuda_benchmark.json
+```
+
+详细数据（含配置、源码 SHA256、逐帧指纹）：`build/cuda_benchmark.json`。
+单独打包以保留旧版运行数据：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\build_app.ps1 -DistRoot "D:\Codex Workspace\jumpbot\dist-cuda" -WorkRoot "D:\Codex Workspace\jumpbot\build\cuda"
+```
+
+优化版入口：`dist-cuda/jumpbot/run_long.bat`，自检：`dist-cuda/jumpbot/selftest.bat`。
+绿色版已生成（约 400 MB），打包前后及移除可选 DLL 后均完成自检，
+最终打包版真实 CUDA 掩码约 1.79ms，GPU vs SIMD 差异 0。
+`dist/jumpbot/`、已安装软件和旧安装包不会自动变更；使用新入口才能运行本次优化。
+下方 2026-10-01 的性能记录保留为历史，最新 CUDA 数据以上述 A/B 为准。
+CuPy 官方参考：[RawKernel](https://docs.cupy.dev/en/stable/reference/generated/cupy.RawKernel.html)、
+[性能计时和预热](https://docs.cupy.dev/en/stable/user_guide/performance.html)。
+OpenCV 适配部分的许可与来源见 `THIRD_PARTY_NOTICES.md` / `LICENSE-OpenCV.txt`。
 
 ## 性能与优化总览（截至 2026-10-01 10:50，全部为实测值）
 

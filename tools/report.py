@@ -8,7 +8,7 @@
     python tools/report.py --json              # 附带 JSON 摘要
 
 统计口径（与 jumpbot.py 完全一致，便于验收对照）：
-    - 落地率 = landed / (landed + died)
+    - 落地率 = landed / 所有已发起的跳跃（不可核对不算成功落地）
     - 真实命中率 = score_hits / (score_hits + score_misses)
       判据来自 HUD 分数增量：delta==1 → 普通落点；delta==min(2×连击,32) → 命中中心；
       偶数 delta≥4 且 ≤32 → 计数错位，按增量反推连击数（仍记为命中）；
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -27,6 +28,18 @@ from _scorelog import as_float, as_int, iter_labels, parse_csv  # noqa: E402
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 LOGS_DIR = PROJECT_DIR / "logs"
+
+
+def wilson(successes: int, total: int) -> list[float] | None:
+    """Two-sided 95% Wilson interval, expressed in percent."""
+    if not total:
+        return None
+    z = 1.959963984540054
+    p = successes / total
+    denominator = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denominator
+    radius = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denominator
+    return [round(max(0, center - radius) * 100, 2), round(min(1, center + radius) * 100, 2)]
 
 
 def analyze(rows: list[dict]) -> dict:
@@ -81,7 +94,7 @@ def analyze(rows: list[dict]) -> dict:
             hits += 1
         elif label == 0:
             misses += 1
-        elif label == -1:
+        elif result not in ("died", "dead", "stopped"):
             unknown += 1
         best_streak = max(best_streak, streak)
 
@@ -103,15 +116,21 @@ def analyze(rows: list[dict]) -> dict:
                 false_death_indices.append(idx)
 
     judged = hits + misses
+    attempts = sum((r.get("result") or "").strip() != "stopped" for r in rows)
     return {
         "rows": len(rows),
+        "attempts": attempts,
         "landed": landed,
         "died": died,
-        "land_rate": round(landed / max(landed + died, 1) * 100, 2),
+        "unresolved": max(0, attempts - landed - died),
+        "land_rate": round(landed / attempts * 100, 2) if attempts else None,
+        "land_rate_ci95": wilson(landed, attempts),
         "score_hits": hits,
         "score_misses": misses,
         "score_unknown": unknown,
         "hit_rate": round(hits / judged * 100, 2) if judged else None,
+        "hit_rate_ci95": wilson(hits, judged),
+        "judgement_coverage": round(judged / attempts * 100, 2) if attempts else None,
         "best_streak": best_streak,
         "best_alive": best_alive,
         "best_life_score": best_life_score,
@@ -159,6 +178,11 @@ def main() -> int:
     hit_text = f"{s['hit_rate']}%" if s["hit_rate"] is not None else "n/a"
     print(f"真实命中/普通/无法判定: {s['score_hits']} / {s['score_misses']} / {s['score_unknown']}"
           f"  → 命中率 {hit_text}（分母 {judged}）")
+    print(f"判定覆盖率: {s['judgement_coverage']}%；落地/命中 95% Wilson 区间: "
+          f"{s['land_rate_ci95']} / {s['hit_rate_ci95']}")
+    recent = analyze(rows[-100:])
+    print(f"最近 {len(rows[-100:])} 跳: 落地 {recent['land_rate']}%，命中 {recent['hit_rate']}%，"
+          f"覆盖率 {recent['judgement_coverage']}%")
     print(f"最长连续命中: {s['best_streak']}；单条命最长存活: {s['best_alive']} 跳；"
           f"单条命最高分: {s['best_life_score']}")
     if s["death_indices"]:

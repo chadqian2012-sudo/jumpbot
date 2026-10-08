@@ -1,0 +1,24 @@
+name: Windows offline safety
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: windows-latest
+    env:
+      JUMPBOT_NO_INPUT: '1'
+      JUMPBOT_DISABLE_CUDA: '1'
+      JUMPBOT_DISABLE_OPENCL: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pyflakes
+      - run: python -m py_compile jumpbot.py run_control.py tools/report.py tools/_scorelog.py tools/dashboard.py tools/check_cuda_driver.py tools/live_acceptance.py tools/summarize_acceptance.py
+      - run: python -m pyflakes jumpbot.py run_control.py tests tools/report.py tools/_scorelog.py tools/dashboard.py tools/check_cuda_driver.py tools/live_acceptance.py tools/summarize_acceptance.py
+      - run: python -m unittest discover -s tests -v
+      - run: python jumpbot.py --selftest --no-cuda --no-opencl

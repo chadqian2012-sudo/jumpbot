@@ -46,6 +46,10 @@ STATE_TEXT = {
     "game_over": "结算页",
     "blocked_modal": "被弹窗遮挡",
     "waiting_window": "正在等待游戏窗口",
+    "countdown": "开跑倒计时",
+    "pausing": "准备暂停（收尾当前操作）",
+    "paused": "已暂停（可以做其他事情）",
+    "resuming": "恢复中（重新定位/识别）",
     "stopped": "已停止",
 }
 
@@ -238,6 +242,7 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
         lines.append(f"脚本 PID   : {status.get('pid')}")
         lines.append("")
         lines.append("正在等待游戏窗口…")
+        lines.append(f"{status.get('pause_hotkey', 'Alt+P')} 暂停/恢复；F8 停止脚本")
         waited = status.get("waited_s")
         if waited:
             lines.append(f"已等待 {int(waited)} 秒")
@@ -258,6 +263,14 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
                          f"客户区={win.get('client')}")
         lines.append(f"运行时长   : {status.get('elapsed_text', '—')}    "
                      f"本轮进度: {status.get('jumps', 0)}/{status.get('max_jumps', '?')}")
+        lines.append(f"暂停/恢复  : {status.get('pause_hotkey', 'Alt+P')} / 控制台 P"
+                     f"    已暂停 {status.get('pause_total_s', 0):.1f} 秒")
+        if status.get('hotkey_registered') is False:
+            lines.append("全局热键   : 未启用（只有控制台 P 可切换暂停）")
+        if status.get('hotkey_error'):
+            lines.append(f"热键提示   : {status['hotkey_error']}（控制台 P 可用）")
+        if status.get('countdown_s') is not None:
+            lines.append(f"倒计时     : {status['countdown_s']:.1f} 秒")
         if status.get("mask_backend"):
             lines.append(f"掩码后端   : {status.get('mask_backend')}"
                          f"{'（' + str(status.get('mask_bench_ms')) + '）' if status.get('mask_bench_ms') else ''}")
@@ -282,7 +295,16 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
                          f"({view['hits']}/{view['hits'] + view['misses']})")
         lines.append(f"落地/死亡  : {view['landed']} / {view['deaths']}"
                      f"    落地率: "
-                     f"{(view['landed'] / max(view['landed'] + view['deaths'], 1) * 100):.1f}%")
+                     f"{(view['landed'] / max((status or {}).get('attempts', view['landed'] + view['deaths']), 1) * 100):.1f}%")
+        if status and 'recent100' in status:
+            recent = status['recent100']
+            recent_rate = recent.get('hit_rate')
+            text = '—' if recent_rate is None else f'{recent_rate:.1f}%'
+            lines.append(f"最近100跳  : 命中 {text}；可判定 {recent.get('judged', 0)}"
+                         f" / {recent.get('attempts', 0)}")
+            coverage = status.get('judgement_coverage')
+            if coverage is not None:
+                lines.append(f"判定覆盖率 : {coverage:.1f}%    不可判定 {status.get('unknown', 0)}")
         lines.append(f"连击       : 当前 {view['streak']}   最长 {view['best_streak']}"
                      f"    跳数: {view['jumps']}")
         last = view.get("last") or {}
@@ -295,10 +317,10 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
             lines.append(f"        {note[:110]}")
         age = time.time() - view.get("mtime", time.time())
         lines.append("-" * 62)
-        waiting = bool(status and status.get("state") == "waiting_window")
+        waiting = bool(status and status.get("state") in ("waiting_window", "paused", "countdown", "resuming"))
         stale = (age > 15) and not waiting
         lines.append(f"数据更新   : {age:.1f} 秒前（来源 {view.get('source', 'csv')}）"
-                     + ("   ⏳ 正在等游戏窗口，不算卡住" if waiting
+                     + ("   ⏳ 控制等待/已暂停，不算卡住" if waiting
                         else ("   ⚠ 超过 15 秒未更新，脚本可能已停止/卡住" if stale else "")))
     else:
         lines.append("-" * 62)
@@ -337,7 +359,7 @@ def main() -> int:
                     age = time.time() - float(data.get("updated_at", 0))
                     # 等待窗口时脚本只每 2 秒写一次心跳，这里放宽到 120 秒；
                     # 真停止时 status 里 alive=False，会走下面的停止分支。
-                    if age < 120.0 and data.get("alive") is not False:
+                    if age < 120.0:
                         status = data
                 except Exception:
                     status = None

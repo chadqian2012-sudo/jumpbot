@@ -3,10 +3,12 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools\build_app.ps1            # with GPU (CuPy+CUDA runtime)
-#   powershell -ExecutionPolicy Bypass -File tools\build_app.ps1 -NoGpu     # CPU-only (smaller)
+#   powershell -ExecutionPolicy Bypass -File tools\build_app.ps1 -NoGpu     # portable OpenCL+CPU (no CUDA)
 param(
     [string]$Root = "D:\Codex Workspace\jumpbot",
     [string]$Python = "D:\Codex Workspace\.venv\Scripts\python.exe",
+    [string]$DistRoot = "",
+    [string]$WorkRoot = "",
     [switch]$NoGpu,
     [switch]$Shortcut
 )
@@ -24,16 +26,21 @@ try {
 Push-Location $Root
 try {
     Write-Host "== PyInstaller build (GPU=$($env:JUMPBOT_WITH_GPU)) =="
-    & $Python -m PyInstaller --noconfirm --clean (Join-Path $Root "tools\jumpbot.spec")
+    $buildArgs = @('--noconfirm', '--clean')
+    if ($DistRoot) { $buildArgs += @('--distpath', $DistRoot) }
+    if ($WorkRoot) { $buildArgs += @('--workpath', $WorkRoot) }
+    $buildArgs += (Join-Path $Root "tools\jumpbot.spec")
+    & $Python -m PyInstaller @buildArgs
     if ($LASTEXITCODE -ne 0) { Write-Error "PyInstaller failed"; exit 3 }
 
-    $exe = Join-Path $Root "dist\jumpbot\jumpbot.exe"
+    $distBase = if ($DistRoot) { $DistRoot } else { Join-Path $Root "dist" }
+    $appDir = Join-Path $distBase "jumpbot"
+    $exe = Join-Path $appDir "jumpbot.exe"
     if (-not (Test-Path $exe)) { Write-Error "exe not found: $exe"; exit 4 }
 
     Write-Host "== selftest (no game window needed) =="
     & $exe --selftest
-
-    $appDir = Join-Path $Root "dist\jumpbot"
+    if ($LASTEXITCODE -ne 0) { throw "app selftest failed" }
 
     # Trim files verified as unnecessary (keeps the frozen GPU stack working):
     #  * opencv ffmpeg decoder (~29MB): we only decode PNG templates
@@ -54,6 +61,15 @@ try {
             }
     }
     if ($saved -gt 0) { Write-Host ("trim total: {0:N0} MB" -f ($saved / 1MB)) }
+    # Verify the delivered runtime too, after removing optional DLLs.
+    & $exe --selftest
+    if ($LASTEXITCODE -ne 0) { throw "trimmed app selftest failed" }
+    $licenseArgs = @('-AppDir', $appDir, '-Python', $Python)
+    if (-not $NoGpu) { $licenseArgs += '-Full' }
+    & (Join-Path $Root 'tools\collect_licenses.ps1') @licenseArgs
+    if (-not (Test-Path -LiteralPath (Join-Path $appDir 'config.json'))) {
+        Copy-Item -LiteralPath (Join-Path $Root 'config.json') -Destination (Join-Path $appDir 'config.json')
+    }
     $size = (Get-ChildItem $appDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
     Write-Host ("app folder size after trim: {0:N0} MB" -f $size)
     $longBat = @"
@@ -77,10 +93,19 @@ cd /d "%~dp0"
 jumpbot.exe --selftest
 pause
 "@
+    $cpuBat = @"
+@echo off
+rem Force CPU SIMD; do not initialize optional CUDA or OpenCL runtimes.
+cd /d "%~dp0"
+jumpbot.exe --backend simd --no-cuda --no-opencl --max-jumps 5000 --daemon
+pause
+"@
     Set-Content -Path (Join-Path $appDir "run_long.bat")   -Value $longBat -Encoding ASCII
     Set-Content -Path (Join-Path $appDir "run_dryrun.bat") -Value $dryBat  -Encoding ASCII
     Set-Content -Path (Join-Path $appDir "selftest.bat")   -Value $selfBat -Encoding ASCII
-    Write-Host "launchers written: run_long.bat / run_dryrun.bat / selftest.bat"
+    Set-Content -Path (Join-Path $appDir "run_cpu.bat")    -Value $cpuBat -Encoding ASCII
+    Copy-Item -LiteralPath (Join-Path $Root 'README.md') -Destination (Join-Path $appDir 'README.md')
+    Write-Host "launchers written: run_long.bat / run_cpu.bat / run_dryrun.bat / selftest.bat"
 
     if ($Shortcut) {
         $desktop = [Environment]::GetFolderPath("Desktop")
