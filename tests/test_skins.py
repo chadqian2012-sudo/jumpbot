@@ -143,6 +143,36 @@ class SkinTests(unittest.TestCase):
         self.assertAlmostEqual(p.y, 643, delta=3)
         self.assertTrue(J._foot_on_block(bm, p, self.cfg))
 
+    def test_broken_gold_head_arc_is_recovered_without_relaxing_geometry(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-white-book.png'))
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 150, delta=3)
+                self.assertAlmostEqual(p.y, 659, delta=3)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_broken_head_reconstruction_is_not_a_gold_hue_rule(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-white-book.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        material = cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        bounds = np.zeros(material.shape, dtype=bool)
+        bounds[546:663, 125:178] = True
+        material &= bounds
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][material] = hue
+                hsv[:, :, 1][material] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 150, delta=3)
+                self.assertAlmostEqual(p.y, 659, delta=3)
+
     def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
         vision = J.Vision(self.cfg)
         original = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)

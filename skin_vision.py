@@ -42,6 +42,59 @@ def _aligned_body(shape, hx, hy, hw, hh):
             and abs((bx + bw * .5) - (hx + hw * .5)) <= diameter * .25)
 
 
+def _head_material(lab, head, hx, hy, hw, hh):
+    """Sample material from a contour's eroded interior in this frame only."""
+    head_mask = np.zeros((hh, hw), dtype=np.uint8)
+    cv2.drawContours(head_mask, [head - np.array([[[hx, hy]]], np.int32)],
+                     -1, 255, cv2.FILLED)
+    core = cv2.erode(head_mask, np.ones((3, 3), np.uint8)) > 0
+    if not core.any():
+        return None
+    head_pixels = lab[hy:hy + hh, hx:hx + hw][core].astype(np.float32)
+    colour = np.median(head_pixels, axis=0)
+    spread = np.percentile(np.linalg.norm(head_pixels[:, 1:] - colour[1:], axis=1), 80)
+    return colour, float(np.clip(spread + 6, 12, 20)), core
+
+
+def _material_plane(pixels, colour, chroma_tolerance):
+    values = pixels.astype(np.float32)
+    return (((np.linalg.norm(values - colour, axis=2) <= 35)
+             & (np.linalg.norm(values[:, :, 1:] - colour[1:], axis=2) <= chroma_tolerance))
+            .astype(np.uint8) * 255)
+
+
+def _recover_round_heads(lab, fragment, hx, hy, hw, hh):
+    """Propose a complete head from a broken edge, not a relaxed head gate.
+
+    Glitter can split the top and bottom head arcs into two flattened contours.
+    A tight, fragment-seeded local material component may recover the circle;
+    cropped components and components not containing the seed are rejected.
+    The caller still applies the original full-head geometry thresholds.
+    """
+    sample = _head_material(lab, fragment, hx, hy, hw, hh)
+    if sample is None:
+        return []
+    colour, tolerance, seed = sample
+    pad = int(math.ceil(max(hw, hh) * .4))
+    x0, x1 = max(0, hx - pad), min(lab.shape[1], hx + hw + pad)
+    y0, y1 = max(0, hy - pad), min(lab.shape[0], hy + hh + pad)
+    plane = _material_plane(lab[y0:y1, x0:x1], colour, tolerance)
+    plane = cv2.morphologyEx(plane, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    heads = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if x <= 0 or y <= 0 or x + w >= x1 - x0 or y + h >= y1 - y0:
+            continue
+        component = np.zeros(plane.shape, np.uint8)
+        cv2.drawContours(component, [contour], -1, 255, cv2.FILLED)
+        seed_hits = component[hy-y0:hy-y0+hh, hx-x0:hx-x0+hw][seed]
+        if (seed_hits > 0).mean() < .6:
+            continue
+        heads.append(contour + np.array([[[x0, y0]]], np.int32))
+    return heads
+
+
 def _material_bodies(lab, head, hx, hy, hw, hh):
     """Recover an outline from this frame's head material, never a hue table.
 
@@ -52,16 +105,10 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     All normal geometry/material/support/uniqueness gates still apply.
     """
     diameter = (hw + hh) * .5
-    head_mask = np.zeros((hh, hw), dtype=np.uint8)
-    cv2.drawContours(head_mask, [head - np.array([[[hx, hy]]], np.int32)],
-                     -1, 255, cv2.FILLED)
-    core = cv2.erode(head_mask, np.ones((3, 3), np.uint8)) > 0
-    if not core.any():
+    sample = _head_material(lab, head, hx, hy, hw, hh)
+    if sample is None:
         return []
-    head_pixels = lab[hy:hy + hh, hx:hx + hw][core].astype(np.float32)
-    colour = np.median(head_pixels, axis=0)
-    chroma_spread = np.percentile(np.linalg.norm(head_pixels[:, 1:] - colour[1:], axis=1), 80)
-    chroma_tolerance = float(np.clip(chroma_spread + 6, 12, 20))
+    colour, chroma_tolerance, core = sample
     cx = hx + hw * .5
     x0 = max(0, int(math.floor(cx - diameter * .85)) - 2)
     x1 = min(lab.shape[1], int(math.ceil(cx + diameter * .85)) + 2)
@@ -69,10 +116,7 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     y1 = min(lab.shape[0], int(math.ceil(y0 + diameter * 4.15)) + 2)
     if y1 <= y0 or x1 <= x0:
         return []
-    pixels = lab[y0:y1, x0:x1].astype(np.float32)
-    material = ((np.linalg.norm(pixels - colour, axis=2) <= 35)
-                & (np.linalg.norm(pixels[:, :, 1:] - colour[1:], axis=2) <= chroma_tolerance))
-    material = material.astype(np.uint8) * 255
+    material = _material_plane(lab[y0:y1, x0:x1], colour, chroma_tolerance)
     # Close single-pixel glitter gaps, not the space between head and body.
     kernel = np.ones((3, 3), np.uint8)
     planes = [cv2.morphologyEx(material, cv2.MORPH_CLOSE, kernel)]
@@ -172,6 +216,21 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
                 and .80 <= bw / bh <= 1.25 and circularity >= .84
                 and solidity >= .72):
             heads.append((x, y, bw, bh, hull, circularity))
+        elif (max(8, width * .018) <= bw <= width * .10
+              and .65 <= bw / bh <= 1.55 and circularity >= .78 and solidity >= .72):
+            for recovered in _recover_round_heads(lab, hull, x, y, bw, bh):
+                rx, ry, rw, rh = cv2.boundingRect(recovered)
+                recovered_hull = cv2.convexHull(recovered)
+                recovered_area = cv2.contourArea(recovered_hull)
+                if recovered_area < 20:
+                    continue
+                perimeter = cv2.arcLength(recovered_hull, True)
+                roundness = 4 * math.pi * recovered_area / max(perimeter * perimeter, 1)
+                recovered_solidity = cv2.contourArea(recovered) / recovered_area
+                if (max(8, width * .018) <= rw <= width * .10
+                        and .80 <= rw / rh <= 1.25 and roundness >= .84
+                        and recovered_solidity >= .72):
+                    heads.append((rx, ry, rw, rh, recovered_hull, roundness))
 
     matches = []
     for hx, hy, hw, hh, head, circularity in heads:
