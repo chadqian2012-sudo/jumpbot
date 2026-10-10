@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""控制逻辑重放回归：用**真实录制的连续帧**验证 落地 settle 与 起跳前一致性确认。
+"""控制逻辑重放回归：用**真实录制的原始帧对**验证 落地 settle 与 起跳前一致性确认。
 
 现有测试面（regress.py）只覆盖"单帧识别"，状态机/落地判据没有回归保护。
-这个脚本用历史 `--save-debug` 录下的三连帧做重放：
-    jump_NNN_before.png  起跳前（画面稳定）
-    jump_NNN_raw.png     按下瞬间（画面在动）
-    jump_NNN_after.png   落地后（画面稳定）
-重放序列 [raw, after, after, after, ...] 给 wait_landing，必须判为 landed；
-重放 [before, before] 给 acquire_frame，必须给出棋子+目标。
+这个脚本只用 `--save-debug` 录下的原始帧，绝不把画过框线的 before/after 标注图当作原图：
+    jump_NNN_raw.png        起跳前原始帧
+    jump_NNN_raw_after.png  落地后原始帧
+重放序列 [raw, raw_after, raw_after, ...] 给 wait_landing，必须判为 landed；
+重放 [raw, raw] 给 acquire_frame，必须给出棋子+目标。
+这不是完整飞行动画录像，也不能代替实机验收。
 
 安全：全程 FakeCtrl（绝不发真实输入）+ 假窗口 + JUMPBOT_NO_INPUT=1。
 
@@ -91,10 +91,23 @@ def pick_dir(explicit: str | None) -> Path | None:
     for d in (PROJECT_DIR / "debug").glob("run_*"):
         if not d.is_dir():
             continue
-        n = len(list(d.glob("jump_*_before.png")))
-        if n > best_n and (d / "jump_001_raw.png").exists():
+        n = len(pick_triples(d))
+        if n > best_n:
             best, best_n = d, n
     return best
+
+
+def pick_triples(directory: Path) -> list:
+    """Keep the caller's three-value contract, using only clean raw pairs."""
+    triples = []
+    for raw in sorted(directory.glob("jump_*_raw.png")):
+        match = re.fullmatch(r"jump_(\d+)_raw\.png", raw.name)
+        if match is None:
+            continue
+        after = directory / f"jump_{match.group(1)}_raw_after.png"
+        if after.exists():
+            triples.append((raw, raw, after))
+    return triples
 
 
 def main() -> int:
@@ -108,23 +121,18 @@ def main() -> int:
     ap.add_argument("--config", default=str(PROJECT_DIR / "config.json"))
     ap.add_argument("--max", type=int, default=12, help="最多重放几跳")
     args = ap.parse_args()
+    if args.max < 1:
+        ap.error('--max must be positive')
 
     run_dir = pick_dir(args.dir or None)
     if run_dir is None:
-        print("找不到含 jump_NNN_{before,raw,after}.png 的目录", file=sys.stderr)
+        print("找不到含 jump_NNN_raw/raw_after.png 原始帧对的目录", file=sys.stderr)
         return 2
     cfg = J.Config.load(Path(args.config))
-    triples = []
-    for before in sorted(run_dir.glob("jump_*_before.png")):
-        m = re.search(r"jump_(\d+)_before", before.name)
-        if not m:
-            continue
-        idx = m.group(1)
-        raw = run_dir / f"jump_{idx}_raw.png"
-        after = run_dir / f"jump_{idx}_after.png"
-        if raw.exists() and after.exists():
-            triples.append((before, raw, after))
-    triples = triples[: args.max]
+    triples = pick_triples(run_dir)[:args.max]
+    if not triples:
+        print('目录中没有完整原始帧对，拒绝使用标注图', file=sys.stderr)
+        return 2
     print(f"重放目录：{run_dir.name}，取 {len(triples)} 跳")
 
     win = None

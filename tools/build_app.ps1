@@ -13,6 +13,7 @@ param(
     [switch]$Shortcut
 )
 $ErrorActionPreference = "Stop"
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility') -ErrorAction Stop
 $env:JUMPBOT_WITH_GPU = if ($NoGpu) { "0" } else { "1" }
 
 # Packaging is CPU heavy; drop to BelowNormal so a running game keeps priority.
@@ -25,6 +26,12 @@ try {
 
 Push-Location $Root
 try {
+    $sourceCommit = (git rev-parse HEAD).Trim()
+    if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'source commit unavailable' }
+    $sourceHashes = [ordered]@{}
+    foreach ($sourceFile in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py')) {
+        $sourceHashes[$sourceFile] = (Get-FileHash -LiteralPath (Join-Path $Root $sourceFile) -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
     Write-Host "== PyInstaller build (GPU=$($env:JUMPBOT_WITH_GPU)) =="
     $buildArgs = @('--noconfirm', '--clean')
     if ($DistRoot) { $buildArgs += @('--distpath', $DistRoot) }
@@ -106,6 +113,18 @@ pause
     Set-Content -Path (Join-Path $appDir "run_cpu.bat")    -Value $cpuBat -Encoding ASCII
     Copy-Item -LiteralPath (Join-Path $Root 'README.md') -Destination (Join-Path $appDir 'README.md')
     Write-Host "launchers written: run_long.bat / run_cpu.bat / run_dryrun.bat / selftest.bat"
+    foreach ($sourceFile in $sourceHashes.Keys) {
+        if ($sourceHashes[$sourceFile] -ne (Get-FileHash -LiteralPath (Join-Path $Root $sourceFile) -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw "source changed during build: $sourceFile"
+        }
+    }
+    $buildManifest = [ordered]@{
+        commit = $sourceCommit
+        flavor = $(if ($NoGpu) { 'portable' } else { 'full' })
+        exe_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+        source_sha256 = $sourceHashes
+    }
+    [System.IO.File]::WriteAllText((Join-Path $appDir 'build-source.json'), ($buildManifest | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
 
     if ($Shortcut) {
         $desktop = [Environment]::GetFolderPath("Desktop")

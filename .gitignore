@@ -3,6 +3,7 @@ dist/
 dist-cuda/
 dist-portable/
 dist-accelerated/
+dist-bugfix-*/
 build/
 /release/
 /installer/

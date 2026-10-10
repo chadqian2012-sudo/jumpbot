@@ -38,7 +38,8 @@ def main():
         parser.error('positive jump counts required')
     args.out.mkdir(parents=True, exist_ok=True)
     hashes = {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-              for name in ['jumpbot.py', 'run_control.py', 'config.json', 'tools/live_acceptance.py']}
+              for name in ['jumpbot.py', 'run_control.py', 'skin_vision.py',
+                           'config.json', 'tools/live_acceptance.py']}
     audit_lock = threading.Lock()
     finished = threading.Event()
     counts = dict(mouse_events=0, down=0, up=0, foreground_calls=0, capture_calls=0,
