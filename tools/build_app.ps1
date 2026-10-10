@@ -83,7 +83,7 @@ try {
 @echo off
 rem Launch jumpbot in long-run mode (auto-resume when the game window comes back).
 cd /d "%~dp0"
-jumpbot.exe --max-jumps 5000 --daemon
+jumpbot.exe --max-jumps 0 --daemon
 pause
 "@
     $dryBat = @"
@@ -104,7 +104,7 @@ pause
 @echo off
 rem Force CPU SIMD; do not initialize optional CUDA or OpenCL runtimes.
 cd /d "%~dp0"
-jumpbot.exe --backend simd --no-cuda --no-opencl --max-jumps 5000 --daemon
+jumpbot.exe --backend simd --no-cuda --no-opencl --max-jumps 0 --daemon
 pause
 "@
     Set-Content -Path (Join-Path $appDir "run_long.bat")   -Value $longBat -Encoding ASCII
@@ -132,7 +132,7 @@ pause
         $shell = New-Object -ComObject WScript.Shell
         $sc = $shell.CreateShortcut($lnk)
         $sc.TargetPath = $exe
-        $sc.Arguments = "--max-jumps 5000 --daemon"
+        $sc.Arguments = "--max-jumps 0 --daemon"
         $sc.WorkingDirectory = $appDir
         $sc.Description = "jumpbot - long run mode"
         $sc.Save()

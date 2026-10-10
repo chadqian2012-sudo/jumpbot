@@ -336,7 +336,7 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(result['unknown'], 1)
 
     def simulate_play(self, count, pause_every=0, unknown_every=0, pause_restart=False,
-                      missing_after=None, confirmed_gameover=False):
+                      missing_after=None, confirmed_gameover=False, unlimited=False):
         """Entire play caller, synthetic scoreboard, fake input/window/capture."""
         import numpy as np
         J = self.j
@@ -346,7 +346,7 @@ class ApplicationTests(unittest.TestCase):
         piece = SimpleNamespace(x=200., y=800., bbox=(180, 700, 40, 100))
         target = SimpleNamespace(x=400., y=684.52, bbox=(320, 630, 160, 80),
                                  top_width=140., dot=None)
-        cfg = J.Config(k=2.61, gamma=0, max_jumps=count, max_runtime_s=100000,
+        cfg = J.Config(k=2.61, gamma=0, max_jumps=0 if unlimited else count, max_runtime_s=100000,
                        window_size_policy='off', start_delay_s=0,
                        masks_backend='simd', center_dot_max_offset_px=0)
         class FakeVision:
@@ -356,6 +356,9 @@ class ApplicationTests(unittest.TestCase):
             def reset_prior(self):
                 pass
             def detect(self, _):
+                if unlimited and counters['presses'] >= count:
+                    owner.control.stop('bounded offline test stop')
+                    raise ControlInterrupted('test reached its own bound')
                 if missing_after is not None and counters['presses'] >= missing_after:
                     return None, None, None, None
                 return piece, target, None, None
@@ -426,16 +429,30 @@ class ApplicationTests(unittest.TestCase):
                                              and counters['presses'] == 2
                                              else counters['score']))
             stack.enter_context(patch.object(J, 'LOG_DIR', Path(self.temp.name)))
-            args = J.build_parser().parse_args(['--config', str(config_path), '--max-jumps', str(count)])
+            args = J.build_parser().parse_args(['--config', str(config_path), '--max-jumps',
+                                               '0' if unlimited else str(count)])
             self.assertEqual(J.play(args), 0)
         actual = count if missing_after is None else missing_after
         self.assertEqual(counters['presses'], actual)
         self.assertEqual(J._STATUS['attempts'], actual)
         self.assertEqual(J._STATUS['deaths'], 1 if pause_restart else 0)
         self.assertEqual(J._STATUS['jumps'], actual)
-        self.assertEqual(J._LAST_STOP_REASON, '达到最大跳跃次数' if missing_after is None
+        self.assertEqual(J._LAST_STOP_REASON, '用户停止（F8 / q / Esc）' if unlimited
+                         else '达到最大跳跃次数' if missing_after is None
                          else '无法可靠识别人物/皮肤，停止；不触发盲跳')
         return J._STATUS.copy(), counters
+
+    def test_unlimited_play_still_stops_and_records_real_attempts(self):
+        status, counters = self.simulate_play(3, unlimited=True)
+        self.assertEqual(status['max_jumps'], 0)
+        self.assertEqual(counters['presses'], 3)
+        self.assertFalse(status['alive'])
+
+    def test_unlimited_play_restarts_after_a_committed_death(self):
+        status, counters = self.simulate_play(3, unlimited=True, pause_restart=True)
+        self.assertTrue(counters['restart_pause'])
+        self.assertEqual(status['deaths'], 1)
+        self.assertEqual(status['landed'], 2)
 
     def test_unknown_skin_does_not_start_or_restart_blindly(self):
         J = self.j

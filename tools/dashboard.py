@@ -10,13 +10,14 @@
 
 用法：
     python tools\\dashboard.py                 # 自动选最新日志
-    python tools\\dashboard.py --interval 0.5
+    python tools\\dashboard.py --interval 0.25
     python tools\\dashboard.py --once          # 只渲染一帧（调试用）
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -200,6 +201,37 @@ def progress_bar(ratio: float, width: int = 28) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def elapsed_text(status: dict) -> str:
+    """Interpolate only the timer, never scores/jumps or an old-format pause.
+
+    Monotonic clocks share a timebase across processes on Windows. Pause,
+    resume preparation and stopped checkpoints are frozen by the producer.
+    Cap extrapolation at the stale-data threshold if the producer disappears.
+    """
+    fallback = str(status.get("elapsed_text", "—"))
+    try:
+        elapsed = float(status["active_elapsed_s"])
+        stamp = float(status["updated_monotonic_s"])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    if not math.isfinite(elapsed) or not math.isfinite(stamp) or elapsed < 0:
+        return fallback
+    if (status.get("elapsed_running") is True and status.get("alive") is not False
+            and status.get("state") not in ("paused", "resuming", "stopped")):
+        elapsed += min(15.0, max(0.0, time.monotonic() - stamp))
+    seconds = int(elapsed)
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def jump_progress(status: dict) -> str:
+    count, limit = status.get("jumps", 0), status.get("max_jumps")
+    if limit == 0:
+        return f"本轮跳数: {count}（不限）"
+    if isinstance(limit, int) and limit > 0:
+        return f"本轮进度: {count}/{limit}"
+    return f"本轮跳数: {count}"
+
+
 def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ansi: bool) -> str:
     lines = []
     now = time.strftime("%H:%M:%S")
@@ -261,8 +293,7 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
         if win:
             lines.append(f"游戏窗口   : hwnd={win.get('hwnd')} pid={win.get('pid')} "
                          f"客户区={win.get('client')}")
-        lines.append(f"运行时长   : {status.get('elapsed_text', '—')}    "
-                     f"本轮进度: {status.get('jumps', 0)}/{status.get('max_jumps', '?')}")
+        lines.append(f"运行时长   : {elapsed_text(status)}    {jump_progress(status)}")
         lines.append(f"暂停/恢复  : {status.get('pause_hotkey', 'Alt+P')} / 控制台 P"
                      f"    已暂停 {status.get('pause_total_s', 0):.1f} 秒")
         if status.get('hotkey_registered') is False:
@@ -344,7 +375,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="跳一跳实时状态面板")
     ap.add_argument("--status", default=str(DEFAULT_STATUS))
     ap.add_argument("--csv", default="", help="指定 CSV；默认选最新")
-    ap.add_argument("--interval", type=float, default=0.5)
+    ap.add_argument("--interval", type=float, default=0.25)
     ap.add_argument("--once", action="store_true", help="只渲染一帧")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
@@ -355,7 +386,7 @@ def main() -> int:
     lower_priority()
     try:
         while True:
-            frame_start = time.time()
+            frame_start = time.monotonic()
             status = None
             if status_path.exists():
                 try:
@@ -367,13 +398,16 @@ def main() -> int:
                         status = data
                 except Exception:
                     status = None
-            csv_path = Path(args.csv) if args.csv else newest_csv()
             csv_stats = None
-            if csv_path and csv_path.exists():
-                try:
-                    csv_stats = stats_from_csv(csv_path)
-                except Exception:
-                    csv_stats = None
+            if status is None:
+                # The live status already contains the scoreboard. Unlimited
+                # runs must not scan/parse ever-growing logs every panel frame.
+                csv_path = Path(args.csv) if args.csv else newest_csv()
+                if csv_path and csv_path.exists():
+                    try:
+                        csv_stats = stats_from_csv(csv_path)
+                    except Exception:
+                        csv_stats = None
             # 有 status.json 时直接用里面的 pid，绝不为此起 PowerShell 查进程表
             if status is not None:
                 pid, _cmd = status.get("pid"), ""
@@ -399,8 +433,8 @@ def main() -> int:
                 time.sleep(3)
                 return 0
             # 按时间补偿：渲染本身可能耗时几十毫秒，sleep 里扣掉它，
-            # 保证"数据更新率"稳定在 --interval（默认 0.5 秒）一次。
-            elapsed = time.time() - frame_start
+            # 保证"数据更新率"稳定在 --interval（默认 0.25 秒）一次。
+            elapsed = time.monotonic() - frame_start
             time.sleep(max(0.05, interval - elapsed))
     except KeyboardInterrupt:
         log_exit("用户 Ctrl+C")
