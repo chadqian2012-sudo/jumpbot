@@ -43,7 +43,7 @@ def main():
     audit_lock = threading.Lock()
     finished = threading.Event()
     counts = dict(mouse_events=0, down=0, up=0, foreground_calls=0, capture_calls=0,
-                  paused_violations=0, automated_pause_cycles=0)
+                  paused_violations=0, automated_pause_cycles=0, backend_frames={})
     latest = {}
     captured_control = []
     audit_file = (args.out / 'input-audit.jsonl').open('w', encoding='utf8')
@@ -66,6 +66,7 @@ def main():
     original_foreground = J.force_foreground
     original_grab = J.Capturer.grab
     original_status = J.status_write
+    original_masks = J.Vision.masks
     listener_type = J.WindowsHotkeyListener
     listener = []
 
@@ -92,6 +93,17 @@ def main():
     def status(**fields):
         original_status(**fields)
         latest.update(J._STATUS)
+
+    def masks(self, frame):
+        guard('vision')
+        result = original_masks(self, frame)
+        actual = self._last_mask_backend or 'unknown'
+        frames = counts['backend_frames']
+        frames[actual] = frames.get(actual, 0) + 1
+        if J._STATUS.get('mask_backend') != actual:
+            status(mask_backend=actual)
+            audit('actual_backend', backend=actual)
+        return result
 
     def make_listener(control, poll_stop):
         instance = listener_type(control, poll_stop)
@@ -160,6 +172,7 @@ def main():
     try:
         with patch.object(J, '_send_mouse', mouse), patch.object(J, 'force_foreground', foreground), \
                 patch.object(J.Capturer, 'grab', grab), patch.object(J, 'status_write', status), \
+                patch.object(J.Vision, 'masks', masks), \
                 patch.object(J, 'WindowsHotkeyListener', make_listener):
             worker.start()
             rc = J.main(argv)
