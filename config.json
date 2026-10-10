@@ -73,6 +73,7 @@
   "piece_template_min_score": 0.45,
   "piece_prior_radius": 0.3,
   "piece_scan_min_score": 0.55,
+  "piece_skin_shape_enabled": true,
   "piece_scan_only_when_needed": true,
   "masks_simd": true,
   "masks_backend": "auto",

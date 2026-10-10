@@ -28,6 +28,7 @@ from contextlib import nullcontext
 
 from run_control import (RunControl, WindowsHotkeyListener, ControlInterrupted,
                          parse_hotkey, validate_timing)
+from skin_vision import find_skin_piece, has_horizontal_character_mask
 
 import cv2
 import numpy as np
@@ -808,6 +809,7 @@ class Config:
     piece_template_min_score: float = 0.45   # 与 templates/piece.png 的最低相关度
     piece_prior_radius: float = 0.30
     piece_scan_min_score: float = 0.55     # 模板扫描的最低相关度（用于跨皮肤找棋子）
+    piece_skin_shape_enabled: bool = True  # 颜色无关的圆头/收腰身体兜底；歧义时不采用
     # 模板扫描（piece_template_scan，实测 17.6ms/次）只在颜色路径**找不到棋子**时才跑。
     # 颜色路径是主路径（跨皮肤也有多模板兜底），这一步原本每帧无条件跑；实测它在
     # 绝大多帧里只是"再确认一次"，把 detect() 的 46.8ms 撑掉近 40%。默认关，
@@ -912,6 +914,8 @@ class Piece:
     bbox: tuple
     area: int
     tpl_score: float = 0.0      # 与棋子模板的归一化相关（越高越像棋子）
+    source: str = "legacy"     # legacy 彩色路径 / skin-shape 几何兜底
+    shape_score: float = 0.0   # 几何评分，不冒充彩色模板相关度
 
 
 _PIECE_TEMPLATES: list | None = None
@@ -966,7 +970,8 @@ def piece_template_score(frame: np.ndarray, bbox: tuple) -> float:
 def piece_template_scan(frame: np.ndarray, cfg: Config) -> list:
     """在画面下半部做多模板扫描，返回模板匹配到的棋子候选。
 
-    这条路径不依赖颜色（色相带只覆盖默认紫色皮肤），换皮肤后仍能找到棋子。
+    这条彩色模板路径不依赖固定色相带，但仍依赖模板颜色和比例。
+    找不到合法候选时，由独立的 skin_vision 几何路径处理其它颜色。
     """
     tpls = load_piece_templates()
     if not tpls:
@@ -1185,7 +1190,7 @@ def _top_face_center_fallback(comp_mask: np.ndarray, x_back: float, y_top: int,
 
 
 def find_dot_near(frame: np.ndarray, cx0: float, cy0: float, radius: float,
-                  cfg: Config) -> tuple | None:
+                  cfg: Config, *, accept=None) -> tuple | None:
     """在 (cx0, cy0) 周围 radius 像素内找游戏自带的中心标记（亮白小圆点）。
 
     返回 (cx, cy, area) 或 None。只接受：够亮（V≥阈值）、够白（S≤阈值）、
@@ -1223,6 +1228,8 @@ def find_dot_near(frame: np.ndarray, cx0: float, cy0: float, radius: float,
         dist = math.hypot(cx - cx0, cy - cy0)
         if dist > radius:
             continue
+        if accept is not None and not accept(cx, cy):
+            continue  # caller can reject current-platform highlights before ranking
         # 该连通域必须**比紧邻它的一圈**明显更亮——用局部环带做参考，
         # 这样"整片浅色背景/白墙面"不会因为整体亮而被误当成中心点。
         comp = _labels == idx
@@ -1258,6 +1265,7 @@ class Vision:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.piece: Piece | None = None
+        self._skin_match = None
         self._gpu_state: bool | None = None      # None=未尝试, True=可用, False=不可用
         self._cp = None
         self._gpu_kernel = None
@@ -1876,8 +1884,10 @@ class Vision:
 
     # ---------- 棋子 ----------
 
-    def find_piece(self, frame: np.ndarray, mask: np.ndarray) -> Piece | None:
+    def find_piece(self, frame: np.ndarray, mask: np.ndarray,
+                   support_mask: np.ndarray | None = None) -> Piece | None:
         cfg = self.cfg
+        self._skin_match = None
         h, w = frame.shape[:2]
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
@@ -1909,6 +1919,23 @@ class Vision:
                 Piece(anchor[0], anchor[1], bbox, int(area),
                       tpl_score=piece_template_score(frame, bbox))
             )
+        skin_candidate = None
+        if not candidates and cfg.piece_skin_shape_enabled:
+            skin_candidate = find_skin_piece(frame, support_mask, cfg.piece_min_y_ratio)
+            if skin_candidate is not None:
+                sx, sy, sw, sh = skin_candidate.bbox
+                silhouette = skin_candidate.mask > 0
+                colour_coverage = float((silhouette & (mask[sy:sy + sh, sx:sx + sw] > 0)).sum())
+                colour_coverage /= max(int(silhouette.sum()), 1)
+                # A differently coloured body can accidentally correlate with
+                # just the lower half of the old template. Prefer the verified
+                # complete shape, but preserve the old purple template path.
+                if colour_coverage < .4:
+                    return self._accept_skin_piece(skin_candidate)
+            elif has_horizontal_character_mask(mask, min_area, max_area, cfg.piece_min_y_ratio):
+                # A falling, sideways pawn can correlate with an upright RGB
+                # template on the adjacent cup. Never turn that into a landing.
+                return None
         scan_hits = []
         if (not cfg.piece_scan_only_when_needed) or (not candidates):
             scan_hits = piece_template_scan(frame, cfg)
@@ -1925,7 +1952,12 @@ class Vision:
                 if not replaced:
                     candidates.append(hit)
         if not candidates:
-            return None
+            if not cfg.piece_skin_shape_enabled:
+                return None
+            match = skin_candidate
+            if match is None:
+                return None
+            return self._accept_skin_piece(match)
 
         # 模板校验：去掉“暗色但不像棋子”的干扰物（例如药瓶的深色部分）。
         # 若所有候选都没过阈值，就保留原候选，避免模板过期时完全读不到棋子。
@@ -2055,6 +2087,8 @@ class Vision:
         # 宁可跳得勉强，也不要因为一步选不出目标而整轮停止（死亡可自动重开）。
         good1, _degen1 = collect(cfg.block_min_area_ratio, cfg.block_min_width_ratio,
                                  cfg.block_min_height_ratio)
+        selected_min_dist = min_dist
+        selected_cross_ratio = cfg.axis_max_cross_ratio
         best = select(good1)
         good2, degen2 = collect(cfg.block_min_area_ratio * 0.4, 0.05, 0.05)
         if not best:
@@ -2078,6 +2112,8 @@ class Vision:
             picked.sort(key=lambda item: (item[0], item[1]))
             if picked:
                 best = [(item[1], item[2]) for item in picked]
+                selected_min_dist = min_dist * 0.5
+                selected_cross_ratio = 0.60
                 log("已放宽距离下限与横向比（贴邻/宽方块场景）")
                 if picked[0][0] == 1:
                     log("警告：目标方块顶面估计退化（影子/碎片粘连），正在使用兜底候选")
@@ -2122,7 +2158,25 @@ class Vision:
             if (cfg.center_dot_degenerate_radius_px > radius
                     and chosen.top_width < cfg.center_dot_degenerate_ratio * max(chosen.bbox[2], 1)):
                 radius = cfg.center_dot_degenerate_radius_px
-            dot = find_dot_near(frame, chosen.x, chosen.y, radius, cfg)
+            def valid_target_dot(x, y):
+                # Dot correction must obey the same geometry gate that chose
+                # this block. A cup rim next to the character is not the next
+                # platform, even when a shadow merged both into one component.
+                if y >= piece.y - cfg.target_min_up_ratio * h:
+                    return False
+                if chosen.top_width >= cfg.low_ratio_gate * chosen.bbox[2]:
+                    # On a trustworthy isometric top, reject cup-label
+                    # highlights below the entire face. Degenerate/merged
+                    # top estimates retain the existing wide-radius rescue.
+                    tolerance = max(3.0, w * .01)
+                    if not (chosen.top_y - tolerance <= y
+                            <= chosen.top_y + chosen.top_width * cfg.axis_slope + tolerance):
+                        return False
+                _axis, along, cross = axis_components(x - piece.x, y - piece.y, cfg.axis_slope)
+                return (selected_min_dist <= along <= max_dist
+                        and cross / max(abs(along), 1.0) <= selected_cross_ratio)
+
+            dot = find_dot_near(frame, chosen.x, chosen.y, radius, cfg, accept=valid_target_dot)
             if dot is not None and (abs(dot[0] - chosen.x) > 3.0 or abs(dot[1] - chosen.y) > 3.0):
                 # 注意：find_target 每帧会被调用多次（acquire_frame / wait_landing），
                 # 这里**不能**打日志，否则一帧刷几十行。主循环在真正起跳前统一打一条。
@@ -2130,11 +2184,34 @@ class Vision:
                              top_y=chosen.top_y, top_width=chosen.top_width, dot=dot)
         return chosen
 
+    def _accept_skin_piece(self, match) -> Piece:
+        self._skin_match = match
+        return Piece(match.x, match.y, match.bbox, int((match.mask > 0).sum()),
+                     source="skin-shape", shape_score=match.score)
+
+    def _include_skin_mask(self, piece_mask: np.ndarray) -> np.ndarray:
+        if self._skin_match is None:
+            return piece_mask
+        x, y, w, h = self._skin_match.bbox
+        combined = piece_mask.copy()
+        combined[y:y + h, x:x + w] |= self._skin_match.mask
+        return combined
+
+    def _include_skin_support(self, block_mask: np.ndarray) -> np.ndarray:
+        if self._skin_match is None or not self._skin_match.support_points:
+            return block_mask
+        combined = block_mask.copy()
+        for x, y in self._skin_match.support_points:
+            combined[y, x] = 255
+        return combined
+
     def detect(self, frame: np.ndarray):
         piece_mask, block_mask = self.masks(frame)
-        piece = self.find_piece(frame, piece_mask)
+        piece = self.find_piece(frame, piece_mask, block_mask)
         if piece is None:
             return None, None, piece_mask, block_mask
+        piece_mask = self._include_skin_mask(piece_mask)
+        block_mask = self._include_skin_support(block_mask)
         target = self.find_target(frame, block_mask, piece, piece_mask)
         self.piece = piece
         return piece, target, piece_mask, block_mask
@@ -2148,9 +2225,11 @@ class Vision:
         detect() 逐字保持一致，否则 find_piece 的后续行为会变。
         """
         piece_mask, block_mask = self.masks(frame)
-        piece = self.find_piece(frame, piece_mask)
+        piece = self.find_piece(frame, piece_mask, block_mask)
         if piece is None:
             return None, piece_mask, block_mask
+        piece_mask = self._include_skin_mask(piece_mask)
+        block_mask = self._include_skin_support(block_mask)
         self.piece = piece
         return piece, piece_mask, block_mask
 
@@ -3223,6 +3302,8 @@ def wait_landing(cap: Capturer, win: WindowInfo, vision: Vision, cfg: Config,
         else:
             stable = 0
         if stable >= cfg.settle_frames:
+            if classify_screen(frame)[0] == ScreenState.GAME_OVER:
+                return "gameover", frame, None, None, None
             # 只在真正要返回时才补算目标（同一帧、同一掩码、同一 piece，
             # 与原先"每轮都 detect"得到的 target 完全一致）。
             if want_target and piece is not None:
@@ -3231,8 +3312,11 @@ def wait_landing(cap: Capturer, win: WindowInfo, vision: Vision, cfg: Config,
         time.sleep(cfg.settle_poll_ms / 1000.0)
     # 超时也要保证返回的 piece/block_mask 与最后这一帧同步（否则调用方的
     # "分数增长=已落地"裁决会因为 piece=None 而失效）
-    if frame is not None and piece is None:
-        piece, target, _pm, block_mask = vision.detect(frame)
+    if frame is not None:
+        if classify_screen(frame)[0] == ScreenState.GAME_OVER:
+            return "gameover", frame, None, None, None
+        if piece is None:
+            piece, target, _pm, block_mask = vision.detect(frame)
     return "timeout", frame, piece, target, block_mask
 
 
@@ -3334,6 +3418,8 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
     返回 (win, frame, piece, target, block_mask) 或 None。
     """
     limit = attempts or cfg.detect_retry_limit
+    if state is not None:
+        state["piece_missing"] = False
     prev_center = None
     last_frame = None
     fail_note = "未知"
@@ -3370,6 +3456,8 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
             continue
 
         piece, target, _piece_mask, block_mask = vision.detect(frame)
+        if state is not None:
+            state["piece_missing"] = piece is None
         if piece is None or target is None:
             fail_note = f"piece={'有' if piece is not None else '无'} target={'有' if target is not None else '无'}"
             if attempt % 5 == 0:
@@ -3383,6 +3471,8 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
             continue
 
         center = (target.x, target.y)
+        status_write(piece_source=getattr(piece, "source", "legacy"),
+                     piece_shape_score=round(getattr(piece, "shape_score", 0.0), 3))
         if (prev_center is not None
                 and abs(center[0] - prev_center[0]) <= cfg.target_consistency_px
                 and abs(center[1] - prev_center[1]) <= cfg.target_consistency_px):
@@ -3444,7 +3534,10 @@ def ensure_playing(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputContro
             if verbose and attempt:
                 log(f"已进入可玩状态（第 {attempt + 1} 次尝试）")
             return win
-        if not allow_fallback_click:
+        if not allow_fallback_click or cfg.piece_skin_shape_enabled:
+            # An unrecognised skin can be a perfectly live game. Never probe
+            # restart coordinates just because character recognition failed.
+            # Verified start/restart buttons above remain usable.
             cooperative_sleep(0.4)
             continue
         if piece is not None:
@@ -3894,6 +3987,10 @@ def play(args) -> int:
                     if f8_pressed():
                         stop_reason = "按下 F8 手动停止"
                         break
+                    if cfg.piece_skin_shape_enabled and run_state.get("piece_missing"):
+                        stop_reason = "无法可靠识别人物/皮肤，停止；不触发盲跳"
+                        log(stop_reason)
+                        break
                     # 有界盲跳：识别彻底失败时，用“上次成功的按压时长”盲跳一次推进局面。
                     # 死亡可以自动重开，而整轮停止会丢掉后续所有进度——所以盲跳比停下更优。
                     blind_jumps += 1
@@ -4022,7 +4119,7 @@ def play(args) -> int:
                 # 读不出来（None）同样要重读：实测 2026-10-01 第 3973 跳落地确认超时，
                 # 恰好那几帧 HUD 读数为 None，导致"分数增长"这条最终裁决拿不到证据，
                 # 被误判成死亡（实际游戏一直在得分：130026→130038→130056…）。
-                if (status not in ("pause_unknown", "stopped") and prev_score is not None
+                if (status not in ("pause_unknown", "stopped", "gameover") and prev_score is not None
                         and (score is None or score == prev_score)):
                     # 第一次重读只等很短（HUD 通常 100ms 内刷新），后面才用 250ms，
                     # 这样"分数滞后"这个高频情形不会再白等 250ms。
@@ -4046,6 +4143,12 @@ def play(args) -> int:
                         else:
                             fresh_win = resolve_window(cfg, cfg.window_wait_s)
                         fresh = cap.grab(fresh_win)
+                        if classify_screen(fresh)[0] == ScreenState.GAME_OVER:
+                            status = "gameover"
+                            frame2 = fresh
+                            score = read_score(fresh, cfg)
+                            piece2 = target2 = block_mask2 = None
+                            break
                         reread = read_score(fresh, cfg)
                         if reread is None:
                             continue
@@ -4077,11 +4180,12 @@ def play(args) -> int:
                 # 中心命中)，CSV 却记 dead，紧接着 #1373 又以同一条命继续跳。
                 # 分数是权威信号，不该被一个辅助的棋子检测挡住。
                 delayed_landing = (
-                    status != "landed" and prev_score is not None
+                    status not in ("landed", "gameover") and prev_score is not None
                     and score is not None and score > prev_score
                 )
                 if (status == "pause_unknown" or (_CONTROL is not None
-                        and _CONTROL.pause_requested and status != "landed" and not delayed_landing)):
+                        and _CONTROL.pause_requested and status not in ("landed", "gameover")
+                        and not delayed_landing)):
                     record = JumpRecord(index + 1, timestamp, k_before, dist, hold_ms, k, None,
                                         "unknown", score, "暂停收尾：无法可靠核对，不判死亡",
                                         t_acquire_ms, t_landing_ms, t_score_ms,
@@ -4639,6 +4743,9 @@ def run_daemon(args) -> int:
         log(f"[daemon] 本轮结束：{reason or '窗口不在'}（rc={rc}，已完成 {rounds} 轮）")
         if poll_stop_key() or ("F8" in reason) or ("中断" in reason) or ("用户停止" in reason):
             log("[daemon] 用户主动停止，daemon 一并退出")
+            return rc
+        if "安全策略" in reason or "不触发盲跳" in reason:
+            log("[daemon] 识别安全停止，不自动重复同一异常；请核对现场后重新启动")
             return rc
         if args.daemon_max_rounds and rounds >= args.daemon_max_rounds:
             log(f"[daemon] 已跑满 {rounds} 轮，退出")

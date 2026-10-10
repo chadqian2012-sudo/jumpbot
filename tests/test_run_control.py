@@ -335,7 +335,8 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(result['recent100']['hits'], 98)
         self.assertEqual(result['unknown'], 1)
 
-    def simulate_play(self, count, pause_every=0, unknown_every=0, pause_restart=False):
+    def simulate_play(self, count, pause_every=0, unknown_every=0, pause_restart=False,
+                      missing_after=None, confirmed_gameover=False):
         """Entire play caller, synthetic scoreboard, fake input/window/capture."""
         import numpy as np
         J = self.j
@@ -355,6 +356,8 @@ class ApplicationTests(unittest.TestCase):
             def reset_prior(self):
                 pass
             def detect(self, _):
+                if missing_after is not None and counters['presses'] >= missing_after:
+                    return None, None, None, None
                 return piece, target, None, None
         owner = self
         class FakeCapture:
@@ -383,6 +386,8 @@ class ApplicationTests(unittest.TestCase):
             owner.clock.sleep(180)
             owner.control.toggle('test resume')
         def landing(*_, **__):
+            if confirmed_gameover and counters['presses'] == 2:
+                return 'gameover', frame, None, None, None
             if pause_restart and counters['presses'] == 2:
                 return 'fixture_dead', None, None, None, None
             if unknown_every and counters['presses'] % unknown_every == 0:
@@ -417,17 +422,49 @@ class ApplicationTests(unittest.TestCase):
             stack.enter_context(patch.object(J, 'wait_landing', landing))
             stack.enter_context(patch.object(J, 'ensure_playing', playing))
             stack.enter_context(patch.object(J, 'read_score', lambda *_:
-                                             None if pause_restart and counters['presses'] == 2
+                                             None if pause_restart and not confirmed_gameover
+                                             and counters['presses'] == 2
                                              else counters['score']))
             stack.enter_context(patch.object(J, 'LOG_DIR', Path(self.temp.name)))
             args = J.build_parser().parse_args(['--config', str(config_path), '--max-jumps', str(count)])
             self.assertEqual(J.play(args), 0)
-        self.assertEqual(counters['presses'], count)
-        self.assertEqual(J._STATUS['attempts'], count)
+        actual = count if missing_after is None else missing_after
+        self.assertEqual(counters['presses'], actual)
+        self.assertEqual(J._STATUS['attempts'], actual)
         self.assertEqual(J._STATUS['deaths'], 1 if pause_restart else 0)
-        self.assertEqual(J._STATUS['jumps'], count)
-        self.assertEqual(J._LAST_STOP_REASON, '达到最大跳跃次数')
+        self.assertEqual(J._STATUS['jumps'], actual)
+        self.assertEqual(J._LAST_STOP_REASON, '达到最大跳跃次数' if missing_after is None
+                         else '无法可靠识别人物/皮肤，停止；不触发盲跳')
         return J._STATUS.copy(), counters
+
+    def test_unknown_skin_does_not_start_or_restart_blindly(self):
+        J = self.j
+        import numpy as np
+        self.stack.enter_context(patch.object(J, 'resolve_window', lambda *_: self.win))
+        self.stack.enter_context(patch.object(J, 'match_ui', lambda *_: None))
+        cap = SimpleNamespace(grab=lambda _: np.zeros((1050, 553, 3), np.uint8))
+        vision = SimpleNamespace(detect=lambda _: (None, None, None, None))
+        ctrl = SimpleNamespace(click=lambda *_: self.fail('blind start/restart'),
+                               press=lambda *_: self.fail('blind jump'))
+        self.assertIsNone(J.ensure_playing(cap, self.cfg, vision, ctrl, False))
+
+    def test_skin_loss_after_valid_jump_never_uses_previous_hold(self):
+        status, counters = self.simulate_play(3, missing_after=1)
+        self.assertEqual(status['landed'], 1)
+        self.assertEqual(counters['presses'], 1)
+
+    def test_daemon_does_not_retry_vision_safety_stops(self):
+        J = self.j
+        args = J.build_parser().parse_args(['--daemon', '--max-jumps', '500'])
+        for reason in ('识别结果持续异常（安全策略：未盲按，已停止）',
+                       '无法可靠识别人物/皮肤，停止；不触发盲跳'):
+            with self.subTest(reason=reason):
+                def play_once(_):
+                    J._LAST_STOP_REASON = reason
+                    return 0
+                with patch.object(J, 'play', side_effect=play_once) as play:
+                    self.assertEqual(J.run_daemon(args), 0)
+                    self.assertEqual(play.call_count, 1)
 
     def test_known_death_is_committed_before_pause_cancels_restart(self):
         status, counters = self.simulate_play(3, pause_restart=True)
@@ -437,6 +474,12 @@ class ApplicationTests(unittest.TestCase):
         import csv
         with next(Path(self.temp.name).glob('run_*.csv')).open(encoding='utf-8-sig', newline='') as stream:
             self.assertEqual([r['result'] for r in csv.DictReader(stream)], ['landed', 'dead', 'landed'])
+
+    def test_confirmed_gameover_overrides_an_increased_score(self):
+        status, counters = self.simulate_play(3, pause_restart=True, confirmed_gameover=True)
+        self.assertTrue(counters['restart_pause'])
+        self.assertEqual(status['deaths'], 1)
+        self.assertEqual(status['landed'], 2)
 
     def test_play_pause_integration_does_not_add_deaths_or_blind_jumps(self):
         status, _ = self.simulate_play(30, pause_every=3)

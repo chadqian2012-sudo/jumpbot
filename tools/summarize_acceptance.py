@@ -12,6 +12,24 @@ from report import analyze
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def unrecorded_restarts(rows, reset_indices):
+    """Score drops must follow a recorded death or an explicit resume baseline.
+
+    Do not infer a death from manual gameplay across pauses; instead prevent a
+    silent automatic restart from passing the 'no missed deaths' safety gate.
+    """
+    reset_set = set(reset_indices)
+    bad = []
+    for i, row in enumerate(rows):
+        index = int(row['index']) if row.get('index') else None
+        if index not in reset_set or '[score基准]' in row.get('note', ''):
+            continue
+        previous = rows[max(0, i - 2):i]
+        if not any(item.get('result') in ('dead', 'died') for item in previous):
+            bad.append(index)
+    return bad
+
+
 def summarize(directory: Path) -> dict:
     evidence = json.loads((directory / 'run-evidence.json').read_text(encoding='utf8'))
     candidates = sorted((directory / 'logs').glob('run_*.csv'))
@@ -60,6 +78,7 @@ def summarize(directory: Path) -> dict:
     unchanged = all(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == value
                     for name, value in evidence['source_sha256'].items())
     final = evidence['final_status']
+    missed_restarts = unrecorded_restarts(rows, stats['reset_indices'])
     statistic_agreement = all(final.get(key) == stats[mapped] for key, mapped in
                               [('attempts', 'attempts'), ('landed', 'landed'),
                                ('hits', 'score_hits'), ('misses', 'score_misses')])
@@ -68,7 +87,8 @@ def summarize(directory: Path) -> dict:
     completed = stats['attempts'] >= evidence['requested_jumps']
     safety_gate = (not balance_errors and not paused_operations and
                    not counters['paused_violations'] and evidence['exception'] is None and
-                   evidence['return_code'] == 0 and not stats['false_death_indices'])
+                   evidence['return_code'] == 0 and not stats['false_death_indices']
+                   and not missed_restarts)
     result = dict(requested_jumps=evidence['requested_jumps'], stats=stats,
                   recent100=analyze(rows[-100:]), counters=counters,
                   down=down, up=up, balance_errors=balance_errors,
@@ -78,7 +98,7 @@ def summarize(directory: Path) -> dict:
                   round_pass=completed and rate_gate and safety_gate and unchanged and statistic_agreement,
                   physical_hotkey_repeat_verified=evidence['physical_hotkey_repeat_verified'],
                   controlled_window_switch_verified=evidence['controlled_window_switch_verified'],
-                  publication_ready=False,
+                  publication_ready=False, unrecorded_restart_indices=missed_restarts,
                   source_sha256=evidence['source_sha256'])
     (directory / 'summary.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf8')
     return result
