@@ -1964,12 +1964,24 @@ class Vision:
                 # A falling, sideways pawn can correlate with an upright RGB
                 # template on the adjacent cup. Never turn that into a landing.
                 return None
+        if cfg.piece_skin_shape_enabled:
+            # Automatic mode must not retain arbitrary low-confidence colour
+            # noise when every template validator failed (e.g. cursor glow).
+            candidates = [p for p in candidates if p.tpl_score >= cfg.piece_template_min_score]
         scan_hits = []
         if (not cfg.piece_scan_only_when_needed) or (not candidates):
             scan_hits = piece_template_scan(frame, cfg)
         if scan_hits:
             # 与颜色候选合并去重（位置接近的取模板分更高的）
             for hit in scan_hits:
+                if cfg.piece_skin_shape_enabled:
+                    hx, hy, hw, hh = hit.bbox
+                    coverage = float((mask[hy:hy + hh, hx:hx + hw] > 0).mean())
+                    if coverage < .4:
+                        # RGB correlation alone can match the dark rim of a cup
+                        # after a gold silhouette is lost. A legacy scan must
+                        # also prove legacy colour, not silently replace gold.
+                        continue
                 replaced = False
                 for idx, cand in enumerate(candidates):
                     if math.hypot(hit.x - cand.x, hit.y - cand.y) < 0.05 * w:

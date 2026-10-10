@@ -74,8 +74,28 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
                 & (np.linalg.norm(pixels[:, :, 1:] - colour[1:], axis=2) <= chroma_tolerance))
     material = material.astype(np.uint8) * 255
     # Close single-pixel glitter gaps, not the space between head and body.
-    material = cv2.morphologyEx(material, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(material, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kernel = np.ones((3, 3), np.uint8)
+    planes = [cv2.morphologyEx(material, cv2.MORPH_CLOSE, kernel)]
+    head_l = lab[hy:hy + hh, hx:hx + hw, 0]
+    head_texture = cv2.absdiff(head_l, cv2.GaussianBlur(head_l, (3, 3), 0))
+    grain = float(np.median(head_texture[core]))
+    if grain >= 1:
+        # Metallic flecks can distinguish a gold body from a flat, same-colour
+        # cardboard top. Derive the texture scale from the head in this frame;
+        # it is an independent proposal, never an excuse to accept a cut body.
+        roi_l = lab[y0:y1, x0:x1, 0]
+        texture = cv2.absdiff(roi_l, cv2.GaussianBlur(roi_l, (3, 3), 0))
+        textured = material & ((texture >= np.clip(grain * .5, 2, 4)).astype(np.uint8) * 255)
+        textured = cv2.morphologyEx(textured, cv2.MORPH_CLOSE, kernel)
+        # Flat platform seams are thin bridges, not the substantial body.
+        width = max(3, int(round(diameter * .14)) | 1)
+        substantial = np.ones((width, width), np.uint8)
+        textured = cv2.morphologyEx(textured, cv2.MORPH_OPEN, substantial)
+        planes.append(cv2.morphologyEx(textured, cv2.MORPH_CLOSE, substantial))
+    contours = []
+    for plane in planes:
+        found, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours.extend(found)
     shapes = []
     for contour in contours:
         x, y, bw, bh = cv2.boundingRect(contour)
@@ -108,7 +128,8 @@ def _has_waist(row_widths):
     lower = [float(np.median(row_widths[y:y + band]))
              for y in range(height // 2, max(height // 2, height * 7 // 8 - band) + 1)]
     sustained_base = max(lower, default=0)
-    return waist >= 3 and waist < collar and sustained_base >= waist * 1.15
+    return ((neck >= 3 and sustained_base >= neck * 1.15)
+            or (waist >= 3 and waist < collar and sustained_base >= waist * 1.15))
 
 
 def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):

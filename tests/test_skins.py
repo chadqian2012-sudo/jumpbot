@@ -122,6 +122,27 @@ class SkinTests(unittest.TestCase):
         self.assertAlmostEqual(p.y, 657, delta=2)
         self.assertTrue(J._foot_on_block(bm, p, self.cfg))
 
+    def test_lost_gold_silhouette_cannot_turn_a_cup_into_a_character(self):
+        for name in ('skin-gold-cardboard', 'skin-gold-falling'):
+            with self.subTest(name=name):
+                frame = cv2.imread(str(ROOT / 'tests/fixtures' / (name + '.png')))
+                p, _t, _pm, _bm = self.detect(frame)
+                if p is not None:
+                    self.assertEqual(p.source, 'skin-shape')
+                    self.assertAlmostEqual(p.x, 391, delta=3)
+                if name == 'skin-gold-falling':
+                    self.assertIsNone(p)
+
+    def test_head_sampled_glitter_distinguishes_gold_from_cardboard(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-cardboard.png'))
+        p, t, _pm, bm = self.detect(frame)
+        self.assertIsNotNone(p)
+        self.assertIsNotNone(t)
+        self.assertEqual(p.source, 'skin-shape')
+        self.assertAlmostEqual(p.x, 391, delta=3)
+        self.assertAlmostEqual(p.y, 643, delta=3)
+        self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
     def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
         vision = J.Vision(self.cfg)
         original = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
