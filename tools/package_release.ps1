@@ -42,7 +42,7 @@ foreach($packageFlavor in @('full','portable')) {
         throw "build identity does not match current source/flavor/executable: $packageFlavor"
     }
     $packageSourceHashes = [ordered]@{}
-    foreach($packageSource in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py','tools/live_acceptance.py','tools/run_frozen_acceptance.py')) {
+    foreach($packageSource in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py','tools/live_acceptance.py','tools/run_frozen_acceptance.py','tools/run_skin_acceptance.py')) {
         $packageSourceHashes[$packageSource] = (Get-FileHash -LiteralPath (Join-Path $packageRoot $packageSource) -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     foreach($packageProperty in $packageBuild.source_sha256.PSObject.Properties) {

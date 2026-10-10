@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ('jumpbot.py', 'run_control.py', 'skin_vision.py', 'config.json',
            'tools/dashboard.py', 'tools/_scorelog.py', 'tools/live_acceptance.py',
-           'tools/run_frozen_acceptance.py')
+           'tools/run_frozen_acceptance.py', 'tools/run_skin_acceptance.py')
 
 
 @unittest.skipUnless(os.name == 'nt' and shutil.which('git'), 'Windows packaging')

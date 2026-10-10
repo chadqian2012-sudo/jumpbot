@@ -107,7 +107,8 @@ runpy.run_path({str(ROOT / 'tools/live_acceptance.py')!r}, run_name='__main__')
                         if status.get('pid') == child.pid:
                             state['progress'] = {key: status.get(key) for key in (
                                 'state', 'jumps', 'landed', 'deaths', 'hits', 'misses',
-                                'unknown', 'mask_backend', 'pause_count', 'stop_reason')}
+                                'unknown', 'mask_backend', 'pause_count', 'stop_reason',
+                                'piece_source', 'skin_auto_enabled', 'piece_shape_score')}
                             save(state_path, state)
                             print(json.dumps(state['progress'], ensure_ascii=False), flush=True)
                     except (OSError, ValueError):

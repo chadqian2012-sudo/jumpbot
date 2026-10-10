@@ -72,6 +72,47 @@ class SkinTests(unittest.TestCase):
                 self.assertAlmostEqual(p.x, 173, delta=2)
                 self.assertAlmostEqual(p.y, 647, delta=2)
 
+    def test_weak_purple_decoration_cannot_disable_auto_skin(self):
+        frame = self.frame.copy()
+        cv2.rectangle(frame, (300, 580), (332, 660), (95, 40, 65), -1)
+        p, t, pm, _bm = self.detect(frame)
+        self.assertIsNotNone(p)
+        self.assertIsNotNone(t)
+        self.assertEqual(p.source, 'skin-shape')
+        self.assertAlmostEqual(p.x, 173, delta=2)
+        self.assertAlmostEqual(p.y, 647, delta=2)
+        self.assertTrue(pm[540:560, 165:180].any(), 'head must not be left as a target')
+
+    def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
+        vision = J.Vision(self.cfg)
+        original = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
+        for hue in (20, 0, 179, 55, 85, 120, 150, 20):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][self.gold] = hue
+                hsv[:, :, 1][self.gold] = 190
+                p, t, _pm, _bm = vision.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 173, delta=2)
+                self.assertAlmostEqual(p.y, 647, delta=2)
+                self.assertAlmostEqual(t.x, 404, delta=3)
+                self.assertAlmostEqual(t.y, 501, delta=3)
+        vision.reset_prior()
+        self.assertIsNone(vision.piece)
+        self.assertIsNone(vision.detect(np.full_like(self.frame, 210))[0])
+
+    def test_old_configuration_enables_auto_skin_by_default(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps({'k': 2.61, 'gamma': 0}), encoding='utf8')
+            cfg = J.Config.load(path)
+            self.assertTrue(cfg.piece_skin_shape_enabled)
+            self.assertEqual(cfg.k, 2.61)
+            self.assertEqual(cfg.gamma, 0)
+
     def test_low_contrast_white_on_white_surface_fails_closed(self):
         # Both shaded and flat white lose the complete body outline at the
         # platform boundary. They are intentionally unsupported, not positives

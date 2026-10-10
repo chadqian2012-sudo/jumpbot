@@ -274,6 +274,10 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
         if status.get("mask_backend"):
             lines.append(f"掩码后端   : {status.get('mask_backend')}"
                          f"{'（' + str(status.get('mask_bench_ms')) + '）' if status.get('mask_bench_ms') else ''}")
+        if status.get('piece_source'):
+            mode = '自动颜色/轮廓适配' if status.get('skin_auto_enabled') else '旧模板模式'
+            source = ('完整头身几何' if status['piece_source'] == 'skin-shape' else '初始颜色/模板')
+            lines.append(f"人物识别   : {mode}；当前 {source}")
     else:
         src = csv_stats.get("csv") if csv_stats else "（无）"
         running = bot_pid is not None

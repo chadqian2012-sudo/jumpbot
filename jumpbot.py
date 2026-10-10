@@ -1920,7 +1920,10 @@ class Vision:
                       tpl_score=piece_template_score(frame, bbox))
             )
         skin_candidate = None
-        if not candidates and cfg.piece_skin_shape_enabled:
+        # A tall purple decoration is not proof that the character itself is
+        # purple. Weak HSV candidates must not suppress automatic skin search.
+        reliable_colour = any(p.tpl_score >= cfg.piece_template_min_score for p in candidates)
+        if (not reliable_colour) and cfg.piece_skin_shape_enabled:
             skin_candidate = find_skin_piece(frame, support_mask, cfg.piece_min_y_ratio)
             if skin_candidate is not None:
                 sx, sy, sw, sh = skin_candidate.bbox
@@ -3472,6 +3475,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
 
         center = (target.x, target.y)
         status_write(piece_source=getattr(piece, "source", "legacy"),
+                     skin_auto_enabled=cfg.piece_skin_shape_enabled,
                      piece_shape_score=round(getattr(piece, "shape_score", 0.0), 3))
         if (prev_center is not None
                 and abs(center[0] - prev_center[0]) <= cfg.target_consistency_px
