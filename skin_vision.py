@@ -33,6 +33,79 @@ def has_horizontal_character_mask(mask, min_area, max_area, min_foot_ratio):
                and bw > bh * 1.25 for _bx, by, bw, bh, area in stats[1:])
 
 
+def _aligned_body(shape, hx, hy, hw, hh):
+    bx, by, bw, bh, _contour, solidity = shape
+    diameter = (hw + hh) * .5
+    return (.55 <= bw / diameter <= 1.65 and 1.15 <= bh / diameter <= 3.8
+            and solidity >= .86 and bh / bw >= 1.15
+            and -2 <= by - (hy + hh) <= diameter * .35
+            and abs((bx + bw * .5) - (hx + hw * .5)) <= diameter * .25)
+
+
+def _material_bodies(lab, head, hx, hy, hw, hh):
+    """Recover an outline from this frame's head material, never a hue table.
+
+    Gold glitter can join Canny edges to the platform and open an otherwise
+    complete body contour. A head-seeded local Lab mask proposes a closed
+    outline instead. Border-touching components are rejected: same-colour
+    platforms/occlusion cannot invent a cropped, apparently tapered body.
+    All normal geometry/material/support/uniqueness gates still apply.
+    """
+    diameter = (hw + hh) * .5
+    head_mask = np.zeros((hh, hw), dtype=np.uint8)
+    cv2.drawContours(head_mask, [head - np.array([[[hx, hy]]], np.int32)],
+                     -1, 255, cv2.FILLED)
+    core = cv2.erode(head_mask, np.ones((3, 3), np.uint8)) > 0
+    if not core.any():
+        return []
+    colour = np.median(lab[hy:hy + hh, hx:hx + hw][core], axis=0)
+    cx = hx + hw * .5
+    x0 = max(0, int(math.floor(cx - diameter * .85)) - 2)
+    x1 = min(lab.shape[1], int(math.ceil(cx + diameter * .85)) + 2)
+    y0 = hy + hh
+    y1 = min(lab.shape[0], int(math.ceil(y0 + diameter * 4.15)) + 2)
+    if y1 <= y0 or x1 <= x0:
+        return []
+    pixels = lab[y0:y1, x0:x1].astype(np.float32)
+    material = (np.linalg.norm(pixels - colour, axis=2) <= 35).astype(np.uint8) * 255
+    # Close single-pixel glitter gaps, not the space between head and body.
+    material = cv2.morphologyEx(material, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(material, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    shapes = []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if x <= 0 or y <= 0 or x + bw >= x1 - x0 or y + bh >= y1 - y0:
+            continue
+        hull_area = cv2.contourArea(cv2.convexHull(contour))
+        if hull_area < 20:
+            continue
+        solidity = cv2.contourArea(contour) / hull_area
+        shapes.append((x + x0, y + y0, bw, bh,
+                       contour + np.array([[[x0, y0]]], np.int32), solidity))
+    return shapes
+
+
+def _has_waist(row_widths):
+    height = len(row_widths)
+    neck = float(np.median(row_widths[max(1, height // 8):max(2, height // 3)]))
+    base = float(np.median(row_widths[height // 2:max(height // 2 + 1, height * 7 // 8)]))
+    if neck >= 3 and base >= neck * 1.15:
+        return True
+    # Some skins have a broad shoulder/collar, with the waist farther down.
+    # Require a sustained constriction followed by a wider base, not one noisy
+    # row or a cylinder. Keep the same minimum widening as the original path.
+    band = max(3, height // 10)
+    stop = min(height // 2, height - band)
+    widths = [float(np.median(row_widths[y:y + band]))
+              for y in range(height // 4, stop + 1)]
+    collar = float(np.median(row_widths[max(1, height // 12):max(2, height // 6)]))
+    waist = min(widths, default=0)
+    lower = [float(np.median(row_widths[y:y + band]))
+             for y in range(height // 2, max(height // 2, height * 7 // 8 - band) + 1)]
+    sustained_base = max(lower, default=0)
+    return waist >= 3 and waist < collar and sustained_base >= waist * 1.15
+
+
 def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         return None
@@ -77,15 +150,11 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
     matches = []
     for hx, hy, hw, hh, head, circularity in heads:
         diameter = (hw + hh) * .5
-        for bx, by, bw, bh, body, solidity in shapes:
-            if not (.55 <= bw / diameter <= 1.65 and 1.15 <= bh / diameter <= 3.8
-                    and solidity >= .86 and bh / bw >= 1.15):
-                continue
-            gap = by - (hy + hh)
-            if not (-2 <= gap <= diameter * .35):
-                continue
-            if abs((bx + bw * .5) - (hx + hw * .5)) > diameter * .25:
-                continue
+        bodies = [shape for shape in shapes if _aligned_body(shape, hx, hy, hw, hh)]
+        if not bodies:
+            bodies = [shape for shape in _material_bodies(lab, head, hx, hy, hw, hh)
+                      if _aligned_body(shape, hx, hy, hw, hh)]
+        for bx, by, bw, bh, body, solidity in bodies:
             foot_y = by + bh + top
             foot_x = bx + bw * .5
             if foot_y < height * min_foot_ratio or foot_y >= height - 2:
@@ -98,9 +167,7 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
             shifted_body = body - np.array([[[bx, by]]], dtype=np.int32)
             cv2.drawContours(body_mask, [shifted_body], -1, 255, cv2.FILLED)
             row_widths = (body_mask > 0).sum(axis=1)
-            neck = float(np.median(row_widths[max(1, bh // 8):max(2, bh // 3)]))
-            base = float(np.median(row_widths[bh // 2:max(bh // 2 + 1, bh * 7 // 8)]))
-            if neck < 3 or base < neck * 1.15:
+            if not _has_waist(row_widths):
                 continue  # reject rods, cylinders and rectangular bottle caps
             head_mask = np.zeros((hh, hw), dtype=np.uint8)
             cv2.drawContours(head_mask, [head - np.array([[[hx, hy]]], dtype=np.int32)],

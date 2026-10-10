@@ -32,19 +32,40 @@ def describe(result):
                                                    target.top_width, target.dot]}
 
 
+def load_baseline(directory):
+    # Each side must use its own skin implementation. Merely loading a second
+    # jumpbot.py leaves its import bound to the already-loaded candidate module
+    # and can hide regressions in precisely the algorithm being reviewed.
+    skin_spec = importlib.util.spec_from_file_location('skin_baseline_impl', directory / 'skin_vision.py')
+    old_skin = importlib.util.module_from_spec(skin_spec)
+    sys.modules[skin_spec.name] = old_skin
+    skin_spec.loader.exec_module(old_skin)
+    current_skin = sys.modules.get('skin_vision')
+    try:
+        sys.modules['skin_vision'] = old_skin
+        spec = importlib.util.spec_from_file_location('skin_baseline', directory / 'jumpbot.py')
+        old = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = old
+        spec.loader.exec_module(old)
+    finally:
+        if current_skin is None:
+            sys.modules.pop('skin_vision', None)
+        else:
+            sys.modules['skin_vision'] = current_skin
+    return old
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--dataset', type=Path, action='append', required=True)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    spec = importlib.util.spec_from_file_location('skin_baseline', args.baseline / 'jumpbot.py')
-    old = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = old
-    spec.loader.exec_module(old)
+    old = load_baseline(args.baseline)
     J.log = old.log = lambda _: None
     cfg = dataclasses.replace(J.Config.load(ROOT / 'config.json'), masks_backend='simd',
                               cuda_enabled=False, opencl_enabled=False)
+    cv2.setNumThreads(J.effective_cv2_threads(cfg.cv2_threads))
     old_cfg = old.Config.load(args.baseline / 'config.json')
     old_cfg.masks_backend, old_cfg.cuda_enabled, old_cfg.opencl_enabled = 'simd', False, False
     paths = sorted({p for dataset in args.dataset for p in dataset.rglob('*.png')

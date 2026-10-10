@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ['JUMPBOT_NO_INPUT'] = '1'
 import jumpbot as J  # noqa: E402
-from skin_vision import find_skin_piece  # noqa: E402
+from skin_vision import find_skin_piece, _has_waist, _material_bodies  # noqa: E402
 
 
 class SkinTests(unittest.TestCase):
@@ -83,6 +83,35 @@ class SkinTests(unittest.TestCase):
         self.assertAlmostEqual(p.y, 647, delta=2)
         self.assertTrue(pm[540:560, 165:180].any(), 'head must not be left as a target')
 
+    def test_gold_glitter_on_red_platform_recovers_a_complete_body(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-red-platform.png'))
+        self.assertIsNotNone(frame)
+        p, t, pm, bm = self.detect(frame)
+        self.assertIsNotNone(p)
+        self.assertIsNotNone(t)
+        self.assertEqual(p.source, 'skin-shape')
+        self.assertAlmostEqual(p.x, 350, delta=2)
+        self.assertAlmostEqual(p.y, 613, delta=2)
+        self.assertAlmostEqual(t.x, 228, delta=3)
+        self.assertAlmostEqual(t.y, 529, delta=3)
+        self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+        self.assertTrue(pm[508:530, 340:360].any())
+
+    def test_glitter_adaptation_retains_backend_and_scale_agreement(self):
+        original = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-red-platform.png'))
+        for scale in (.75, 1, 1.25):
+            with self.subTest(scale=scale):
+                frame = cv2.resize(original, None, fx=scale, fy=scale)
+                ps, ts, *_ = self.detect(frame)
+                pc, tc, *_ = self.detect(frame, dataclasses.replace(self.cfg, masks_backend='cpu'))
+                self.assertIsNotNone(ps)
+                self.assertIsNotNone(pc)
+                self.assertIsNotNone(ts)
+                self.assertIsNotNone(tc)
+                self.assertEqual((ps.x, ps.y, ts.x, ts.y), (pc.x, pc.y, tc.x, tc.y))
+                self.assertAlmostEqual(ps.x / scale, 350, delta=3)
+                self.assertAlmostEqual(ps.y / scale, 613, delta=3)
+
     def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
         vision = J.Vision(self.cfg)
         original = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
@@ -140,6 +169,17 @@ class SkinTests(unittest.TestCase):
     def test_no_supported_platform_no_shape_match(self):
         self.assertIsNone(find_skin_piece(self.frame, np.zeros(self.frame.shape[:2], np.uint8)))
         self.assertIsNone(find_skin_piece(self.frame, np.full(self.frame.shape[:2], 255, np.uint8)))
+
+    def test_material_profile_cannot_crop_same_colour_platform_into_a_body(self):
+        lab = np.full((200, 120, 3), (197, 127, 168), np.uint8)
+        head = cv2.ellipse2Poly((60, 40), (15, 15), 0, 0, 360, 5).reshape(-1, 1, 2)
+        self.assertEqual(_material_bodies(lab, head, 45, 25, 31, 31), [])
+
+    def test_a_noisy_cylinder_is_not_a_sustained_waist(self):
+        widths = np.full(72, 30)
+        widths[30] = 5
+        self.assertFalse(_has_waist(widths))
+        self.assertFalse(_has_waist(np.full(72, 30)))
 
     def test_blank_noise_and_round_bottle_do_not_match(self):
         blank = np.full((600, 400, 3), 210, np.uint8)
