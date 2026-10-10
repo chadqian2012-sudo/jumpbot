@@ -73,6 +73,7 @@ _STATUS: dict = {}
 _CUDA_ENV_READY = False      # CUDA 运行时路径只需铺一次（否则 PATH 会被反复追加直到爆掉）
 _OPENCL_RUNTIMES: dict = {}  # 进程内复用上下文/程序，Vision 各自持有队列、内核和缓冲区
 _OPENCL_FAILED: set = set()
+_OPENCL_ENUMERATION_CHECKS: dict = {}  # 隔离枚举失败时，输入进程不加载该驱动
 _OPENCL_CHECKED: set = set()
 
 
@@ -1521,6 +1522,31 @@ class Vision:
             return self._cl_state
         self._cl_state = False
         try:
+            selector = self.cfg.opencl_device.casefold().strip()
+            if os.environ.get("JUMPBOT_OPENCL_PROBE") != "1":
+                # Enumeration itself can crash an ICD (e.g. Intel integer
+                # divide-by-zero), before the existing per-device build probe.
+                # Do not enter the input owner's driver loader until a no-input
+                # child has enumerated, built and checked the selected backend.
+                if selector not in _OPENCL_ENUMERATION_CHECKS:
+                    cmd = [sys.executable]
+                    if not _is_frozen():
+                        cmd.append(str(Path(__file__).resolve()))
+                    cmd += ["--_opencl-check", self.cfg.opencl_device]
+                    env = dict(os.environ, JUMPBOT_NO_INPUT="1", JUMPBOT_DISABLE_CUDA="1",
+                               JUMPBOT_OPENCL_PROBE="1")
+                    try:
+                        result = subprocess.run(cmd, env=env, capture_output=True, timeout=20,
+                                                encoding="utf-8", errors="replace",
+                                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                        _OPENCL_ENUMERATION_CHECKS[selector] = result.returncode == 0
+                        if result.returncode != 0:
+                            log(f"OpenCL 枚举/预热隔离自检失败（{result.returncode}），跳过 OpenCL；CUDA/CPU 仍可用")
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        _OPENCL_ENUMERATION_CHECKS[selector] = False
+                        log(f"OpenCL 枚举/预热隔离自检不可用，跳过 OpenCL：{exc}")
+                if not _OPENCL_ENUMERATION_CHECKS[selector]:
+                    return False
             import pyopencl as cl
             self._cl = cl
             devices = []
@@ -1529,7 +1555,6 @@ class Vision:
                     devices.extend(platform.get_devices(device_type=cl.device_type.GPU))
                 except cl.Error:
                     continue
-            selector = self.cfg.opencl_device.casefold().strip()
             cache_dir = DEBUG_DIR / "opencl_cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
             for device in devices:

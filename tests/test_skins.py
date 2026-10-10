@@ -112,6 +112,16 @@ class SkinTests(unittest.TestCase):
                 self.assertAlmostEqual(ps.x / scale, 350, delta=3)
                 self.assertAlmostEqual(ps.y / scale, 613, delta=3)
 
+    def test_edge_proposal_cannot_hide_gold_material_on_green_platform(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-green-platform.png'))
+        p, t, _pm, bm = self.detect(frame)
+        self.assertIsNotNone(p)
+        self.assertIsNotNone(t)
+        self.assertEqual(p.source, 'skin-shape')
+        self.assertAlmostEqual(p.x, 407, delta=2)
+        self.assertAlmostEqual(p.y, 657, delta=2)
+        self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
     def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
         vision = J.Vision(self.cfg)
         original = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)

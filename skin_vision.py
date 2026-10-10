@@ -58,7 +58,10 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     core = cv2.erode(head_mask, np.ones((3, 3), np.uint8)) > 0
     if not core.any():
         return []
-    colour = np.median(lab[hy:hy + hh, hx:hx + hw][core], axis=0)
+    head_pixels = lab[hy:hy + hh, hx:hx + hw][core].astype(np.float32)
+    colour = np.median(head_pixels, axis=0)
+    chroma_spread = np.percentile(np.linalg.norm(head_pixels[:, 1:] - colour[1:], axis=1), 80)
+    chroma_tolerance = float(np.clip(chroma_spread + 6, 12, 20))
     cx = hx + hw * .5
     x0 = max(0, int(math.floor(cx - diameter * .85)) - 2)
     x1 = min(lab.shape[1], int(math.ceil(cx + diameter * .85)) + 2)
@@ -67,7 +70,9 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     if y1 <= y0 or x1 <= x0:
         return []
     pixels = lab[y0:y1, x0:x1].astype(np.float32)
-    material = (np.linalg.norm(pixels - colour, axis=2) <= 35).astype(np.uint8) * 255
+    material = ((np.linalg.norm(pixels - colour, axis=2) <= 35)
+                & (np.linalg.norm(pixels[:, :, 1:] - colour[1:], axis=2) <= chroma_tolerance))
+    material = material.astype(np.uint8) * 255
     # Close single-pixel glitter gaps, not the space between head and body.
     material = cv2.morphologyEx(material, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(material, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -151,9 +156,11 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
     for hx, hy, hw, hh, head, circularity in heads:
         diameter = (hw + hh) * .5
         bodies = [shape for shape in shapes if _aligned_body(shape, hx, hy, hw, hh)]
-        if not bodies:
-            bodies = [shape for shape in _material_bodies(lab, head, hx, hy, hw, hh)
-                      if _aligned_body(shape, hx, hy, hw, hh)]
+        # An edge proposal may pass the bounding box gates but later fail its
+        # silhouette/material checks. Keep independent material proposals too;
+        # their existence never bypasses any of the common validators below.
+        bodies += [shape for shape in _material_bodies(lab, head, hx, hy, hw, hh)
+                   if _aligned_body(shape, hx, hy, hw, hh)]
         for bx, by, bw, bh, body, solidity in bodies:
             foot_y = by + bh + top
             foot_x = bx + bw * .5
