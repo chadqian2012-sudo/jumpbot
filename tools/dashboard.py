@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _scorelog import as_int, iter_labels, parse_csv  # noqa: E402
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
+PROJECT_DIR = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False)
+               else Path(__file__).resolve().parent.parent)
 LOGS_DIR = PROJECT_DIR / "logs"
 DEFAULT_STATUS = PROJECT_DIR / "debug" / "status.json"
 

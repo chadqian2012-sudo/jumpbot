@@ -71,7 +71,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; \
-    Excludes: "\logs\*,\debug\*,\logs,\debug,\config.json,\README.md"; \
+    Excludes: "\logs\*,\debug\*,\logs,\debug,\_internal\logs\*,\_internal\debug\*,\_internal\logs,\_internal\debug,\config.json,\README.md"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist

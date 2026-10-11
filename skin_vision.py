@@ -58,8 +58,9 @@ def _head_material(lab, head, hx, hy, hw, hh):
 
 def _material_plane(pixels, colour, chroma_tolerance):
     values = pixels.astype(np.float32)
-    return (((np.linalg.norm(values - colour, axis=2) <= 35)
-             & (np.linalg.norm(values[:, :, 1:] - colour[1:], axis=2) <= chroma_tolerance))
+    delta = values - colour
+    return (((np.linalg.norm(delta, axis=2) <= 35)
+             & (np.linalg.norm(delta[:, :, 1:], axis=2) <= chroma_tolerance))
             .astype(np.uint8) * 255)
 
 
@@ -239,12 +240,21 @@ def _has_waist(row_widths):
     # row or a cylinder. Keep the same minimum widening as the original path.
     band = max(3, height // 10)
     stop = min(height // 2, height - band)
-    widths = [float(np.median(row_widths[y:y + band]))
-              for y in range(height // 4, stop + 1)]
     collar = float(np.median(row_widths[max(1, height // 12):max(2, height // 6)]))
+    lower_stop = max(height // 2, height * 7 // 8 - band)
+    if height >= 6:
+        # The same integer-width windows and medians, computed once in NumPy.
+        # No new waist threshold or smoothing; the read-only view is frame-local.
+        medians = np.median(np.lib.stride_tricks.sliding_window_view(row_widths, band), axis=1)
+        widths = medians[height // 4:stop + 1]
+        lower = medians[height // 2:lower_stop + 1]
+    else:
+        # Preserve the helper's small-array behavior, including truncated bands.
+        widths = [float(np.median(row_widths[y:y + band]))
+                  for y in range(height // 4, stop + 1)]
+        lower = [float(np.median(row_widths[y:y + band]))
+                 for y in range(height // 2, lower_stop + 1)]
     waist = min(widths, default=0)
-    lower = [float(np.median(row_widths[y:y + band]))
-             for y in range(height // 2, max(height // 2, height * 7 // 8 - band) + 1)]
     sustained_base = max(lower, default=0)
     return ((neck >= 3 and sustained_base >= neck * 1.15)
             or (waist >= 3 and waist < collar and sustained_base >= waist * 1.15))

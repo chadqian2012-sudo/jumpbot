@@ -69,7 +69,7 @@ foreach($packageFlavor in @('full','portable')) {
     try {
         foreach($packageFile in Get-ChildItem -LiteralPath $packageApp -File -Recurse) {
             $packageRelative = $packageFile.FullName.Substring($packageApp.Length + 1).Replace('\','/')
-            if($packageRelative -match '^(logs|debug)/') { continue }
+            if($packageRelative -match '^(_internal/)?(logs|debug)/') { continue }
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($packageArchive, $packageFile.FullName, "jumpbot/$packageRelative", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
     } finally {

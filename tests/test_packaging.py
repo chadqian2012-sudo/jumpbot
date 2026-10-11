@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ('jumpbot.py', 'run_control.py', 'skin_vision.py', 'config.json',
@@ -93,6 +94,36 @@ class PackagingTests(unittest.TestCase):
                                  "$Version = '1.3-rc.1'; " + '; '.join(lines) + '; $numericVersion'],
                                 capture_output=True, text=True, check=True, timeout=30)
         self.assertEqual(result.stdout.strip(), '1.3.0.0')
+
+    def test_release_excludes_root_and_internal_runtime_logs_only(self):
+        for flavor, directory, installer_dir in (
+                ('full', 'dist-accelerated', 'installer-accelerated'),
+                ('portable', 'dist-portable', 'installer-portable')):
+            app = self.root / directory / 'jumpbot'
+            for name in ('debug/status.json', 'logs/run.csv', '_internal/debug/panel_exit.log',
+                         '_internal/logs/helper.log', '_internal/vendor/debug/legitimate.bin'):
+                file = app / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(b'QA-only payload')
+            installer = self.root / installer_dir
+            installer.mkdir()
+            (installer / f'jumpbot-setup-1.3-rc.3-{flavor}.exe').write_bytes(b'installer fixture')
+        (self.root / 'TEST_SUMMARY_v1.3-rc.3.md').write_text('no-input packaging fixture', encoding='utf8')
+        self.assertEqual(self.prepare('1.3-rc.3').returncode, 0)
+        result = subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                 '-File', str(ROOT / 'tools/package_release.ps1'),
+                                 '-Root', str(self.root), '-Version', '1.3-rc.3'],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for flavor in ('full', 'portable'):
+            with zipfile.ZipFile(self.root / 'release/1.3-rc.3' / f'jumpbot-win64-v1.3-rc.3-{flavor}.zip') as archive:
+                names = archive.namelist()
+                self.assertIn('jumpbot/_internal/vendor/debug/legitimate.bin', names)
+                self.assertFalse(any(n.startswith(('jumpbot/debug/', 'jumpbot/logs/',
+                    'jumpbot/_internal/debug/', 'jumpbot/_internal/logs/')) for n in names))
+        installer = (ROOT / 'tools/installer/jumpbot.iss').read_text(encoding='utf8')
+        self.assertIn('\\_internal\\debug\\*', installer)
+        self.assertIn('\\_internal\\logs\\*', installer)
 
 
 if __name__ == '__main__':
