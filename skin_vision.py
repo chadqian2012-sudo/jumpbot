@@ -331,6 +331,25 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
             body_colour = np.median(lab[by:by + bh, bx:bx + bw][body_core], axis=0)
             if np.linalg.norm(head_colour - body_colour) > 35:
                 continue
+            # A closed edge can include the platform rim below a real body.
+            # Whole-body medians hide that small foreign-material extension,
+            # moving the foot and creating a second, otherwise valid person.
+            # Check an eroded, head-scaled base band separately. Brightness
+            # shading alone is not a different material; require chroma evidence
+            # too, using the same frame-local head spread as material proposals.
+            base_rows = max(3, int(round(diameter * .25)))
+            base_core = body_core[-base_rows:]
+            if not base_core.any():
+                continue
+            base_colour = np.median(
+                lab[by:by + bh, bx:bx + bw][-base_rows:][base_core], axis=0)
+            head_pixels = lab[hy:hy + hh, hx:hx + hw][head_core].astype(np.float32)
+            chroma_spread = np.percentile(
+                np.linalg.norm(head_pixels[:, 1:] - head_colour[1:], axis=1), 80)
+            chroma_tolerance = float(np.clip(chroma_spread + 6, 12, 20))
+            if (np.linalg.norm(head_colour - base_colour) > 35
+                    and np.linalg.norm(head_colour[1:] - base_colour[1:]) > chroma_tolerance):
+                continue
             support_points = ()
             if support_mask is not None:
                 hits = 0

@@ -334,6 +334,63 @@ class SkinTests(unittest.TestCase):
         hollow.mask[35:65, 5:35] = 0
         self.assertFalse(_nested_silhouette(hollow, head, short, head))
 
+    def test_narrow_pylon_rim_is_not_part_of_the_gold_body(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-narrow-pylon.png'))
+        self.assertIsNotNone(frame)
+        # The green disk ends around y=660; the actual gold foot is y=650.
+        # No-support recognition must also resolve the foreign-material rim;
+        # this is not a weakened platform-support check.
+        skin = find_skin_piece(frame)
+        self.assertIsNotNone(skin)
+        self.assertAlmostEqual(skin.x, 165, delta=2)
+        self.assertAlmostEqual(skin.y, 650, delta=2)
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 165, delta=2)
+                self.assertAlmostEqual(p.y, 650, delta=2)
+                self.assertAlmostEqual(t.x, 416, delta=3)
+                self.assertAlmostEqual(t.y, 493, delta=3)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_narrow_pylon_material_check_is_hue_and_scale_independent(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-narrow-pylon.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # A manually bounded gold material selection excludes the green rim
+        # and white pylon. It does not derive its oracle from the new matcher.
+        selected = cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        bounds = np.zeros(selected.shape, dtype=bool)
+        bounds[540:650, 145:185] = True
+        selected &= bounds
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][selected] = hue
+                hsv[:, :, 1][selected] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 165, delta=3)
+                self.assertAlmostEqual(p.y, 650, delta=3)
+        for scale in (.75, 1.25):
+            with self.subTest(scale=scale):
+                p, t, _pm, _bm = self.detect(cv2.resize(frame, None, fx=scale, fy=scale))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x / scale, 165, delta=3)
+                self.assertAlmostEqual(p.y / scale, 650, delta=3)
+
+    def test_narrow_pylon_does_not_override_ambiguity_or_bad_support(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-narrow-pylon.png'))
+        duplicate = frame.copy()
+        duplicate[540:651, 295:335] = frame[540:651, 145:185]
+        self.assertIsNone(find_skin_piece(duplicate))
+        self.assertIsNone(find_skin_piece(frame, np.zeros(frame.shape[:2], np.uint8)))
+        self.assertIsNone(find_skin_piece(frame, np.full(frame.shape[:2], 255, np.uint8)))
+
     def test_start_texture_coalescing_is_hue_independent_and_keeps_ambiguity(self):
         frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-start-texture.png'))
         original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
