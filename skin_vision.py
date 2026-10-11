@@ -144,6 +144,19 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
         substantial = np.ones((width, width), np.uint8)
         textured = cv2.morphologyEx(textured, cv2.MORPH_OPEN, substantial)
         planes.append(cv2.morphologyEx(textured, cv2.MORPH_CLOSE, substantial))
+        # Use the head's *local* fleck coverage to propose a textured region,
+        # not only isolated bright fleck pixels. Sparse gaps in a gold body
+        # otherwise fragment it even when a nearby flat yellow top is cleanly
+        # excluded. Material, geometry, waist, support and border gates remain
+        # unchanged; thin seams still need to survive the substantial opening.
+        threshold = float(np.clip(grain * .5, 2, 4))
+        head_coverage = float((head_texture[core] >= threshold).mean())
+        density = cv2.blur((texture >= threshold).astype(np.float32), (width, width))
+        gate = float(np.clip(head_coverage * .6, .25, .5))
+        region = material & ((density >= gate).astype(np.uint8) * 255)
+        region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
+        region = cv2.morphologyEx(region, cv2.MORPH_OPEN, substantial)
+        planes.append(cv2.morphologyEx(region, cv2.MORPH_CLOSE, substantial))
     contours = []
     for plane in planes:
         found, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
