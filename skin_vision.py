@@ -124,10 +124,14 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     # holes. Repair scale comes from the validated head diameter, not a texture
     # or colour label. Keep the original proposal and all original validators.
     # Cropped/platform-connected components still fail below.
-    repair_width = int(np.clip(round(diameter * .20) | 1, 3, 7))
+    # Seven pixels at the reference 553px capture; keep the same relative
+    # limit when DPI/capture scaling changes, never an unbounded pixel fill.
+    repair_cap = max(3, int(round(lab.shape[1] * 7 / 553)) | 1)
+    repair_width = int(np.clip(round(diameter * .20) | 1, 3, repair_cap))
     if repair_width > 3:
         repair = np.ones((repair_width, repair_width), np.uint8)
         planes.append(cv2.morphologyEx(material, cv2.MORPH_CLOSE, repair))
+    material_plane_count = len(planes)
     head_l = lab[hy:hy + hh, hx:hx + hw, 0]
     head_texture = cv2.absdiff(head_l, cv2.GaussianBlur(head_l, (3, 3), 0))
     grain = float(np.median(head_texture[core]))
@@ -173,6 +177,13 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
         region = cv2.morphologyEx(region, cv2.MORPH_OPEN, substantial)
         planes.append(cv2.morphologyEx(region, cv2.MORPH_CLOSE, substantial))
+    # Texture regions also inherit small boundary gaps. Apply the SAME bounded
+    # head-scale repair already used for material proposals, retaining each
+    # original region too. Never fill a convex hull or lower solidity: a joined
+    # platform/cropped component must still fail the common validators below.
+    if repair_width > 3:
+        planes.extend(cv2.morphologyEx(plane, cv2.MORPH_CLOSE, repair)
+                      for plane in planes[material_plane_count:])
     contours = []
     for plane in planes:
         found, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

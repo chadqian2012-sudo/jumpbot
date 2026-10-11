@@ -391,6 +391,69 @@ class SkinTests(unittest.TestCase):
         self.assertIsNone(find_skin_piece(frame, np.zeros(frame.shape[:2], np.uint8)))
         self.assertIsNone(find_skin_piece(frame, np.full(frame.shape[:2], 255, np.uint8)))
 
+    def test_textured_gold_on_yellow_badge_platform_gets_bounded_gap_repair(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-yellow-badge.png'))
+        self.assertIsNotNone(frame)
+        # Full head already passes; the original textured body has solidity
+        # 0.8587 and must NOT pass the unchanged 0.86 gate. The existing 7px
+        # bounded repair proposes a complete body (0.8817), not a relaxed gate.
+        skin = find_skin_piece(frame)
+        self.assertIsNotNone(skin)
+        self.assertGreaterEqual(skin.score, .86)
+        self.assertAlmostEqual(skin.x, 364, delta=2)
+        self.assertAlmostEqual(skin.y, 626, delta=2)
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 364, delta=2)
+                self.assertAlmostEqual(p.y, 626, delta=2)
+                self.assertAlmostEqual(t.x, 210, delta=3)
+                self.assertAlmostEqual(t.y, 524, delta=3)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_texture_boundary_repair_keeps_hue_and_scale_agreement(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-yellow-badge.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        selected = cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        # This frame's top is also yellow: a rectangular hue selection paints
+        # background/top pixels and clips the body's left edge. Use the full
+        # silhouette separately checked against the labelled foot above.
+        skin = find_skin_piece(frame)
+        self.assertIsNotNone(skin)
+        x, y, w, h = skin.bbox
+        bounds = np.zeros(selected.shape, dtype=bool)
+        bounds[y:y + h, x:x + w] = skin.mask > 0
+        selected &= bounds
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][selected] = hue
+                hsv[:, :, 1][selected] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 364, delta=3)
+                self.assertAlmostEqual(p.y, 626, delta=3)
+        for scale in (.75, 1.25):
+            with self.subTest(scale=scale):
+                p, t, _pm, _bm = self.detect(cv2.resize(frame, None, fx=scale, fy=scale))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x / scale, 364, delta=3)
+                self.assertAlmostEqual(p.y / scale, 626, delta=3)
+
+    def test_texture_repair_cannot_invent_a_missing_body_or_merge_people(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-yellow-badge.png'))
+        broken = frame.copy()
+        broken[575:611, 345:385] = frame[100, 460]
+        self.assertIsNone(find_skin_piece(broken))
+        duplicate = frame.copy()
+        duplicate[518:628, 145:185] = frame[518:628, 345:385]
+        self.assertIsNone(find_skin_piece(duplicate))
+
     def test_start_texture_coalescing_is_hue_independent_and_keeps_ambiguity(self):
         frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-start-texture.png'))
         original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
