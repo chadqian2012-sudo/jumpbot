@@ -188,6 +188,61 @@ class SkinTests(unittest.TestCase):
                 self.assertAlmostEqual(p.y, 645, delta=2)
                 self.assertTrue(J._foot_on_block(bm, p, self.cfg))
 
+    def test_gold_round_platform_boundary_holes_get_bounded_repair(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-round-platform.png'))
+        self.assertIsNotNone(frame)
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 232, delta=2)
+                self.assertAlmostEqual(p.y, 611, delta=2)
+                self.assertAlmostEqual(t.x, 346, delta=3)
+                self.assertAlmostEqual(t.y, 533, delta=3)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_round_platform_repair_keeps_hue_and_scale_agreement(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-round-platform.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        material = cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        bounds = np.zeros(material.shape, dtype=bool)
+        bounds[497:616, 208:258] = True
+        material &= bounds
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][material] = hue
+                hsv[:, :, 1][material] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 232, delta=2)
+                self.assertAlmostEqual(p.y, 611, delta=2)
+        for scale in (.75, 1.25):
+            with self.subTest(scale=scale):
+                p, t, _pm, _bm = self.detect(cv2.resize(frame, None, fx=scale, fy=scale))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x / scale, 232, delta=3)
+                self.assertAlmostEqual(p.y / scale, 611, delta=3)
+
+    def test_textured_flat_material_cannot_be_cropped_into_a_body(self):
+        lab = np.full((200, 120, 3), (197, 127, 168), np.uint8)
+        noise = np.random.default_rng(154).integers(-8, 9, size=lab.shape[:2])
+        lab[:, :, 0] = (lab[:, :, 0].astype(np.int16) + noise).astype(np.uint8)
+        head = cv2.ellipse2Poly((60, 40), (15, 15), 0, 0, 360, 5).reshape(-1, 1, 2)
+        self.assertEqual(_material_bodies(lab, head, 45, 25, 31, 31), [])
+        # A textured cylinder still has no sustained waist.
+        frame = np.full((600, 400, 3), 210, np.uint8)
+        cv2.circle(frame, (200, 350), 15, (60, 90, 180), -1)
+        cv2.rectangle(frame, (185, 370), (215, 430), (60, 90, 180), -1)
+        selected = frame[:, :, 0] == 60
+        values = frame.astype(np.int16)
+        values[selected] += np.random.default_rng(86).integers(-8, 9, size=(selected.sum(), 1))
+        self.assertIsNone(find_skin_piece(np.clip(values, 0, 255).astype(np.uint8)))
+
     def test_nested_outline_coalescing_requires_same_head_and_coverage(self):
         full = SkinMatch(20, 95, (0, 0, 40, 95), .90, np.full((95, 40), 255, np.uint8))
         short = SkinMatch(20, 65, (5, 0, 30, 65), .99, np.full((65, 30), 255, np.uint8))

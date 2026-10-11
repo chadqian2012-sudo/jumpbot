@@ -120,6 +120,14 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
     # Close single-pixel glitter gaps, not the space between head and body.
     kernel = np.ones((3, 3), np.uint8)
     planes = [cv2.morphologyEx(material, cv2.MORPH_CLOSE, kernel)]
+    # A shaded head can look smooth even when its body has metallic boundary
+    # holes. Repair scale comes from the validated head diameter, not a texture
+    # or colour label. Keep the original proposal and all original validators.
+    # Cropped/platform-connected components still fail below.
+    repair_width = int(np.clip(round(diameter * .20) | 1, 3, 7))
+    if repair_width > 3:
+        repair = np.ones((repair_width, repair_width), np.uint8)
+        planes.append(cv2.morphologyEx(material, cv2.MORPH_CLOSE, repair))
     head_l = lab[hy:hy + hh, hx:hx + hw, 0]
     head_texture = cv2.absdiff(head_l, cv2.GaussianBlur(head_l, (3, 3), 0))
     grain = float(np.median(head_texture[core]))
