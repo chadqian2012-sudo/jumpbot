@@ -157,6 +157,22 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
         region = cv2.morphologyEx(region, cv2.MORPH_OPEN, substantial)
         planes.append(cv2.morphologyEx(region, cv2.MORPH_CLOSE, substantial))
+    # Shading can quantize metallic flecks to just one Lab unit. A dense fine
+    # texture witness in the head may propose a body region in all Lab channels;
+    # this does not lower any final geometry/colour/support acceptance gate.
+    head_lab = lab[hy:hy + hh, hx:hx + hw]
+    head_detail = cv2.absdiff(head_lab, cv2.GaussianBlur(head_lab, (3, 3), 0)).max(axis=2)
+    fine_coverage = float((head_detail[core] >= 1).mean())
+    if fine_coverage >= .6:
+        roi_lab = lab[y0:y1, x0:x1]
+        detail = cv2.absdiff(roi_lab, cv2.GaussianBlur(roi_lab, (3, 3), 0)).max(axis=2)
+        width = max(3, int(round(diameter * .14)) | 1)
+        substantial = np.ones((width, width), np.uint8)
+        density = cv2.blur((detail >= 1).astype(np.float32), (width, width))
+        region = material & ((density >= np.clip(fine_coverage * .6, .25, .5)).astype(np.uint8) * 255)
+        region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
+        region = cv2.morphologyEx(region, cv2.MORPH_OPEN, substantial)
+        planes.append(cv2.morphologyEx(region, cv2.MORPH_CLOSE, substantial))
     contours = []
     for plane in planes:
         found, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

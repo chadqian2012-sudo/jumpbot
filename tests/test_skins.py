@@ -284,6 +284,43 @@ class SkinTests(unittest.TestCase):
         values[selected] += np.random.default_rng(86).integers(-8, 9, size=(selected.sum(), 1))
         self.assertIsNone(find_skin_piece(np.clip(values, 0, 255).astype(np.uint8)))
 
+    def test_shaded_gold_fine_texture_on_tan_background_is_complete(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-tan-background.png'))
+        self.assertIsNotNone(frame)
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 175, delta=2)
+                self.assertAlmostEqual(p.y, 646, delta=2)
+                self.assertAlmostEqual(t.x, 404, delta=3)
+                self.assertAlmostEqual(t.y, 501, delta=3)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_fine_texture_adaptation_on_tan_is_not_a_gold_hue_rule(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-tan-background.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        vision = J.Vision(self.cfg)
+        self.assertIsNotNone(vision.detect(frame)[0])
+        skin = vision._skin_match
+        self.assertIsNotNone(skin)
+        x, y, w, h = skin.bbox
+        selected = np.zeros(frame.shape[:2], dtype=bool)
+        selected[y:y + h, x:x + w] = skin.mask > 0
+        selected &= cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][selected] = hue
+                hsv[:, :, 1][selected] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 175, delta=3)
+                self.assertAlmostEqual(p.y, 646, delta=3)
+
     def test_nested_outline_coalescing_requires_same_head_and_coverage(self):
         full = SkinMatch(20, 95, (0, 0, 40, 95), .90, np.full((95, 40), 255, np.uint8))
         short = SkinMatch(20, 65, (5, 0, 30, 65), .99, np.full((65, 30), 255, np.uint8))
