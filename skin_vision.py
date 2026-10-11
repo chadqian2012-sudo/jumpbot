@@ -176,6 +176,31 @@ def _has_waist(row_widths):
             or (waist >= 3 and waist < collar and sustained_base >= waist * 1.15))
 
 
+def _nested_silhouette(first, first_head, second, second_head):
+    """Coalesce an interior fragment only under the same validated head.
+
+    Both proposals have already passed every complete-person validator. A
+    material mask can nevertheless split a glitter body into a shorter closed
+    outline. Sharing a head alone is insufficient: the smaller full silhouette
+    must be enclosed and at least 95% covered by the larger one. Two separate
+    heads or branching/non-nested bodies remain ambiguous.
+    """
+    ax, ay, aw, ah = first_head
+    bx, by, bw, bh = second_head
+    overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(
+        0, min(ay + ah, by + bh) - max(ay, by))
+    if overlap / max(aw * ah + bw * bh - overlap, 1) < .85:
+        return False
+    small, large = sorted((first, second), key=lambda m: m.bbox[2] * m.bbox[3])
+    sx, sy, sw, sh = small.bbox
+    lx, ly, lw, lh = large.bbox
+    if sx < lx or sy < ly or sx + sw > lx + lw or sy + sh > ly + lh:
+        return False
+    core = small.mask > 0
+    enclosing = large.mask[sy - ly:sy - ly + sh, sx - lx:sx - lx + sw] > 0
+    return bool(core.any() and enclosing[core].mean() >= .95)
+
+
 def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         return None
@@ -233,6 +258,7 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
                     heads.append((rx, ry, rw, rh, recovered_hull, roundness))
 
     matches = []
+    match_heads = []
     for hx, hy, hw, hh, head, circularity in heads:
         diameter = (hw + hh) * .5
         bodies = [shape for shape in shapes if _aligned_body(shape, hx, hy, hw, hh)]
@@ -307,12 +333,21 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
             candidate = SkinMatch(foot_x, float(foot_y),
                                   (x0, y0 + top, x1 - x0, y1 - y0),
                                   float(min(circularity, solidity)), mask, support_points)
+            candidate_head = (hx, hy + top, hw, hh)
             duplicates = [i for i, old in enumerate(matches)
-                          if math.hypot(old.x - candidate.x, old.y - candidate.y) < diameter * .35]
+                          if math.hypot(old.x - candidate.x, old.y - candidate.y) < diameter * .35
+                          or _nested_silhouette(old, match_heads[i], candidate, candidate_head)]
             if duplicates:
                 index = duplicates[0]
-                if candidate.score > matches[index].score:
+                old = matches[index]
+                nested = _nested_silhouette(old, match_heads[index], candidate, candidate_head)
+                # For proven nesting the longer validated silhouette represents
+                # the foot; a high-score interior fragment cannot truncate it.
+                if ((nested and candidate.y > old.y)
+                        or (candidate.score > old.score and (not nested or candidate.y == old.y))):
                     matches[index] = candidate
+                    match_heads[index] = candidate_head
             else:
                 matches.append(candidate)
+                match_heads.append(candidate_head)
     return matches[0] if len(matches) == 1 else None

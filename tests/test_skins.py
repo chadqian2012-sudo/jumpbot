@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ['JUMPBOT_NO_INPUT'] = '1'
 import jumpbot as J  # noqa: E402
-from skin_vision import find_skin_piece, _has_waist, _material_bodies  # noqa: E402
+from skin_vision import (find_skin_piece, _has_waist, _material_bodies,
+                         _nested_silhouette, SkinMatch)  # noqa: E402
 
 
 class SkinTests(unittest.TestCase):
@@ -172,6 +173,54 @@ class SkinTests(unittest.TestCase):
                 self.assertIsNotNone(t)
                 self.assertAlmostEqual(p.x, 150, delta=3)
                 self.assertAlmostEqual(p.y, 659, delta=3)
+
+    def test_gold_start_texture_fragment_is_not_a_second_person(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-start-texture.png'))
+        self.assertIsNotNone(frame)
+        self.assertIsNone(J.match_ui(frame), 'a live frame is not a restart button')
+        for backend in ('cpu', 'simd'):
+            with self.subTest(backend=backend):
+                p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertEqual(p.source, 'skin-shape')
+                self.assertAlmostEqual(p.x, 173, delta=2)
+                self.assertAlmostEqual(p.y, 645, delta=2)
+                self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_nested_outline_coalescing_requires_same_head_and_coverage(self):
+        full = SkinMatch(20, 95, (0, 0, 40, 95), .90, np.full((95, 40), 255, np.uint8))
+        short = SkinMatch(20, 65, (5, 0, 30, 65), .99, np.full((65, 30), 255, np.uint8))
+        head = (5, 0, 30, 30)
+        self.assertTrue(_nested_silhouette(full, head, short, head))
+        self.assertTrue(_nested_silhouette(short, head, full, head))
+        self.assertFalse(_nested_silhouette(full, head, short, (15, 0, 30, 30)))
+        self.assertFalse(_nested_silhouette(full, head,
+            dataclasses.replace(short, bbox=(25, 0, 30, 65)), head))
+        hollow = dataclasses.replace(full, mask=full.mask.copy())
+        hollow.mask[35:65, 5:35] = 0
+        self.assertFalse(_nested_silhouette(hollow, head, short, head))
+
+    def test_start_texture_coalescing_is_hue_independent_and_keeps_ambiguity(self):
+        frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-start-texture.png'))
+        original = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        material = cv2.inRange(original, (12, 55, 65), (40, 255, 255)) > 0
+        bounds = np.zeros(material.shape, dtype=bool)
+        bounds[530:650, 145:202] = True
+        material &= bounds
+        for hue in (0, 20, 55, 85, 120, 150, 175):
+            with self.subTest(hue=hue):
+                hsv = original.copy()
+                hsv[:, :, 0][material] = hue
+                hsv[:, :, 1][material] = 190
+                p, t, _pm, _bm = self.detect(cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR))
+                self.assertIsNotNone(p)
+                self.assertIsNotNone(t)
+                self.assertAlmostEqual(p.x, 173, delta=2)
+                self.assertAlmostEqual(p.y, 645, delta=2)
+        duplicate = frame.copy()
+        duplicate[530:650, 295:352] = frame[530:650, 145:202]
+        self.assertIsNone(find_skin_piece(duplicate))
 
     def test_one_vision_adapts_to_colour_changes_without_a_stale_profile(self):
         vision = J.Vision(self.cfg)
