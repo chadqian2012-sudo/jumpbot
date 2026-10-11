@@ -34,7 +34,9 @@ $packageFiles = @()
 foreach($packageFlavor in @('full','portable')) {
     $packageDist = if($packageFlavor -eq 'full') { 'dist-accelerated' } else { 'dist-portable' }
     $packageInstaller = if($packageFlavor -eq 'full') { 'installer-accelerated' } else { 'installer-portable' }
-    $packageApp = Join-Path $packageRoot "$packageDist\jumpbot"
+    # The caller/temp directory may use an 8.3 name (RUNNER~1), while the
+    # provider expands Get-ChildItem.FullName. Use that same canonical base.
+    $packageApp = (Get-Item -LiteralPath (Join-Path $packageRoot "$packageDist\jumpbot")).FullName.TrimEnd('\')
     if(-not (Test-Path -LiteralPath (Join-Path $packageApp 'jumpbot.exe'))) { throw 'missing app executable' }
     $packageBuild = Get-Content -LiteralPath (Join-Path $packageApp 'build-source.json') -Raw | ConvertFrom-Json
     $packageExeHash = (Get-FileHash -LiteralPath (Join-Path $packageApp 'jumpbot.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -68,8 +70,11 @@ foreach($packageFlavor in @('full','portable')) {
     $packageArchive = [System.IO.Compression.ZipArchive]::new($packageStream, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach($packageFile in Get-ChildItem -LiteralPath $packageApp -File -Recurse) {
+            if(-not $packageFile.FullName.StartsWith($packageApp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'payload file escaped canonical app directory'
+            }
             $packageRelative = $packageFile.FullName.Substring($packageApp.Length + 1).Replace('\','/')
-            if($packageRelative -match '^(logs|debug)/') { continue }
+            if($packageRelative -match '^(_internal/)?(logs|debug)/') { continue }
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($packageArchive, $packageFile.FullName, "jumpbot/$packageRelative", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
     } finally {
