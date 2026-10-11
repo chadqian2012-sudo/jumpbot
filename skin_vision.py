@@ -95,7 +95,31 @@ def _recover_round_heads(lab, fragment, hx, hy, hw, hh):
     return heads
 
 
-def _material_bodies(lab, head, hx, hy, hw, hh):
+def _repair_texture_components(plane, kernel):
+    """Close boundary gaps inside ONE component, never join a platform seam.
+
+    Work in each original bounding box with zero padding. Return independent
+    contour proposals, not a union mask that could reconnect neighbours after
+    repair. Components touching the material ROI border remain unsupported.
+    """
+    _count, labels, stats, _centres = cv2.connectedComponentsWithStats(plane, 8)
+    pad = kernel.shape[0]
+    contours = []
+    for label, (x, y, w, h, area) in enumerate(stats[1:], 1):
+        if (area < 20 or x <= 0 or y <= 0
+                or x + w >= plane.shape[1] or y + h >= plane.shape[0]):
+            continue
+        component = ((labels[y:y + h, x:x + w] == label).astype(np.uint8) * 255)
+        padded = cv2.copyMakeBorder(component, pad, pad, pad, pad,
+                                   cv2.BORDER_CONSTANT, value=0)
+        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, kernel)
+        repaired = closed[pad:pad + h, pad:pad + w]
+        found, _ = cv2.findContours(repaired, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours.extend(contour + np.array([[[x, y]]], np.int32) for contour in found)
+    return contours
+
+
+def _material_bodies(lab, head, hx, hy, hw, hh, *, with_origins=False):
     """Recover an outline from this frame's head material, never a hue table.
 
     Gold glitter can join Canny edges to the platform and open an otherwise
@@ -179,17 +203,18 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
         planes.append(cv2.morphologyEx(region, cv2.MORPH_CLOSE, substantial))
     # Texture regions also inherit small boundary gaps. Apply the SAME bounded
     # head-scale repair already used for material proposals, retaining each
-    # original region too. Never fill a convex hull or lower solidity: a joined
-    # platform/cropped component must still fail the common validators below.
-    if repair_width > 3:
-        planes.extend(cv2.morphologyEx(plane, cv2.MORPH_CLOSE, repair)
-                      for plane in planes[material_plane_count:])
+    # original region too. Repair components independently so a nearby platform
+    # seam cannot extend the body/foot. No hull fill or lowered solidity.
     contours = []
     for plane in planes:
         found, _ = cv2.findContours(plane, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours.extend(found)
+        contours.extend((contour, False) for contour in found)
+    if repair_width > 3:
+        for plane in planes[material_plane_count:]:
+            contours.extend((contour, True)
+                            for contour in _repair_texture_components(plane, repair))
     shapes = []
-    for contour in contours:
+    for contour, repaired in contours:
         x, y, bw, bh = cv2.boundingRect(contour)
         if x <= 0 or y <= 0 or x + bw >= x1 - x0 or y + bh >= y1 - y0:
             continue
@@ -197,8 +222,9 @@ def _material_bodies(lab, head, hx, hy, hw, hh):
         if hull_area < 20:
             continue
         solidity = cv2.contourArea(contour) / hull_area
-        shapes.append((x + x0, y + y0, bw, bh,
-                       contour + np.array([[[x0, y0]]], np.int32), solidity))
+        shape = (x + x0, y + y0, bw, bh,
+                 contour + np.array([[[x0, y0]]], np.int32), solidity)
+        shapes.append((shape, repaired) if with_origins else shape)
     return shapes
 
 
@@ -309,13 +335,22 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
     match_heads = []
     for hx, hy, hw, hh, head, circularity in heads:
         diameter = (hw + hh) * .5
-        bodies = [shape for shape in shapes if _aligned_body(shape, hx, hy, hw, hh)]
+        bodies = [(shape, False) for shape in shapes if _aligned_body(shape, hx, hy, hw, hh)]
         # An edge proposal may pass the bounding box gates but later fail its
         # silhouette/material checks. Keep independent material proposals too;
         # their existence never bypasses any of the common validators below.
-        bodies += [shape for shape in _material_bodies(lab, head, hx, hy, hw, hh)
+        bodies += [(shape, repaired) for shape, repaired in
+                   _material_bodies(lab, head, hx, hy, hw, hh, with_origins=True)
                    if _aligned_body(shape, hx, hy, hw, hh)]
-        for bx, by, bw, bh, body, solidity in bodies:
+        has_original_match = False
+        for (bx, by, bw, bh, body, solidity), repaired in bodies:
+            # Boundary repair is a fallback for THIS head, not evidence that
+            # a longer silhouette is more complete than an already validated
+            # original. Even one connected textured component can contain a
+            # same-colour platform seam. Other heads still need independent
+            # validation, including their repair fallback, to detect ambiguity.
+            if repaired and has_original_match:
+                continue
             foot_y = by + bh + top
             foot_x = bx + bw * .5
             if foot_y < height * min_foot_ratio or foot_y >= height - 2:
@@ -394,6 +429,8 @@ def find_skin_piece(frame, support_mask=None, min_foot_ratio=0.5):
                     if not witnesses:
                         continue
                     support_points = max(witnesses, key=len)
+            if not repaired:
+                has_original_match = True
             mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
             mask[hy - y0:hy - y0 + hh, hx - x0:hx - x0 + hw] |= head_mask
             mask[by - y0:by - y0 + bh, bx - x0:bx - x0 + bw] |= body_mask

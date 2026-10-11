@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 os.environ['JUMPBOT_NO_INPUT'] = '1'
 import jumpbot as J  # noqa: E402
 from skin_vision import (find_skin_piece, _has_waist, _material_bodies,
-                         _nested_silhouette, SkinMatch)  # noqa: E402
+                         _nested_silhouette, _repair_texture_components, SkinMatch)  # noqa: E402
 
 
 class SkinTests(unittest.TestCase):
@@ -453,6 +453,46 @@ class SkinTests(unittest.TestCase):
         duplicate = frame.copy()
         duplicate[518:628, 145:185] = frame[518:628, 345:385]
         self.assertIsNone(find_skin_piece(duplicate))
+
+    def test_repair_cannot_extend_a_validated_character_into_cardboard(self):
+        for name, x, y, tx, ty in (
+                ('skin-gold-cardboard-seam', 338, 606, 231, 528),
+                ('skin-gold-cardboard-bonus', 200, 630, 378, 515)):
+            frame = cv2.imread(str(ROOT / 'tests/fixtures' / (name + '.png')))
+            self.assertIsNotNone(frame)
+            skin = find_skin_piece(frame)
+            self.assertIsNotNone(skin)
+            self.assertAlmostEqual(skin.x, x, delta=1)
+            self.assertAlmostEqual(skin.y, y, delta=1)
+            for backend in ('cpu', 'simd'):
+                with self.subTest(name=name, backend=backend):
+                    p, t, _pm, bm = self.detect(frame, dataclasses.replace(self.cfg, masks_backend=backend))
+                    self.assertIsNotNone(p)
+                    self.assertIsNotNone(t)
+                    self.assertAlmostEqual(p.x, x, delta=1)
+                    self.assertAlmostEqual(p.y, y, delta=1)
+                    self.assertAlmostEqual(t.x, tx, delta=2)
+                    self.assertAlmostEqual(t.y, ty, delta=2)
+                    self.assertTrue(J._foot_on_block(bm, p, self.cfg))
+
+    def test_component_repair_never_joins_neighbouring_regions(self):
+        plane = np.zeros((60, 50), np.uint8)
+        plane[10:33, 15:28] = 255
+        plane[36:44, 14:29] = 255
+        kernel = np.ones((7, 7), np.uint8)
+        global_closed = cv2.morphologyEx(plane, cv2.MORPH_CLOSE, kernel)
+        merged, _ = cv2.findContours(global_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.assertEqual(len(merged), 1, 'fixture must reproduce cross-component bridging')
+        repaired = _repair_texture_components(plane, kernel)
+        self.assertEqual(sorted(cv2.boundingRect(c) for c in repaired),
+                         [(14, 36, 15, 8), (15, 10, 13, 23)])
+        border = np.full_like(plane, 255)
+        self.assertEqual(_repair_texture_components(border, kernel), [])
+
+    def test_validated_original_head_does_not_hide_another_repaired_person(self):
+        mixed = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-yellow-badge.png'))
+        mixed[520:640, 145:196] = self.frame[532:652, 148:199]
+        self.assertIsNone(find_skin_piece(mixed))
 
     def test_start_texture_coalescing_is_hue_independent_and_keeps_ambiguity(self):
         frame = cv2.imread(str(ROOT / 'tests/fixtures/skin-gold-start-texture.png'))
