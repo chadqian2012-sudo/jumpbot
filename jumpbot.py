@@ -70,9 +70,11 @@ def log(msg: str) -> None:
 
 
 _STATUS: dict = {}
+_ROUND_STARTED_ACTIVE: float | None = None
 _CUDA_ENV_READY = False      # CUDA 运行时路径只需铺一次（否则 PATH 会被反复追加直到爆掉）
 _OPENCL_RUNTIMES: dict = {}  # 进程内复用上下文/程序，Vision 各自持有队列、内核和缓冲区
 _OPENCL_FAILED: set = set()
+_OPENCL_ENUMERATION_CHECKS: dict = {}  # 隔离枚举失败时，输入进程不加载该驱动
 _OPENCL_CHECKED: set = set()
 
 
@@ -90,6 +92,15 @@ def status_write(**fields) -> None:
                 fields["state"] = "resuming"
     _STATUS.update(fields)
     _STATUS["updated_at"] = time.time()
+    # A monotonic checkpoint lets the panel tick locally between jumps, without
+    # another writer/thread doing disk I/O alongside a precision mouse hold.
+    _STATUS["updated_monotonic_s"] = time.monotonic()
+    _STATUS["active_elapsed_s"] = (max(0.0, active_time() - _ROUND_STARTED_ACTIVE)
+                                    if _ROUND_STARTED_ACTIVE is not None else 0.0)
+    _STATUS["elapsed_running"] = (
+        _ROUND_STARTED_ACTIVE is not None and _STATUS.get("state") != "stopped"
+        and _STATUS.get("alive", True) is not False
+        and (_CONTROL is None or (not _CONTROL.stopped and _CONTROL.paused_at is None)))
     try:
         STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATUS_PATH.with_suffix(".tmp")
@@ -864,7 +875,7 @@ class Config:
     center_hit_tolerance_px: float = 12.0
     score_bonus_cap: int = 32            # 连击加成上限：min(2×连击数, 32)
     digit_min_height_ratio: float = 0.02
-    max_jumps: int = 100
+    max_jumps: int = 0                  # 0 = unlimited; positive only for bounded tests
     max_runtime_s: float = 1800.0
 
     @classmethod
@@ -892,6 +903,8 @@ class Config:
         parse_hotkey(cfg.pause_hotkey)
         cfg.startup_wait_s = validate_timing(cfg.startup_wait_s, "startup_wait_s")
         cfg.start_delay_s = validate_timing(cfg.start_delay_s, "start_delay_s")
+        if isinstance(cfg.max_jumps, bool) or not isinstance(cfg.max_jumps, int) or cfg.max_jumps < 0:
+            raise ValueError("max_jumps 必须是非负整数（0 表示不限跳数）")
         return cfg
 
     def save(self, path: Path) -> None:
@@ -1521,6 +1534,31 @@ class Vision:
             return self._cl_state
         self._cl_state = False
         try:
+            selector = self.cfg.opencl_device.casefold().strip()
+            if os.environ.get("JUMPBOT_OPENCL_PROBE") != "1":
+                # Enumeration itself can crash an ICD (e.g. Intel integer
+                # divide-by-zero), before the existing per-device build probe.
+                # Do not enter the input owner's driver loader until a no-input
+                # child has enumerated, built and checked the selected backend.
+                if selector not in _OPENCL_ENUMERATION_CHECKS:
+                    cmd = [sys.executable]
+                    if not _is_frozen():
+                        cmd.append(str(Path(__file__).resolve()))
+                    cmd += ["--_opencl-check", self.cfg.opencl_device]
+                    env = dict(os.environ, JUMPBOT_NO_INPUT="1", JUMPBOT_DISABLE_CUDA="1",
+                               JUMPBOT_OPENCL_PROBE="1")
+                    try:
+                        result = subprocess.run(cmd, env=env, capture_output=True, timeout=20,
+                                                encoding="utf-8", errors="replace",
+                                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                        _OPENCL_ENUMERATION_CHECKS[selector] = result.returncode == 0
+                        if result.returncode != 0:
+                            log(f"OpenCL 枚举/预热隔离自检失败（{result.returncode}），跳过 OpenCL；CUDA/CPU 仍可用")
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        _OPENCL_ENUMERATION_CHECKS[selector] = False
+                        log(f"OpenCL 枚举/预热隔离自检不可用，跳过 OpenCL：{exc}")
+                if not _OPENCL_ENUMERATION_CHECKS[selector]:
+                    return False
             import pyopencl as cl
             self._cl = cl
             devices = []
@@ -1529,7 +1567,6 @@ class Vision:
                     devices.extend(platform.get_devices(device_type=cl.device_type.GPU))
                 except cl.Error:
                     continue
-            selector = self.cfg.opencl_device.casefold().strip()
             cache_dir = DEBUG_DIR / "opencl_cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
             for device in devices:
@@ -1920,7 +1957,10 @@ class Vision:
                       tpl_score=piece_template_score(frame, bbox))
             )
         skin_candidate = None
-        if not candidates and cfg.piece_skin_shape_enabled:
+        # A tall purple decoration is not proof that the character itself is
+        # purple. Weak HSV candidates must not suppress automatic skin search.
+        reliable_colour = any(p.tpl_score >= cfg.piece_template_min_score for p in candidates)
+        if (not reliable_colour) and cfg.piece_skin_shape_enabled:
             skin_candidate = find_skin_piece(frame, support_mask, cfg.piece_min_y_ratio)
             if skin_candidate is not None:
                 sx, sy, sw, sh = skin_candidate.bbox
@@ -1936,12 +1976,24 @@ class Vision:
                 # A falling, sideways pawn can correlate with an upright RGB
                 # template on the adjacent cup. Never turn that into a landing.
                 return None
+        if cfg.piece_skin_shape_enabled:
+            # Automatic mode must not retain arbitrary low-confidence colour
+            # noise when every template validator failed (e.g. cursor glow).
+            candidates = [p for p in candidates if p.tpl_score >= cfg.piece_template_min_score]
         scan_hits = []
         if (not cfg.piece_scan_only_when_needed) or (not candidates):
             scan_hits = piece_template_scan(frame, cfg)
         if scan_hits:
             # 与颜色候选合并去重（位置接近的取模板分更高的）
             for hit in scan_hits:
+                if cfg.piece_skin_shape_enabled:
+                    hx, hy, hw, hh = hit.bbox
+                    coverage = float((mask[hy:hy + hh, hx:hx + hw] > 0).mean())
+                    if coverage < .4:
+                        # RGB correlation alone can match the dark rim of a cup
+                        # after a gold silhouette is lost. A legacy scan must
+                        # also prove legacy colour, not silently replace gold.
+                        continue
                 replaced = False
                 for idx, cand in enumerate(candidates):
                     if math.hypot(hit.x - cand.x, hit.y - cand.y) < 0.05 * w:
@@ -3472,6 +3524,7 @@ def acquire_frame(cap: Capturer, cfg: Config, vision: Vision, ctrl: InputControl
 
         center = (target.x, target.y)
         status_write(piece_source=getattr(piece, "source", "legacy"),
+                     skin_auto_enabled=cfg.piece_skin_shape_enabled,
                      piece_shape_score=round(getattr(piece, "shape_score", 0.0), 3))
         if (prev_center is not None
                 and abs(center[0] - prev_center[0]) <= cfg.target_consistency_px
@@ -3770,8 +3823,14 @@ def analyze_calibration(samples: list, cfg: Config, config_path: Path, tag: str,
             "implied_k": implied_k, "credit": credit, "mean_target": float(d.mean())}
 
 
+def jump_budget_available(completed: int, limit: int) -> bool:
+    """Zero is unlimited; positive limits belong to explicit bounded tests."""
+    return limit == 0 or completed < limit
+
+
 def play(args) -> int:
-    global _LAST_STOP_REASON
+    global _LAST_STOP_REASON, _ROUND_STARTED_ACTIVE
+    _ROUND_STARTED_ACTIVE = None
     cfg = Config.load(
         Path(args.config),
         {
@@ -3922,7 +3981,7 @@ def play(args) -> int:
                          stop_reason="无法进入可玩状态")
             return 3
         log(f"开始运行：k={k:.3f} ms/px, gamma={cfg.gamma}, "
-            f"最大跳跃={cfg.max_jumps}, 输入={'后台' if background else '前台'}, "
+            f"最大跳跃={cfg.max_jumps or '不限'}, 输入={'后台' if background else '前台'}, "
             f"识别={'capture=' + args.capture}")
         status_write(state="playing", window={"hwnd": win.hwnd, "pid": win.pid,
                                               "title": win.title, "client": list(win.client_rect)})
@@ -3937,9 +3996,11 @@ def play(args) -> int:
 
         index = 0
         started = active_time()
+        _ROUND_STARTED_ACTIVE = started
+        status_write(state="playing", alive=True)
         last_progress_ts = active_time()
         next_stall_warn = last_progress_ts + 90.0
-        while index < cfg.max_jumps:
+        while jump_budget_available(index, cfg.max_jumps):
             try:
                 in_flight = False
                 restart_after_record = False
@@ -4426,7 +4487,7 @@ def play(args) -> int:
                 # Commit the completed jump before the interruptible restart.
                 # A pause here cancels only the new click, not its known death
                 # record; the catch handler sees in_flight=False.
-                if (restart_after_record and index < cfg.max_jumps and
+                if (restart_after_record and jump_budget_available(index, cfg.max_jumps) and
                         (_CONTROL is None or not _CONTROL.needs_resume)):
                     win = ensure_playing(cap, cfg, vision, ctrl, foreground, True, run_state)
                     if win is None:
@@ -4561,7 +4622,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--capture", choices=["screen", "printwindow"], default="screen")
     parser.add_argument("--background", action="store_true", help="后台 PostMessage 输入")
     parser.add_argument("--dry-run", action="store_true", help="只识别不发输入")
-    parser.add_argument("--max-jumps", type=int, default=None, help="最大跳跃次数")
+    parser.add_argument("--max-jumps", type=int, default=None,
+                        help="0 表示不限跳数（日常默认）；正整数仅用于有限次数测试")
     parser.add_argument("--k", type=float, default=None, help="按压系数 ms/px")
     parser.add_argument("--gamma", type=float, default=None, help="自适应增益")
     parser.add_argument("--no-adaptive", action="store_true", help="关闭自适应修正")

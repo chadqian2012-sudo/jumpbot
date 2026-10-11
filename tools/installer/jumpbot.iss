@@ -77,17 +77,17 @@ Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
-Name: "{group}\跳一跳自动脚本（长跑）"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; WorkingDir: "{app}"; Comment: "长跑模式：5000 跳上限，掉窗口自动等回来"
+Name: "{group}\跳一跳自动脚本（长跑）"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 0 --daemon"; WorkingDir: "{app}"; Comment: "不限跳数，掉窗口自动等回来；F8 停止"
 Name: "{group}\自检（不碰游戏）"; Filename: "{app}\jumpbot.exe"; Parameters: "--selftest"; WorkingDir: "{app}"; Comment: "检查依赖 / 模板 / GPU 后端，不发送任何输入"
-Name: "{group}\纯 CPU 模式"; Filename: "{app}\jumpbot.exe"; Parameters: "--backend simd --no-cuda --no-opencl --max-jumps 5000 --daemon"; WorkingDir: "{app}"
+Name: "{group}\纯 CPU 模式"; Filename: "{app}\jumpbot.exe"; Parameters: "--backend simd --no-cuda --no-opencl --max-jumps 0 --daemon"; WorkingDir: "{app}"
 Name: "{group}\只识别不发输入（安全演示）"; Filename: "{app}\jumpbot.exe"; Parameters: "--dry-run --samples 3"; WorkingDir: "{app}"
 Name: "{group}\配置文件夹"; Filename: "{app}"
 Name: "{group}\卸载 跳一跳自动脚本"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 0 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\jumpbot.exe"; Parameters: "--selftest"; Description: "运行自检（推荐，验证依赖与 GPU 后端）"; Flags: postinstall nowait skipifsilent
-Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 5000 --daemon"; Description: "立即启动长跑（请先在微信里打开「跳一跳」并保持窗口可见）"; Flags: postinstall nowait skipifsilent unchecked
+Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 0 --daemon"; Description: "立即启动长跑（请先在微信里打开「跳一跳」并保持窗口可见）"; Flags: postinstall nowait skipifsilent unchecked
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
