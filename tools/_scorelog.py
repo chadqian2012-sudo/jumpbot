@@ -22,32 +22,35 @@ BONUS_CAP = 32
 TAG_RE = re.compile(r"tb=(-?\d+),(-?\d+),(\d+),(\d+)\s+tw=(\d+)")
 
 
-def parse_csv(path: Path) -> list[dict]:
+def iter_csv(path: Path):
     """用 csv 模块解析（不要自己 split(",")）。
 
     踩过的坑：note 列里带 `tb=x,y,w,h tw=NN` 这类逗号，csv.writer 会给整个字段加引号；
     手写 split 会把引号里的逗号也当分隔符，note 被截断、后面列全部错位——
     实测 3979/3980 行受影响，表现是"明明有新日志，几何分类却全是（旧日志无几何信息）"。
     """
-    rows: list[dict] = []
     with Path(path).open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.reader(fh)
         try:
             header = next(reader)
         except StopIteration:
-            return rows
+            return
         for parts in reader:
             if not parts:
                 continue
             if len(parts) < len(header):
                 parts = parts + [""] * (len(header) - len(parts))
-            rows.append(dict(zip(header, parts)))
-    return rows
+            yield dict(zip(header, parts))
+
+
+def parse_csv(path: Path) -> list[dict]:
+    """Keep the historical list API; streaming consumers use iter_csv."""
+    return list(iter_csv(path))
 
 
 def iter_rows(paths):
     for path in paths:
-        for row in parse_csv(path):
+        for row in iter_csv(path):
             row["_file"] = Path(path).name
             yield row
 
