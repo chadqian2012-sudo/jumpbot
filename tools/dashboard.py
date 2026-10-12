@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _scorelog import as_int, iter_labels, parse_csv  # noqa: E402
+from _scorelog import as_int, iter_csv, iter_labels  # noqa: E402
 
 PROJECT_DIR = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False)
                else Path(__file__).resolve().parent.parent)
@@ -117,8 +117,17 @@ def enable_ansi() -> bool:
 
 
 def newest_csv() -> Path | None:
-    files = sorted(LOGS_DIR.glob("run_*.csv"), key=lambda p: p.stat().st_mtime)
-    return files[-1] if files else None
+    # One pass, same last-file tie rule as sorted(...)[-1]. Rotated/deleted
+    # logs must not crash a panel in CSV fallback mode.
+    newest, newest_mtime = None, -math.inf
+    for path in LOGS_DIR.glob("run_*.csv"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= newest_mtime:
+            newest, newest_mtime = path, mtime
+    return newest
 
 
 def lower_priority() -> None:
@@ -194,7 +203,7 @@ def stats_from_csv(path: Path) -> dict:
     key = (str(path), st.st_mtime if st else 0.0, st.st_size if st else 0)
     if _CSV_CACHE.get("key") == key and _CSV_CACHE.get("stats") is not None:
         return _CSV_CACHE["stats"]
-    rows = parse_csv(path)
+    rows = iter_csv(path)
     jumps = landed = deaths = 0
     hits = misses = unknown = 0
     streak = best_streak = 0
