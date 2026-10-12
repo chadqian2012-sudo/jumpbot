@@ -34,8 +34,52 @@ LOGS_DIR = PROJECT_DIR / "logs"
 DEFAULT_STATUS = PROJECT_DIR / "debug" / "status.json"
 
 # 进程扫描结果缓存（10 秒）与 CSV 解析缓存，见 bot_process / stats_from_csv
-_PID_CACHE: tuple[float, int | None, str] = (0.0, None, "")
+_PID_CACHE: tuple[float, int | None, str] = (-math.inf, None, "")
 _CSV_CACHE: dict = {"key": None, "stats": None}
+
+
+class StatusReader:
+    """Reuse unchanged JSON, not its age or the rendered clock.
+
+    Check identity/size/nanosecond timestamps every frame. Periodic reads also
+    cover filesystems with coarse metadata. Bind cached data to the open file,
+    so a producer's atomic replacement is noticed on the very next poll.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._key = None
+        self._data = None
+        self._read_at = -math.inf
+
+    @staticmethod
+    def _signature(stat):
+        # Windows 3.12 can expose different ctime values through stat/fstat
+        # after rename. Use the common identity/write fields, not ctime.
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def read(self) -> dict | None:
+        now = time.monotonic()
+        try:
+            key = self._signature(self.path.stat())
+            if key != self._key or not 0 <= now - self._read_at < 2.0:
+                with self.path.open(encoding="utf-8") as stream:
+                    before = self._signature(os.fstat(stream.fileno()))
+                    data = json.load(stream)
+                    after = self._signature(os.fstat(stream.fileno()))
+                if before != after or not isinstance(data, dict) or not data:
+                    raise ValueError("incomplete status snapshot")
+                self._key, self._data, self._read_at = after, data, now
+            age = time.time() - float(self._data.get("updated_at", 0))
+            # Pause/window waits still emit heartbeats. Re-evaluate freshness
+            # on cache hits too; a vanished producer must not look alive forever.
+            if math.isfinite(age) and age < 120.0:
+                return self._data
+        except (OSError, ValueError, TypeError, OverflowError):
+            # Never keep an older valid status after a failed/missing read.
+            # Retry failures next frame rather than caching partial JSON.
+            self._key = self._data = None
+        return None
 
 STATE_TEXT = {
     "starting": "启动中",
@@ -114,7 +158,7 @@ def bot_process() -> tuple[int | None, str]:
     global _PID_CACHE
     if os.name != "nt":
         return None, ""
-    now = time.time()
+    now = time.monotonic()
     ts, pid, cmd = _PID_CACHE
     if now - ts < 10.0:
         return pid, cmd
@@ -126,9 +170,7 @@ def bot_process() -> tuple[int | None, str]:
             capture_output=True, text=True, timeout=8,
             creationflags=0x08000000,  # CREATE_NO_WINDOW
         ).stdout.strip()
-        if not out:
-            return None, ""
-        data = json.loads(out)
+        data = json.loads(out) if out else []
         if isinstance(data, dict):
             data = [data]
         for item in data:
@@ -383,22 +425,13 @@ def main() -> int:
 
     ansi = (not args.no_color) and enable_ansi()
     status_path = Path(args.status)
+    status_reader = StatusReader(status_path)
     interval = max(args.interval, 0.2)
     lower_priority()
     try:
         while True:
             frame_start = time.monotonic()
-            status = None
-            if status_path.exists():
-                try:
-                    data = json.loads(status_path.read_text(encoding="utf-8"))
-                    age = time.time() - float(data.get("updated_at", 0))
-                    # 等待窗口时脚本只每 2 秒写一次心跳，这里放宽到 120 秒；
-                    # 真停止时 status 里 alive=False，会走下面的停止分支。
-                    if age < 120.0:
-                        status = data
-                except Exception:
-                    status = None
+            status = status_reader.read()
             csv_stats = None
             if status is None:
                 # The live status already contains the scoreboard. Unlimited
