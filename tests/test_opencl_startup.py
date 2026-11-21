@@ -16,7 +16,7 @@ class OpenCLStartupTests(unittest.TestCase):
         environment.pop('JUMPBOT_OPENCL_PROBE', None)
         environment.pop('JUMPBOT_DISABLE_OPENCL', None)
         result = SimpleNamespace(returncode=-1073741676, stdout='', stderr='')
-        with patch.dict(os.environ, environment, clear=True), \
+        with patch.object(J.os, 'environ', environment), \
                 patch.dict(J._OPENCL_ENUMERATION_CHECKS, {}, clear=True), \
                 patch.object(J.subprocess, 'run', return_value=result) as run:
             self.assertFalse(J.Vision(cfg)._init_opencl())
@@ -34,7 +34,7 @@ class OpenCLStartupTests(unittest.TestCase):
         environment = dict(os.environ)
         environment.pop('JUMPBOT_OPENCL_PROBE', None)
         environment.pop('JUMPBOT_DISABLE_OPENCL', None)
-        with patch.dict(os.environ, environment, clear=True), \
+        with patch.object(J.os, 'environ', environment), \
                 patch.dict(J._OPENCL_ENUMERATION_CHECKS, {}, clear=True), \
                 patch.object(J.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture', 20)):
             vision = J.Vision(cfg)

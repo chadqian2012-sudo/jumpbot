@@ -1,4 +1,5 @@
 """Exercise the standalone runner with a temporary text-replay EXE (no input APIs)."""
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -21,6 +22,10 @@ class Worker {
     static int Main(string[] args) {
         Console.OutputEncoding = new UTF8Encoding(false);
         var stdin = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false, true), false);
+        if (Environment.GetEnvironmentVariable("JUMPBOT_FIXTURE_HOLD") == "1") {
+            stdin.ReadLine();
+            return 0;
+        }
         File.AppendAllText("launches", "launch\n");
         var logs = args[Array.IndexOf(args, "--log-dir") + 1];
         Directory.CreateDirectory(logs);
@@ -168,6 +173,42 @@ class FrozenAcceptanceTests(unittest.TestCase):
         self.assertEqual(len(result['rounds']), 1)
         self.assertEqual(result['rounds'][0]['evidence']['return_code'], 7)
         self.assertEqual((self.app / 'launches').read_text().splitlines(), ['launch'])
+
+    def test_offline_jobs_can_coexist_but_possible_input_owners_block_launch(self):
+        python_mock = self.app / 'python.exe'
+        shutil.copyfile(self.fixture, python_mock)
+        with ExitStack() as processes:
+            def hold(executable, *args):
+                # This is always a private copy of the text fixture. EOF releases it.
+                child = processes.enter_context(subprocess.Popen(
+                    [str(executable), *args], cwd=self.app, stdin=subprocess.PIPE,
+                    env={**self.env, 'JUMPBOT_FIXTURE_HOLD': '1'}))
+                processes.callback(child.stdin.close)
+                return child.pid
+
+            hold(self.exe, '--config', 'config with spaces.json', '--backend', 'simd',
+                 '--bench-repeat', '3', '--image', 'frame 1.png', '--image', 'frame 2.png')
+            hold(self.exe, '--_opencl-check', 'list')
+            passed = self.replay([snapshot()])
+            self.assertEqual(passed.returncode, 0, passed.stderr + passed.stdout)
+
+            owners = [
+                hold(self.exe, '--worker', '--max-jumps', '0'),
+                hold(self.exe, '--probe', '--click-xy', '0.5,0.5'),
+                hold(self.exe, '--config', 'directory --image frame/config.json'),
+                hold(self.exe, '--_opencl-check', 'list', '--worker'),
+                hold(self.exe, '-m', 'jumpbot'),
+                hold(python_mock, 'jumpbot.py', '--probe', '--click-xy', '0.5,0.5'),
+            ]
+            dest = self.app / 'blocked'
+            blocked = self.replay([snapshot()], cmd=round_command(self.exe, dest, 100, 'simd'))
+            self.assertNotEqual(blocked.returncode, 0)
+            # PowerShell may wrap the displayed exception between PIDs.
+            error = b''.join(blocked.stderr.split())
+            for pid in owners:
+                self.assertIn(str(pid).encode(), error)
+            self.assertFalse(dest.exists())
+            self.assertEqual((self.app / 'launches').read_text().splitlines(), ['launch'])
 
     def test_preflight_and_legacy_cli(self):
         standalone = self.cmd.copy()

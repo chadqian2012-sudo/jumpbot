@@ -45,20 +45,25 @@ const running = (pid) => {
   try { process.kill(pid, 0); return true; }
   catch (error) { if (error.code === "ESRCH") return false; throw error; }
 };
-function checkProcessTree() {
+function guiDescendants() {
   // Limit the returned data to descendants of this GUI. Other users of Python on
   // the host are unrelated, and their command lines are not part of the test.
-  const tree = JSON.parse(ps(
+  return JSON.parse(ps(
     `$all=Get-CimInstance Win32_Process; $pids=@(${child.pid}); $seen=@(); ` +
     "while ($pids.Count) { $next=@($all | Where-Object { $_.ParentProcessId -in $pids -and $_.ProcessId -notin $seen }); " +
     "$pids=@($next | ForEach-Object ProcessId); $seen+=$pids }; " +
     "$tree=@($all | Where-Object { $_.ProcessId -in $seen } | Select-Object Name,ProcessId,ParentProcessId," +
     "ExecutablePath,@{Name='Worker';Expression={$_.CommandLine -match '(?:^|\\s)--worker(?:$|\\s)'}}); " +
     "ConvertTo-Json -InputObject $tree -Compress"));
+}
+function checkProcessTree() {
+  const tree = guiDescendants();
   for (const proc of tree) {
     assert(!/^(?:pythonw?[\d.]*|pypy[\d.]*|py)\.exe$/i.test(proc.Name), "Python process in GUI tree: " + proc.Name);
     if (!report.observedProcesses.includes(proc.Name)) report.observedProcesses.push(proc.Name);
   }
+  const browser = tree.find((proc) => /^msedgewebview2\.exe$/i.test(proc.Name));
+  if (browser?.ExecutablePath) report.webview2.executable = browser.ExecutablePath;
   return tree.filter((p) => p.ParentProcessId === child.pid && p.Worker);
 }
 async function closeWindow() {
@@ -123,15 +128,31 @@ try {
   const port = server.address().port;
   await new Promise((done) => server.close(done));
   env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=" + port;
-  child = spawn(gui, [], { cwd: app, env, windowsHide: true, stdio: "ignore" });
+  const endpoint = "http://127.0.0.1:" + port;
+  report.webview2 = { endpoint, targets: [] };
+  child = spawn(gui, [], { cwd: app, env, windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+  let spawnError;
+  child.once("error", (error) => { spawnError = error; });
+  child.stderr.setEncoding("utf8").on("data", (data) => {
+    report.webview2.stderr = ((report.webview2.stderr || "") + data).slice(-4096);
+  });
   let page;
   await waitFor(async () => {
-    assert.equal(child.exitCode, null, "Desktop exited before opening");
+    if (spawnError) throw spawnError;
+    assert(child.exitCode === null && child.signalCode === null,
+      "Desktop exited before WebView2 opened: " + (child.exitCode ?? child.signalCode));
     try {
-      const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+      const response = await fetch(endpoint + "/json/list", { signal: AbortSignal.timeout(1500) });
+      if (!response.ok) throw new Error("DevTools HTTP " + response.status);
+      const pages = await response.json();
+      report.webview2.targets = pages.map(({ type, url }) => ({ type, url }));
+      delete report.webview2.discoveryError;
       page = pages.find((item) => item.type === "page" && new URL(item.url).hostname === "jumpbot.localhost");
       return page;
-    } catch { return false; }
+    } catch (error) {
+      report.webview2.discoveryError = error.cause?.code || error.message;
+      return false;
+    }
   }, "packaged WebView2", 30000);
   socket = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise((done, reject) => { socket.onopen = done; socket.onerror = reject; });
@@ -191,6 +212,18 @@ try {
   pythonFreeEntries();
   console.log(JSON.stringify(report, null, 2));
 } catch (error) {
+  if (child) {
+    report.gui = { pid: child.pid, exitCode: child.exitCode, signal: child.signalCode };
+    if (child.pid) {
+      try {
+        report.gui.descendants = guiDescendants();
+        report.gui.window = ps("(Get-Process -Id " + child.pid +
+          " -ErrorAction SilentlyContinue) | Select-Object SessionId,MainWindowTitle,Responding | ConvertTo-Json -Compress");
+      } catch (diagnosticError) {
+        report.gui.inspectionError = diagnosticError.message;
+      }
+    }
+  }
   console.error(JSON.stringify(report, null, 2));
   throw error;
 } finally {

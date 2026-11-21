@@ -35,10 +35,43 @@ $exeHash = (Get-FileHash -LiteralPath $exeFile.FullName).Hash
 if ($exeHash -ne $build.files_sha256.'jumpbot.exe') { throw 'Worker executable hash mismatch.' }
 
 # Old Python/frozen versions do not acquire the native worker's single-instance lock.
+function Test-PossibleInputOwner($process) {
+    $line = $process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($line)) { return $true }
+    $native = $process.Name -eq 'jumpbot.exe'
+    if (!$native -and $line -notmatch '(?:jumpbot|live_acceptance)\.py\b|(?:^|\s)-m\s+(?:tools\.live_acceptance|jumpbot)\b') {
+        return $false
+    }
+
+    # Accept unquoted words or whole quoted arguments. Leave complex Windows escaping ambiguous.
+    $word = '(?:"[^"\r\n]*(?<!\\)"|[^\s"]+)'
+    if ($line -cnotmatch "\A$word(?:[ \t]+$word)*[ \t]*\z") { return $true }
+    $argv = @([regex]::Matches($line, $word) | ForEach-Object { $_.Value.Trim('"') })
+    $first = 1
+    if (!$native) {
+        if ($argv.Count -lt 2 -or [IO.Path]::GetFileName($argv[1]) -ine 'jumpbot.py') { return $true }
+        $first = 2
+    }
+    if ($argv[$first] -ceq '--_opencl-check') { return ($argv.Count -ne ($first + 2) -or !$argv[$first + 1] -or $argv[$first + 1].StartsWith('-')) }
+    if ($argv[$first] -ceq '--panel') { return $false }
+
+    # Only known offline options and their values. A filename containing '--image' is just a value.
+    $offline = $false
+    for ($i = $first; $i -lt $argv.Count; $i++) {
+        if ($argv[$i] -cin '--selftest','--harvest-score') { $offline = $true; continue }
+        if ($argv[$i] -cin '--no-cuda','--no-opencl','--worker') { continue }
+        $key, $value = $argv[$i] -csplit '=', 2
+        if ($key -cnotin '--image','--config','--backend','--bench-repeat','--out-dir','--opencl-device','--score-dir') {
+            return $true
+        }
+        if ($null -eq $value) { $i++; $value = $argv[$i] }
+        if (!$value -or $value.StartsWith('-')) { return $true }
+        if ($key -ceq '--image') { $offline = $true }
+    }
+    return !$offline
+}
 $owners = Get-CimInstance Win32_Process -Filter "Name='jumpbot.exe' OR Name='python.exe' OR Name='pythonw.exe'" |
-    Where-Object { ($_.Name -eq 'jumpbot.exe' -and $_.CommandLine -notmatch ' --panel| -m ') -or
-        ($_.Name -ne 'jumpbot.exe' -and $_.CommandLine -match 'jumpbot\.py|live_acceptance\.py' -and
-         $_.CommandLine -notmatch '--selftest|--dry-run|--image|--probe') }
+    Where-Object { Test-PossibleInputOwner $_ }
 if ($owners) { throw "Another JumpBot process may own input (PID $($owners.ProcessId -join ', '))." }
 
 $Out = (New-Item -ItemType Directory -Path $Out).FullName

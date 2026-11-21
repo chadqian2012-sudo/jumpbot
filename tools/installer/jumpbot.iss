@@ -57,13 +57,9 @@ Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
-Source: "{#PayloadDir}\*"; DestDir: "{app}"; \
-    Excludes: "\logs\*,\debug\*,\logs,\debug,\config.json,\templates\*"; \
-    Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PayloadDir}\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
-; Installed v1.3 kept user-harvested digit templates under _internal.
+; At install time, preserve digit templates harvested with v1.3.
 Source: "{app}\_internal\templates\*.png"; DestDir: "{app}\templates"; Flags: external skipifsourcedoesntexist onlyifdoesntexist uninsneveruninstall
-Source: "{#PayloadDir}\templates\*.png"; DestDir: "{app}\templates"; Flags: onlyifdoesntexist uninsneveruninstall
+#include PayloadFiles
 
 [Icons]
 Name: "{group}\跳一跳控制台"; Filename: "{app}\jumpbot-desktop.exe"; WorkingDir: "{app}"

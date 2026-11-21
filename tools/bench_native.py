@@ -1,4 +1,4 @@
-"""Offline full detection parity and CPU benchmark. Run from an x64 MSVC developer shell.
+"""Offline full detection parity and backend benchmark. Run from an x64 MSVC developer shell.
 
     python tools/bench_native.py --baseline-only
     python tools/bench_native.py --native desktop/target/release/jumpbot.exe
@@ -43,7 +43,6 @@ def reference_worker(src, config, repeat, images):
     import jumpbot as bot
 
     cfg = bot.Config.load(config)
-    cfg.masks_backend = "simd"
     cv2.setNumThreads(cfg.cv2_threads)
     cv2.ocl.setUseOpenCL(False)
     vision = bot.Vision(cfg)
@@ -91,7 +90,7 @@ def reference_sources(stage, rustc):
     return ref
 
 
-def samples_for(command, env, images, repeat, cwd):
+def samples_for(command, env, images, repeat, cwd, backend):
     proc = subprocess.run(command, env=env, cwd=cwd, capture_output=True,
                           encoding="utf-8", errors="replace", timeout=300)
     if proc.returncode:
@@ -103,7 +102,7 @@ def samples_for(command, env, images, repeat, cwd):
             continue
         row = json.loads(line)
         name = Path(row["image"]).name
-        if name in rows or name not in expected or row["backend"] != "simd":
+        if name in rows or name not in expected or ("cuda" if row["backend"] == "gpu" else row["backend"]) != backend:
             raise ValueError(f"Unexpected/duplicate image or backend: {name}, {row['backend']}")
         times = row["detect_us"]
         if len(times) != repeat or not all(type(t) in (float, int) and t > 0 and math.isfinite(t)
@@ -174,10 +173,12 @@ def benchmark(args, stage):
     images.append(corrected)
     config = stage / "config.json"
     settings = json.loads((ref / "config.json").read_text(encoding="utf-8"))
-    settings.update(cv2_threads=4, masks_backend="simd", cuda_enabled=False, opencl_enabled=False)
+    settings.update(cv2_threads=4, masks_backend=args.backend, cuda_enabled=args.backend == "cuda",
+                    opencl_enabled=args.backend == "opencl")
     config.write_text(json.dumps(settings), encoding="utf-8")
     base_env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("JUMPBOT_", "PYTHON"))}
-    base_env.update(JUMPBOT_NO_INPUT="1", JUMPBOT_DISABLE_CUDA="1", JUMPBOT_DISABLE_OPENCL="1",
+    base_env.update(JUMPBOT_NO_INPUT="1", JUMPBOT_DISABLE_CUDA=str(int(args.backend != "cuda")),
+                    JUMPBOT_DISABLE_OPENCL=str(int(args.backend != "opencl")),
                     PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
     engines = list(REFS)
     if args.native:
@@ -198,7 +199,7 @@ def benchmark(args, stage):
         for name in order:
             env = dict(base_env)
             if name == "native":
-                cmd = [args.native, "--config", config, "--backend", "simd", "--bench-repeat",
+                cmd = [args.native, "--config", config, "--backend", args.backend, "--bench-repeat",
                        str(args.repeat), *(arg for p in batch for arg in ("--image", p))]
                 cwd = args.native.parent
             else:
@@ -207,7 +208,7 @@ def benchmark(args, stage):
                        config, str(args.repeat), *batch]
                 if name == "8003412":
                     env["JUMPBOT_VISION_DLL"] = str(ref / "jumpbot_vision.dll")
-            for image, row in samples_for(cmd, env, batch, args.repeat, cwd).items():
+            for image, row in samples_for(cmd, env, batch, args.repeat, cwd, args.backend).items():
                 previous = report["rows"][name].get(image)
                 if previous is None:
                     report["rows"][name][image] = row
@@ -261,6 +262,8 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--baseline-only", action="store_true")
     mode.add_argument("--native", type=Path, help="Release jumpbot.exe with its runtime DLLs")
+    parser.add_argument("--backend", choices=("cpu", "simd", "cuda", "opencl"), default="simd",
+                        help="Compare this exact backend. An unexpected fallback fails the run.")
     parser.add_argument("--rustc", default="rustc")
     parser.add_argument("--repeat", type=int, default=5, help="Timed detections per frame and pass")
     parser.add_argument("--out", type=Path, help="Default: build/native-bench[-baseline].json")
