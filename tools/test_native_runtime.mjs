@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { cpSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
@@ -32,7 +32,14 @@ env.JUMPBOT_DISABLE_OPENCL = "1";
 env.WEBVIEW2_USER_DATA_FOLDER = join(stage, "webview");
 const report = { package: original, states: [], workers: [], observedProcesses: [] };
 const positive = "skin-gold-play.png", negative = "purple-horizontal-fall.png";
-let child, socket;
+const automation = fileURLToPath(new URL("./native_gui_control.ps1", import.meta.url));
+let child;
+function control(action, id, expected) {
+  return execFileSync(shell, ["-NoProfile", "-NonInteractive", "-MTA", "-ExecutionPolicy", "Bypass",
+    "-File", automation, "-ProcessId", String(child.pid), "-GuiPath", gui,
+    "-Action", action, "-Id", id, "-Expected", expected],
+    { encoding: "utf8", timeout: 35000, windowsHide: true }).trim();
+}
 const waitFor = async (check, label, ms = 15000) => {
   const end = Date.now() + ms;
   do {
@@ -123,73 +130,22 @@ try {
   config.window_wait_s = 120;
   writeFileSync(configPath, JSON.stringify(config));
 
-  const server = createServer();
-  await new Promise((done) => server.listen(0, "127.0.0.1", done));
-  const port = server.address().port;
-  await new Promise((done) => server.close(done));
-  env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=" + port;
-  const endpoint = "http://127.0.0.1:" + port;
-  report.webview2 = { endpoint, targets: [] };
+  report.webview2 = {};
   child = spawn(gui, [], { cwd: app, env, windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
-  let spawnError;
-  child.once("error", (error) => { spawnError = error; });
+  await once(child, "spawn");
   child.stderr.setEncoding("utf8").on("data", (data) => {
     report.webview2.stderr = ((report.webview2.stderr || "") + data).slice(-4096);
   });
-  let page;
-  await waitFor(async () => {
-    if (spawnError) throw spawnError;
-    assert(child.exitCode === null && child.signalCode === null,
-      "Desktop exited before WebView2 opened: " + (child.exitCode ?? child.signalCode));
-    try {
-      const response = await fetch(endpoint + "/json/list", { signal: AbortSignal.timeout(1500) });
-      if (!response.ok) throw new Error("DevTools HTTP " + response.status);
-      const pages = await response.json();
-      report.webview2.targets = pages.map(({ type, url }) => ({ type, url }));
-      delete report.webview2.discoveryError;
-      page = pages.find((item) => item.type === "page" && new URL(item.url).hostname === "jumpbot.localhost");
-      return page;
-    } catch (error) {
-      report.webview2.discoveryError = error.cause?.code || error.message;
-      return false;
-    }
-  }, "packaged WebView2", 30000);
-  socket = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((done, reject) => { socket.onopen = done; socket.onerror = reject; });
-  let sequence = 0;
-  const pending = new Map();
-  socket.onmessage = ({ data }) => {
-    const reply = JSON.parse(data);
-    pending.get(reply.id)?.(reply);
-  };
-  async function evaluate(expression) {
-    const id = ++sequence;
-    let timer;
-    try {
-      const reply = await new Promise((done, reject) => {
-        timer = setTimeout(() => reject(new Error("WebView evaluation timed out")), 5000);
-        pending.set(id, done);
-        socket.send(JSON.stringify({ id, method: "Runtime.evaluate", params: { expression, returnByValue: true } }));
-      });
-      assert(!reply.error && !reply.result?.exceptionDetails, JSON.stringify(reply));
-      return reply.result.result.value;
-    } finally { clearTimeout(timer); pending.delete(id); }
-  }
-  async function click(id) {
-    assert(await evaluate(`(() => {const el=document.getElementById('${id}'); if(!el || el.disabled) return false; el.click(); return true})()`), id);
-  }
-  async function state(key) {
-    await waitFor(() => evaluate(`lastPhase === ${JSON.stringify(key)}`), key);
-    const visible = await evaluate("document.getElementById('phase').textContent");
-    assert(visible, "Visible phase label");
+  function state(key, expected) {
+    const visible = control("Phase", "phase", expected);
+    assert.equal(visible, expected);
     report.states.push({ state: key, label: visible });
     return checkProcessTree();
   }
-  await waitFor(() => evaluate("Boolean(document.querySelector('#primary:enabled'))"), "start button");
-  await evaluate("document.querySelector('#backend').value='simd'");
+  control("SelectBackend", "backend", "CPU SIMD");
   for (const operation of ["stop", "close"]) {
-    await click("primary");
-    const active = await state("waiting_window");
+    control("Invoke", "primary", "启动脚本");
+    const active = state("waiting_window", "等待游戏窗口");
     assert.equal(active.length, 1, "Expected exactly one native worker");
     const worker = active[0];
     report.workers.push(worker);
@@ -198,12 +154,13 @@ try {
       const modules = JSON.parse(ps(`$m=@((Get-Process -Id ${worker.ProcessId}).Modules | ForEach-Object FileName); ConvertTo-Json -InputObject $m -Compress`));
       assert(modules.length && !modules.some((path) => /(?:python|pypy)[0-9.]*\.dll$/i.test(basename(path))), "Unexpected Python in worker");
       assert(modules.some((path) => dirname(path).toLowerCase() === app.toLowerCase() && /^opencv_world\d+\.dll$/i.test(basename(path))), "Worker did not load the packaged OpenCV DLL");
-      await click("primary"); await state("paused");
-      await click("primary"); await state("waiting_window");
-      await click("stop"); await state("stopped");
-      await waitFor(() => evaluate("Boolean(document.querySelector('#primary:enabled'))"), "stopped UI");
+      control("Invoke", "primary", "暂停运行");
+      assert.equal(state("paused", "已暂停")[0]?.ProcessId, worker.ProcessId);
+      control("Invoke", "primary", "恢复运行");
+      assert.equal(state("waiting_window", "等待游戏窗口")[0]?.ProcessId, worker.ProcessId);
+      control("Invoke", "stop", "停止");
+      state("stopped", "已停止");
     } else {
-      socket.close();
       await closeWindow();
       report.states.push("已关闭");
     }
@@ -227,7 +184,6 @@ try {
   console.error(JSON.stringify(report, null, 2));
   throw error;
 } finally {
-  socket?.close();
   if (child?.pid && child.exitCode === null) {
     try { await closeWindow(); } catch { child.kill(); }
   }
