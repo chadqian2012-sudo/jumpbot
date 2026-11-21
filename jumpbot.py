@@ -59,6 +59,7 @@ TEMPLATE_DIR = DATA_DIR / "templates"
 LOG_DIR = PROJECT_DIR / "logs"
 DEBUG_DIR = PROJECT_DIR / "debug"
 STATUS_PATH = DEBUG_DIR / "status.json"
+_DESKTOP_PIPE = os.environ.get("JUMPBOT_DESKTOP_PIPE") == "1"
 
 VK_F8 = 0x77
 _CONTROL: RunControl | None = None
@@ -88,7 +89,7 @@ def status_write(**fields) -> None:
         if fields.get("state") != "stopped" and not _CONTROL.stopped:
             if _CONTROL.pause_requested:
                 fields["state"] = "paused" if _CONTROL.paused_at is not None else "pausing"
-            elif _CONTROL.needs_resume:
+            elif _CONTROL.needs_resume and fields.get("state") != "waiting_window":
                 fields["state"] = "resuming"
     _STATUS.update(fields)
     _STATUS["updated_at"] = time.time()
@@ -102,6 +103,10 @@ def status_write(**fields) -> None:
         and _STATUS.get("alive", True) is not False
         and (_CONTROL is None or (not _CONTROL.stopped and _CONTROL.paused_at is None)))
     try:
+        if _DESKTOP_PIPE:
+            sys.stdout.write("@jumpbot " + json.dumps(_STATUS, ensure_ascii=False, allow_nan=False) + "\n")
+            sys.stdout.flush()
+            return
         STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATUS_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(_STATUS, ensure_ascii=False), encoding="utf-8")
@@ -601,6 +606,20 @@ def _mss_factory():
     return getattr(mss_module, "MSS", None) or mss_module.mss
 
 
+def _load_edge_medians():
+    path = os.environ.get("JUMPBOT_VISION_DLL")
+    if not path:
+        return None
+    kernel = ctypes.CDLL(path).jumpbot_edge_medians
+    kernel.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                       ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    kernel.restype = None
+    return kernel
+
+
+_EDGE_MEDIANS = _load_edge_medians()
+
+
 def estimate_background_rows(frame: np.ndarray, band_ratio: float = 0.03) -> np.ndarray:
     """逐行估计背景颜色（背景是平滑渐变，两侧边缘通常就是背景）。
 
@@ -609,8 +628,15 @@ def estimate_background_rows(frame: np.ndarray, band_ratio: float = 0.03) -> np.
     """
     h, w = frame.shape[:2]
     band = max(3, int(round(band_ratio * w)))
-    left = np.median(frame[:, :band, :].astype(np.float32), axis=1)
-    right = np.median(frame[:, w - band:, :].astype(np.float32), axis=1)
+    if (_EDGE_MEDIANS is not None and frame.dtype == np.uint8 and
+            frame.shape == (h, w, 3) and frame.flags.c_contiguous and h and 0 < band <= w):
+        left = np.empty((h, 3), np.float32)
+        right = np.empty_like(left)
+        _EDGE_MEDIANS(frame.ctypes.data, h, w, band, w - band,
+                      left.ctypes.data, right.ctypes.data)
+    else:
+        left = np.median(frame[:, :band, :].astype(np.float32), axis=1)
+        right = np.median(frame[:, w - band:, :].astype(np.float32), axis=1)
     agree = np.abs(left - right).sum(axis=1) < 36
     estimate = 0.5 * (left + right)
     ys = np.arange(h, dtype=np.float32)
@@ -3026,11 +3052,29 @@ def _console_key_watcher() -> None:
 def start_console_watcher() -> None:
     """启动控制台按键监听（daemon 线程，进程退出即消失）。"""
     try:
-        thread = threading.Thread(target=_console_key_watcher,
+        thread = threading.Thread(target=_desktop_command_watcher if _DESKTOP_PIPE else _console_key_watcher,
                                   name="console-stop-key", daemon=True)
         thread.start()
     except Exception as exc:
         log(f"控制台按键监听未启动（不影响 F8）：{exc}")
+        if _DESKTOP_PIPE and _CONTROL is not None:
+            _CONTROL.stop("桌面控制通道未启动")
+
+
+def _desktop_command_watcher() -> None:
+    control = _CONTROL
+    try:
+        for line in sys.stdin:
+            command = line.rstrip("\r\n")
+            with control.lock:
+                if control.stopped or command == "stop":
+                    break
+                if (command in ("pause", "resume") and
+                        (command == "pause" or control.hotkey_registered) and
+                        control.pause_requested != (command == "pause")):
+                    control.toggle("desktop")
+    finally:
+        control.stop("用户停止（桌面控制台）")
 
 
 def control_check(generation=None) -> None:
@@ -3858,6 +3902,7 @@ def play(args) -> int:
         deaths=0, hits=0, misses=0, unknown=0, streak=0, best_streak=0,
         score=None, best_life_score=0, k=round(k, 4),
         csv="", config=str(args.config), daemon=bool(args.daemon),
+        background_kernel="rust" if _EDGE_MEDIANS is not None else "numpy",
     )
 
     log_dir = Path(args.log_dir) if args.log_dir else LOG_DIR

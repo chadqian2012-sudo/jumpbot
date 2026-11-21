@@ -1,0 +1,119 @@
+@font-face {
+  font-family: Saira;
+  src: url("Saira.ttf") format("truetype");
+  font-weight: 100 900;
+  font-stretch: 50% 125%;
+  font-display: swap;
+}
+
+:root {
+  --ef-font-ui: Saira, "Microsoft YaHei UI", sans-serif;
+  --ef-font-text: "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+  --pad: clamp(16px, 3.2vw, 46px);
+}
+
+body.ef { min-width: 0; margin: 0; }
+[hidden] { display: none !important; }
+.ef-cmdbar { min-height: 56px; align-items: center; padding-inline: var(--pad); gap: clamp(12px, 3vw, 42px); }
+.ef-cmdbar .brand { font-weight: 800; font-stretch: 125%; letter-spacing: .12em; }
+.ef-cmdbar .seal { background: var(--ef-signal); color: #161616; }
+.current { color: #161616; background: var(--ef-signal); padding: 7px 13px; font-weight: 750; }
+.theme {
+  margin-left: auto; min-height: 44px; padding: 0 18px; border: 0;
+  color: #eee; background: #303030; clip-path: polygon(0 0, 100% 0, 100% 78%, 92% 100%, 0 100%);
+  cursor: pointer;
+}
+.theme:hover, .theme:focus-visible { color: #161616; background: var(--ef-signal); }
+.theme:focus-visible { outline-offset: -5px; }
+
+main { max-width: 1540px; margin: 0 auto; padding: 21px var(--pad) 20px; }
+.mast { display: flex; justify-content: space-between; align-items: end; gap: 14px; border-bottom: 1px solid var(--ef-ink); padding-bottom: 14px; }
+.mast h1 { margin: 3px 0 0; font: 800 clamp(27px, 3.4vw, 44px)/1.14 var(--ef-font-text); letter-spacing: -.025em; }
+.mast p { margin: 0; }
+.mast-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--ef-ink-2); font-size: 12px; }
+.mast-meta span:first-child { font-family: var(--ef-font-ui); text-transform: uppercase; letter-spacing: .12em; }
+.mast-meta span + span { border-left: 1px solid var(--ef-rule); padding-left: 16px; }
+#notice { margin: 14px 0 0; }
+
+.overview, .work { display: grid; grid-template-columns: minmax(0, 1.68fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+.flight, .readouts, .controls, .activity { position: relative; min-width: 0; padding: 18px 20px 16px; background: var(--ef-panel); border-top: 1px solid var(--ef-rule); }
+.flight::before, .readouts::before, .controls::before, .activity::before {
+  content: ""; position: absolute; top: -1px; left: 0; width: 68px; height: 4px; background: var(--ef-ink);
+}
+.flight { --i: 0; overflow: hidden; }
+.readouts { --i: 1; display: flex; flex-direction: column; }
+.controls { --i: 2; }
+.activity { --i: 3; }
+main .ef-pair { font-size: 20px; line-height: 1.24; margin: 0; }
+main .ef-pair .ef-eyebrow { margin-bottom: 4px; }
+.flight-copy { position: relative; z-index: 1; display: grid; grid-template-columns: 1fr auto; align-items: start; gap: 7px; }
+.flight-copy #phase { font-size: 15px; font-weight: 750; }
+#phase-note { color: var(--ef-ink-2); margin: 7px 0 0; font-size: 13px; }
+.diagram { width: 100%; display: block; height: clamp(165px, 21vw, 270px); margin: -7px 0 0; color: var(--ef-ink); }
+.frame-edge, .base-line, .arc-guide, .arc-sweep, .landing-mark { fill: none; stroke: currentColor; }
+.frame-edge { stroke-width: 2; opacity: .55; }
+.base-line { opacity: .17; }
+.platform { stroke: currentColor; stroke-width: 1.6; fill: var(--ef-paper); }
+.target { fill: var(--ef-chip); }
+.receiver { fill: var(--ef-panel); }
+.arc-guide { stroke-dasharray: .027 .015; stroke-width: 1.8; opacity: .55; }
+.arc-sweep { stroke-width: 3.3; stroke-dasharray: 1; stroke-dashoffset: 1; }
+.pawn { fill: currentColor; }
+.landing-mark { opacity: 0; stroke-width: 1; }
+.flight-foot { border-top: 1px solid var(--ef-rule); padding-top: 9px; display: flex; justify-content: space-between; align-items: center; gap: 8px; color: var(--ef-ink-2); font-size: 11px; }
+#countdown { font: 700 13px/1 var(--ef-font-ui); font-variant-numeric: tabular-nums; }
+
+.score { flex: 1; min-height: 112px; display: flex; flex-direction: column; justify-content: center; margin-top: 7px; }
+.score span, .metrics dt, .backend span { color: var(--ef-ink-2); font-size: 12px; }
+.score strong { display: block; font: 800 clamp(48px, 6.6vw, 96px)/.99 var(--ef-font-ui); font-stretch: 125%; letter-spacing: -.04em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.metrics { margin: 4px 0 6px; }
+.metrics div { min-height: 35px; border-top: 1px solid var(--ef-rule); display: flex; align-items: center; justify-content: space-between; }
+.metrics dd { margin: 0; font: 750 19px/1 var(--ef-font-ui); font-stretch: 112%; font-variant-numeric: tabular-nums; }
+.backend { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; border-top: 1px solid var(--ef-ink); padding-top: 8px; font-size: 12px; }
+.backend b { font-family: var(--ef-font-ui); font-stretch: 112%; margin-right: 8px; }
+
+.settings { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin: 13px 0 10px; font-size: 13px; }
+select {
+  color: var(--ef-ink); background: var(--ef-panel); border: 1px solid var(--ef-rule);
+  border-radius: 0; min-height: 44px; padding: 0 10px; font: inherit;
+}
+.repeat { display: flex; align-items: center; gap: 7px; min-height: 44px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions .go { flex: 1; min-width: 120px; }
+.empty { margin: 14px 0 0; padding: 8px 0; font-size: 13px; color: var(--ef-ink-2); border-top: 1px solid var(--ef-rule); }
+.ledger { list-style: none; max-height: 150px; margin: 13px 0 0; padding: 0; overflow: auto; scrollbar-color: var(--ef-rule) transparent; }
+.ledger li { padding: 6px 7px 6px 0; border-top: 1px solid var(--ef-rule); line-height: 1.45; font-size: 12px; overflow-wrap: anywhere; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .diagram .platform { animation: slide-in 460ms var(--ef-snap) both; }
+  .diagram .target { animation-delay: 100ms; }
+  .diagram .arc-guide { animation: raise 400ms 200ms var(--ef-snap) both; }
+  .flight.is-jumping .arc-sweep { animation: trace-flight 360ms var(--ef-mech) both; }
+  .flight.is-jumping .pawn { animation: launch 360ms var(--ef-snap) both; }
+  .flight.is-jumping .landing-mark { animation: land 250ms 150ms var(--ef-snap) both; }
+  .flight.is-jumping .receiver { animation: target-active 320ms 80ms var(--ef-mech) both; }
+  #phase.changed, #notice.changed { animation: shutter 280ms var(--ef-mech) both; }
+  .ledger li:last-child { animation: row-appear 200ms var(--ef-snap) both; }
+  .score strong.changed { animation: shutter 220ms var(--ef-mech) both; }
+  @keyframes slide-in { from { transform: translateY(42px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+  @keyframes raise { from { opacity: 0; transform: translateY(14px); } to { opacity: .55; transform: none; } }
+  @keyframes trace-flight { 65% { stroke-dashoffset: 0; opacity: 1; } to { stroke-dashoffset: 0; opacity: 0; } }
+  @keyframes launch { 45% { transform: translate(145px, -89px); } 84% { transform: translate(317px, -54px); opacity: 1; } to { transform: translate(317px, -54px); opacity: 0; } }
+  @keyframes land { 60% { opacity: 1; } to { opacity: 0; } }
+  @keyframes target-active { 25%, 75% { fill: var(--ef-signal); } }
+  @keyframes shutter { from { clip-path: polygon(0 0, 0 0, 0 100%, 0 100%); } to { clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%); } }
+  @keyframes row-appear { from { opacity: 0; transform: translateX(-7px); } to { opacity: 1; transform: none; } }
+}
+
+@media (max-width: 760px) {
+  .overview, .work { grid-template-columns: 1fr; }
+  .mast { flex-wrap: wrap; }
+  .diagram { height: 205px; }
+}
+@media (max-width: 450px) {
+  .mast-meta span + span { padding-left: 8px; }
+  .ef-cmdbar .brand { gap: 6px; font-size: 12px; }
+  .current, .theme { font-size: 11px; }
+  .theme { padding-inline: 10px; }
+  .flight, .readouts, .controls, .activity { padding-inline: 12px; }
+}

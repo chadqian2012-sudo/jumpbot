@@ -7,6 +7,7 @@ from unittest.mock import patch
 import warnings
 
 import numpy as np
+import jumpbot as J
 import skin_vision as S
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,20 @@ def legacy_waist(rows):
 
 
 class OptimizationTests(unittest.TestCase):
+    @unittest.skipUnless(J._EDGE_MEDIANS is not None, "requires the Rust DLL")
+    def test_native_background_edges_match_numpy(self):
+        rng = np.random.default_rng(861)
+        for width in (3, 500, 553, 601):
+            frame = rng.integers(0, 256, (64, width, 3), dtype=np.uint8)
+            frame[:28, :20] = frame[:28, -20:] = (110, 120, 130)
+            for pixels in (frame, frame[:, ::-1]):
+                with self.subTest(width=width, contiguous=pixels.flags.c_contiguous):
+                    before = pixels.copy()
+                    with patch.object(J, "_EDGE_MEDIANS", None):
+                        expected = J.estimate_background_rows(pixels)
+                    np.testing.assert_array_equal(J.estimate_background_rows(pixels), expected)
+                    np.testing.assert_array_equal(pixels, before)
+
     def test_vectorized_waist_is_exact_and_does_not_change_rows(self):
         rng = np.random.default_rng(20261011)
         with warnings.catch_warnings():

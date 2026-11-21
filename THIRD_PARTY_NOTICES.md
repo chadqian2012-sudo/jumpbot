@@ -21,3 +21,10 @@ under `_internal/` in their original distribution directories.
 
 These notices do not replace the vendor terms. The portable build omits the
 CuPy/CUDA libraries; OpenCL uses the device driver's runtime.
+
+## 桌面控制台
+
+桌面界面随附 Saira 字体，依据 SIL Open Font License 1.1 分发，许可证见
+[`desktop/ui/Saira-OFL.txt`](desktop/ui/Saira-OFL.txt)。
+桌面窗口依赖 Tao、Wry 和系统 WebView2 Runtime。Rust 第三方依赖版本见
+[`desktop/Cargo.lock`](desktop/Cargo.lock)。

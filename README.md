@@ -3,6 +3,29 @@
 在 Windows 上截取微信小游戏「跳一跳」窗口画面，用 OpenCV 识别棋子与目标方块，
 模拟鼠标按住蓄力完成自动跳跃。当前配置按压系数固定为 k=2.61，在线自适应关闭。
 
+## Windows 桌面控制台
+
+琥珀高亮、暖白底、宽切角、细网格。支持深色模式和系统的「减少动态效果」。
+中央示意图随真实按压和落点检查更新，右侧显示本轮分数、跳数和命中率。
+窗口可启动、暂停、恢复、停止、切换识别后端和运行无输入自检。
+
+需要 Windows x64、WebView2 Runtime、Rust 的 MSVC 工具链和项目的 Python 依赖。
+准备好已安装 `requirements.txt` 的 `.venv` 后，在项目目录运行：
+
+```powershell
+cargo build --manifest-path desktop/Cargo.toml --workspace --release --locked
+.\desktop\target\release\jumpbot-desktop.exe
+```
+
+窗口会从项目目录及其上级查找 `.venv\Scripts\python.exe`。
+也可把环境变量 `JUMPBOT_PYTHON` 设置为现有 Python 的绝对路径。
+EXE 和旁边的 `jumpbot_vision.dll` 应保留在项目目录内。
+
+桌面版用 Rust 管理运行进程、接收状态，并计算背景边带的颜色中位数。
+Python 继续处理游戏截图、识别判定、暂停热键和鼠标操作，保留已有加速后端。
+启动后等待用户打开小游戏。暂停后等窗口显示「已暂停」再切换应用，停止键仍是 F8。
+关闭窗口会请求脚本释放鼠标并退出。
+
 ## 日志流式读取与面板缓存优化（v1.3）
 
 - 将 CSV 逐行解析提取成同一份 `iter_csv`，面板统计及多日志遍历不再先构建完整

@@ -5,6 +5,7 @@ dist-portable/
 dist-accelerated/
 dist-bugfix-*/
 build/
+/desktop/target/
 /release/
 /installer/
 /installer-cuda/
