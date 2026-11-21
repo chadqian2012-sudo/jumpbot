@@ -1,23 +1,12 @@
-use std::slice;
-
-/// Compute BGR medians for both edge bands of each row.
-///
-/// # Safety
-/// The caller supplies an initialized packed BGR buffer of height * width * 3
-/// bytes and two writable, disjoint output buffers of height * 3 floats.
-#[no_mangle]
-pub unsafe extern "C" fn jumpbot_edge_medians(
-    pixels: *const u8,
-    height: usize,
+/// Compute the BGR median on each side of every row.
+pub fn edge_medians(
+    frame: &[u8],
     width: usize,
     left_width: usize,
     right_start: usize,
-    left: *mut f32,
-    right: *mut f32,
+    left: &mut [f32],
+    right: &mut [f32],
 ) {
-    let frame = unsafe { slice::from_raw_parts(pixels, height * width * 3) };
-    let left = unsafe { slice::from_raw_parts_mut(left, height * 3) };
-    let right = unsafe { slice::from_raw_parts_mut(right, height * 3) };
     let mut channel = Vec::with_capacity(left_width.max(width - right_start));
     for (y, row) in frame.chunks_exact(width * 3).enumerate() {
         for (band, output) in [
@@ -40,13 +29,9 @@ pub unsafe extern "C" fn jumpbot_edge_medians(
     }
 }
 
-/// Return the lowest fitting edge vertex, or -1 when no edge fits.
-///
-/// # Safety
-/// The mask must contain (limit + 1) * width readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn jumpbot_fit_vertex(
-    mask: *const u8,
+/// Return the lowest fitting vertex, or -1 when neither edge fits.
+pub fn fit_vertex(
+    mask: &[u8],
     width: usize,
     top: usize,
     limit: usize,
@@ -54,7 +39,6 @@ pub unsafe extern "C" fn jumpbot_fit_vertex(
     dx_per_dy: f64,
     tolerance: f64,
 ) -> isize {
-    let mask = unsafe { slice::from_raw_parts(mask, (limit + 1) * width) };
     let start = (corner_x - 2.0).ceil() as usize;
     let end = ((corner_x + 2.0).floor() as usize).min(width - 1);
     let mut last_edge = None;

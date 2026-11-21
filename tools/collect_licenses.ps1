@@ -1,48 +1,41 @@
 param(
     [Parameter(Mandatory=$true)][string]$AppDir,
-    [string]$Python = 'D:\Codex Workspace\.venv\Scripts\python.exe',
-    [switch]$Full
+    [string]$Root = (Split-Path $PSScriptRoot -Parent),
+    [switch]$NoGpu
 )
 $ErrorActionPreference = 'Stop'
-$licenseAppDir = (Resolve-Path -LiteralPath $AppDir).Path
-$licenseOutputDir = Join-Path $licenseAppDir 'licenses'
-New-Item -ItemType Directory -Force -Path $licenseOutputDir | Out-Null
-$licenseMetadataCode = @'
-import importlib.metadata as m
-import json, re, sys
-from pathlib import Path
-names = ['numpy', 'opencv-python', 'opencv-python-headless', 'mss', 'pyopencl', 'pytools', 'PyInstaller']
-if sys.argv[1] == 'full':
-    names += ['cupy-cuda12x', 'cuda-pathfinder', 'nvidia-cuda-runtime-cu12', 'nvidia-cuda-nvrtc-cu12', 'nvidia-nvjitlink-cu12']
-result = []
-for name in names:
-    try:
-        d = m.distribution(name)
-    except m.PackageNotFoundError:
-        continue
-    for f in d.files or []:
-        text = str(f).replace('\\', '/')
-        if '.dist-info/' not in text:
-            continue
-        if '/licenses/' not in text and not re.search(r'/(license|copying|notice|eula)(\.[^/]*)?$', text, re.I):
-            continue
-        relative = text.split('/licenses/', 1)[-1] if '/licenses/' in text else f.name
-        result.append(dict(source=str(d.locate_file(f)), relative=name + '/' + relative))
-python_license = Path(sys.base_prefix) / 'LICENSE.txt'
-if python_license.exists():
-    result.append(dict(source=str(python_license), relative='Python/LICENSE.txt'))
-print(json.dumps(result))
-'@
-$licenseFlavor = if($Full) { 'full' } else { 'portable' }
-$licenseJson = & $Python -c $licenseMetadataCode $licenseFlavor
-if($LASTEXITCODE -ne 0) { throw 'license inventory failed' }
-$licenseInventory = $licenseJson | ConvertFrom-Json
-foreach($licenseEntry in $licenseInventory) {
-    $licenseDestination = [System.IO.Path]::GetFullPath((Join-Path $licenseOutputDir $licenseEntry.relative))
-    if(-not $licenseDestination.StartsWith($licenseOutputDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw 'license path escaped the app license directory'
+$dest = Join-Path $AppDir 'licenses'
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+$features = @()
+if ($NoGpu) { $features += '--no-default-features' }
+$graph = & cargo metadata --manifest-path (Join-Path $Root 'desktop\Cargo.toml') --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc @features
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read the locked Cargo dependency graph.' }
+$metadata = $graph | ConvertFrom-Json
+$index = foreach ($pkg in ($metadata.packages | Where-Object source | Sort-Object name, version)) {
+    $crateDir = Split-Path $pkg.manifest_path
+    $texts = @(Get-ChildItem -LiteralPath $crateDir -File | Where-Object Name -Match '^(LICENSE|LICENCE|COPYING|NOTICE|UNLICENSE|COPYRIGHT)([._-]|$)')
+    if ($pkg.license_file) { $texts += Get-Item -LiteralPath (Join-Path $crateDir $pkg.license_file) }
+    $subdir = Join-Path $dest "$($pkg.name)-$($pkg.version)"
+    foreach ($file in ($texts | Sort-Object FullName -Unique)) {
+        New-Item -ItemType Directory -Path $subdir -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $subdir -Force
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path $licenseDestination -Parent) | Out-Null
-    Copy-Item -LiteralPath $licenseEntry.source -Destination $licenseDestination -Force
+    $nested = Join-Path $crateDir 'licenses'
+    if (Test-Path -LiteralPath $nested -PathType Container) {
+        New-Item -ItemType Directory -Path $subdir -Force | Out-Null
+        Copy-Item -LiteralPath $nested -Destination $subdir -Recurse
+    }
+    "$($pkg.name) $($pkg.version) | $($pkg.license) | $($pkg.repository)"
 }
-Write-Host "copied $($licenseInventory.Count) runtime license files to $licenseOutputDir"
+[IO.File]::WriteAllLines((Join-Path $dest 'cargo-dependencies.txt'), [string[]]$index)
+$sysroot = & rustc --print sysroot
+if ($LASTEXITCODE -ne 0) { throw 'Cannot locate the Rust standard library notices.' }
+$doc = Join-Path $sysroot 'share\doc\rust'
+$copyright = @('COPYRIGHT-library.html','COPYRIGHT.html') | ForEach-Object { Join-Path $doc $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (!$copyright) { throw "Missing Rust toolchain copyright notices: $doc" }
+Copy-Item -LiteralPath $copyright -Destination (Join-Path $dest 'rust-standard-library.html')
+Copy-Item -LiteralPath (Join-Path $Root 'desktop\ui\Saira-OFL.txt') -Destination $dest
+$sdk = if ($env:JUMPBOT_OPENCV_DIR) { $env:JUMPBOT_OPENCV_DIR } else { Join-Path $Root 'build\cv-sdk' }
+$cvLicenses = Join-Path $sdk 'etc\licenses'
+if (!(Test-Path -LiteralPath $cvLicenses -PathType Container)) { throw "Missing OpenCV SDK notices: $cvLicenses" }
+Copy-Item -LiteralPath $cvLicenses -Destination (Join-Path $dest 'OpenCV') -Recurse

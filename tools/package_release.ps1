@@ -1,96 +1,88 @@
 param(
-    [string]$Root = 'D:\Codex Workspace\jumpbot',
-    [ValidatePattern('^\d+\.\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$')][string]$Version = '1.2',
-    [string]$OutputDir = '',
-    [switch]$PrepareOnly
+    [string]$Root = (Split-Path $PSScriptRoot -Parent),
+    [Parameter(Mandatory=$true)][ValidatePattern('^\d+\.\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$')][string]$Version,
+    [string]$OutputDir,
+    [string]$BuildRoot,
+    [switch]$PrepareOnly,
+    [switch]$Candidate
 )
 $ErrorActionPreference = 'Stop'
-# A PowerShell 7 parent can put incompatible modules ahead of Windows PS 5.1.
-Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility') -ErrorAction Stop
-$packageRoot = (Resolve-Path -LiteralPath $Root).Path
-$packageOutput = if($OutputDir) { [System.IO.Path]::GetFullPath($OutputDir) } else { Join-Path $packageRoot "release\$Version" }
-New-Item -ItemType Directory -Force -Path $packageOutput | Out-Null
-$packageCommit = (git -C $packageRoot rev-parse HEAD).Trim()
-if($packageCommit -notmatch '^[0-9a-f]{40}$') { throw 'source commit unavailable' }
-git -C $packageRoot diff --quiet HEAD
-if($LASTEXITCODE -ne 0) { throw 'commit tracked source before sealing delivery' }
-if(-not $PrepareOnly) {
-    foreach($packageFlavor in @('full','portable')) {
-        $packageInstaller = if($packageFlavor -eq 'full') { 'installer-accelerated' } else { 'installer-portable' }
-        $packageSetupName = "jumpbot-setup-$Version-$packageFlavor.exe"
-        if(-not (Test-Path -LiteralPath (Join-Path $packageRoot "$packageInstaller\$packageSetupName"))) { throw "missing installer: $packageSetupName" }
-        foreach($packageName in @("jumpbot-win64-v$Version-$packageFlavor.zip",$packageSetupName)) {
-            if(Test-Path -LiteralPath (Join-Path $packageOutput $packageName)) { throw "will not overwrite existing delivery: $packageName" }
-        }
-    }
-    if(-not (Test-Path -LiteralPath (Join-Path $packageRoot "TEST_SUMMARY_v$Version.md"))) { throw 'missing test summary' }
-    foreach($packageName in @('TEST_SUMMARY.md','SHA256SUMS.txt')) {
-        if(Test-Path -LiteralPath (Join-Path $packageOutput $packageName)) { throw "will not overwrite existing delivery: $packageName" }
-    }
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility')
+$Root = (Get-Item -LiteralPath $Root).FullName
+if (!$BuildRoot) { $BuildRoot = $Root }
+if ($Candidate -and !$OutputDir) { throw 'Choose a separate -OutputDir for candidate packages.' }
+if (!$OutputDir) { $OutputDir = Join-Path $Root "release\$Version" }
+$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$commit = git -C $Root rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the source revision.' }
+if (!$Candidate) {
+    $changes = git -C $Root status --porcelain --untracked-files=normal
+    if ($LASTEXITCODE -ne 0 -or $changes) { throw 'Commit the source before sealing a release. Use -Candidate for local verification.' }
+}
+$summary = Join-Path $Root "TEST_SUMMARY_v$Version.md"
+if (!$PrepareOnly) {
+    if (Test-Path -LiteralPath $OutputDir) { throw "Choose a new output directory; already exists: $OutputDir" }
+    if (!$Candidate -and !(Test-Path -LiteralPath $summary -PathType Leaf)) { throw "Missing test summary: $summary" }
 }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$packageFiles = @()
-foreach($packageFlavor in @('full','portable')) {
-    $packageDist = if($packageFlavor -eq 'full') { 'dist-accelerated' } else { 'dist-portable' }
-    $packageInstaller = if($packageFlavor -eq 'full') { 'installer-accelerated' } else { 'installer-portable' }
-    # The caller/temp directory may use an 8.3 name (RUNNER~1), while the
-    # provider expands Get-ChildItem.FullName. Use that same canonical base.
-    $packageApp = (Get-Item -LiteralPath (Join-Path $packageRoot "$packageDist\jumpbot")).FullName.TrimEnd('\')
-    if(-not (Test-Path -LiteralPath (Join-Path $packageApp 'jumpbot.exe'))) { throw 'missing app executable' }
-    $packageBuild = Get-Content -LiteralPath (Join-Path $packageApp 'build-source.json') -Raw | ConvertFrom-Json
-    $packageExeHash = (Get-FileHash -LiteralPath (Join-Path $packageApp 'jumpbot.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
-    if($packageBuild.commit -ne $packageCommit -or $packageBuild.flavor -ne $packageFlavor -or $packageBuild.exe_sha256 -ne $packageExeHash) {
-        throw "build identity does not match current source/flavor/executable: $packageFlavor"
+$apps = [ordered]@{}
+foreach ($flavor in 'full','portable') {
+    $dist = if ($flavor -eq 'full') { 'dist-accelerated' } else { 'dist-portable' }
+    $app = (Get-Item -LiteralPath (Join-Path $BuildRoot "$dist\jumpbot")).FullName
+    $build = Get-Content -Raw -LiteralPath (Join-Path $app 'build-source.json') | ConvertFrom-Json
+    if ($build.commit -ne $commit -or $build.flavor -ne $flavor) { throw "Build revision or flavor mismatch: $app" }
+    foreach ($required in 'jumpbot.exe','jumpbot-desktop.exe','config.json','templates/piece.png','THIRD_PARTY_NOTICES.md') {
+        if (!$build.files_sha256.PSObject.Properties[$required]) { throw "Missing from build manifest: $required" }
     }
-    $packageSourceHashes = [ordered]@{}
-    foreach($packageSource in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py','tools/live_acceptance.py','tools/run_frozen_acceptance.py','tools/run_skin_acceptance.py')) {
-        $packageSourceHashes[$packageSource] = (Get-FileHash -LiteralPath (Join-Path $packageRoot $packageSource) -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sourceFiles = git -C $Root -c core.quotepath=false ls-files --cached --others --exclude-standard -- desktop templates config.json run.bat README.md '*NOTICE*' 'LICENSE*' tools/build_app.ps1 tools/collect_licenses.ps1
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot list build inputs.' }
+    $sourceFiles = @($sourceFiles | Where-Object { Test-Path -LiteralPath (Join-Path $Root $_) -PathType Leaf })
+    if (Compare-Object $sourceFiles @($build.source_sha256.PSObject.Properties.Name)) { throw "Source list changed: $flavor" }
+    foreach ($entry in $build.source_sha256.PSObject.Properties) {
+        if ((Get-FileHash -LiteralPath (Join-Path $Root $entry.Name)).Hash -ne $entry.Value) { throw "Source changed since build: $($entry.Name)" }
     }
-    foreach($packageProperty in $packageBuild.source_sha256.PSObject.Properties) {
-        if($packageSourceHashes[$packageProperty.Name] -ne $packageProperty.Value) { throw "build source hash mismatch: $($packageProperty.Name)" }
+    $payload = @(Get-ChildItem -LiteralPath $app -Recurse -File | ForEach-Object { $_.FullName.Substring($app.Length + 1).Replace('\','/') } |
+        Where-Object { $_ -notmatch '^(logs/|debug/|build-source\.json$|source-version\.json$)' })
+    if (Compare-Object $payload @($build.files_sha256.PSObject.Properties.Name)) { throw "Payload file list changed: $app" }
+    foreach ($entry in $build.files_sha256.PSObject.Properties) {
+        if ((Get-FileHash -LiteralPath (Join-Path $app $entry.Name)).Hash -ne $entry.Value) { throw "Payload changed since build: $($entry.Name)" }
     }
-    foreach($packageSource in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py')) {
-        if(-not $packageBuild.source_sha256.PSObject.Properties[$packageSource]) { throw "missing build source hash: $packageSource" }
-    }
-    $packageManifest = [ordered]@{ version=$Version; commit=$packageCommit; flavor=$packageFlavor; exe_sha256=$packageExeHash; source_sha256=$packageSourceHashes }
-    $packageManifestText = $packageManifest | ConvertTo-Json -Depth 5
-    $packageManifestPath = Join-Path $packageApp 'source-version.json'
-    if($PrepareOnly) {
-        [System.IO.File]::WriteAllText($packageManifestPath, $packageManifestText, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "prepared manifest before installer compilation: $packageFlavor"
-        continue
-    }
-    if((Get-Content -LiteralPath $packageManifestPath -Raw).Trim() -ne $packageManifestText.Trim()) {
-        throw 'prepare matching manifests before compiling installers'
-    }
-    $packageZipPath = Join-Path $packageOutput "jumpbot-win64-v$Version-$packageFlavor.zip"
-    if(Test-Path -LiteralPath $packageZipPath) { throw "will not overwrite existing ZIP: $packageZipPath" }
-    $packageStream = [System.IO.File]::Open($packageZipPath, [System.IO.FileMode]::CreateNew)
-    $packageArchive = [System.IO.Compression.ZipArchive]::new($packageStream, [System.IO.Compression.ZipArchiveMode]::Create)
-    try {
-        foreach($packageFile in Get-ChildItem -LiteralPath $packageApp -File -Recurse) {
-            if(-not $packageFile.FullName.StartsWith($packageApp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw 'payload file escaped canonical app directory'
+    $versionInfo = [ordered]@{ version=$Version; commit=$commit; flavor=$flavor; candidate=[bool]$Candidate; build_manifest_sha256=(Get-FileHash -LiteralPath (Join-Path $app 'build-source.json')).Hash }
+    [IO.File]::WriteAllText((Join-Path $app 'source-version.json'), ($versionInfo | ConvertTo-Json))
+    $apps[$flavor] = $app
+}
+if ($PrepareOnly) { return }
+# Make all four artifacts from the verified folders and expose the directory only on success.
+$parent = Split-Path $OutputDir -Parent
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+$stage = Join-Path $parent ('.jumpbot-package-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stage | Out-Null
+try {
+    foreach ($flavor in $apps.Keys) {
+        $app = $apps[$flavor]
+        & (Join-Path $Root 'tools\installer\build_installer.ps1') -Root $Root -Version $Version -Flavor $flavor -PayloadDir $app -OutputDir $stage -SkipAppBuild
+        $archive = [IO.Compression.ZipFile]::Open((Join-Path $stage "jumpbot-win64-v$Version-$flavor.zip"), [IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in Get-ChildItem -LiteralPath $app -Recurse -File) {
+                $relative = $file.FullName.Substring($app.Length + 1).Replace('\','/')
+                if ($relative -match '^(logs|debug)/') { continue }
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, "jumpbot/$relative") | Out-Null
             }
-            $packageRelative = $packageFile.FullName.Substring($packageApp.Length + 1).Replace('\','/')
-            if($packageRelative -match '^(_internal/)?(logs|debug)/') { continue }
-            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($packageArchive, $packageFile.FullName, "jumpbot/$packageRelative", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-        }
-    } finally {
-        $packageArchive.Dispose()
-        $packageStream.Dispose()
+        } finally { $archive.Dispose() }
     }
-    $packageSetupName = "jumpbot-setup-$Version-$packageFlavor.exe"
-    Copy-Item -LiteralPath (Join-Path $packageRoot "$packageInstaller\$packageSetupName") -Destination (Join-Path $packageOutput $packageSetupName)
-    $packageFiles += @($packageZipPath, (Join-Path $packageOutput $packageSetupName))
+    if (Test-Path -LiteralPath $summary -PathType Leaf) { Copy-Item -LiteralPath $summary -Destination (Join-Path $stage 'TEST_SUMMARY.md') }
+    $sums = foreach ($file in (Get-ChildItem -LiteralPath $stage -File | Sort-Object Name)) {
+        '{0}  {1}' -f (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant(), $file.Name
+    }
+    [IO.File]::WriteAllLines((Join-Path $stage 'SHA256SUMS.txt'), [string[]]$sums)
+    [IO.Directory]::Move($stage, $OutputDir)
+} finally {
+    if (Test-Path -LiteralPath $stage) {
+        $checked = (Get-Item -LiteralPath $stage).FullName
+        if ((Split-Path $checked -Parent) -eq (Get-Item $parent).FullName -and (Split-Path $checked -Leaf) -match '^\.jumpbot-package-[0-9a-f]{32}$') {
+            Remove-Item -LiteralPath $checked -Recurse -Force
+        }
+    }
 }
-if($PrepareOnly) { return }
-$packageSummary = Join-Path $packageOutput 'TEST_SUMMARY.md'
-Copy-Item -LiteralPath (Join-Path $packageRoot "TEST_SUMMARY_v$Version.md") -Destination $packageSummary
-$packageFiles += $packageSummary
-$packageHashLines = foreach($packageFile in $packageFiles) {
-    '{0}  {1}' -f (Get-FileHash -LiteralPath $packageFile -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path $packageFile -Leaf)
-}
-[System.IO.File]::WriteAllLines((Join-Path $packageOutput 'SHA256SUMS.txt'), $packageHashLines, [System.Text.UTF8Encoding]::new($false))
-Get-ChildItem -LiteralPath $packageOutput -File | Select-Object Name,Length
+Write-Host "Packages: $OutputDir"

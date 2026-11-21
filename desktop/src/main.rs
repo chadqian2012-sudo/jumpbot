@@ -61,57 +61,33 @@ enum Message {
 }
 
 struct Engine {
-    cwd: PathBuf,
-    python: PathBuf,
-    dll: PathBuf,
+    worker: PathBuf,
 }
 
 impl Engine {
     fn locate() -> Result<Self, String> {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let cwd = exe
-            .ancestors()
-            .skip(1)
-            .find(|dir| dir.join("jumpbot.py").is_file())
-            .ok_or("找不到 jumpbot.py。请在项目内保留编译后的桌面程序。")?;
-        let python = std::env::var_os("JUMPBOT_PYTHON")
-            .map(PathBuf::from)
-            .or_else(|| {
-                cwd.ancestors()
-                    .map(|dir| dir.join(r".venv\Scripts\python.exe"))
-                    .find(|path| path.is_file())
-            })
-            .ok_or("找不到 Python 环境。请设置 JUMPBOT_PYTHON 或创建项目的 .venv。")?;
-        if !python.is_absolute() || !python.is_file() {
-            return Err("JUMPBOT_PYTHON 必须指向 Python 可执行文件的绝对路径。".into());
+        let worker = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .with_file_name("jumpbot.exe");
+        if !worker.is_file() {
+            return Err("缺少 jumpbot.exe，请保留完整软件目录。".into());
         }
-        let dll = exe.with_file_name("jumpbot_vision.dll");
-        if !dll.is_file() {
-            return Err("找不到 jumpbot_vision.dll。请编译完整 Cargo 工作区。".into());
-        }
-        Ok(Self {
-            cwd: cwd.into(),
-            python,
-            dll,
-        })
+        Ok(Self { worker })
     }
 
     fn spawn(&self, backend: Backend, daemon: bool, selftest: bool) -> std::io::Result<Child> {
-        let mut command = Command::new(&self.python);
+        let mut command = Command::new(&self.worker);
         command
-            .current_dir(&self.cwd)
-            .arg(self.cwd.join("jumpbot.py"))
-            .args(["--backend", backend.argument(), "--no-dashboard"])
-            .env("JUMPBOT_DESKTOP_PIPE", "1")
-            .env("JUMPBOT_VISION_DLL", &self.dll)
-            .env("PYTHONUTF8", "1")
+            .arg("--worker")
+            .args(["--backend", backend.argument()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW);
         if selftest {
-            command.args(["--selftest", "--no-cuda", "--no-opencl"]);
-            command.env("JUMPBOT_NO_INPUT", "1");
+            command
+                .args(["--selftest", "--no-cuda", "--no-opencl"])
+                .env("JUMPBOT_NO_INPUT", "1");
         } else {
             command.args(["--max-jumps", "0"]);
             if daemon {
@@ -222,7 +198,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         })
         .with_url("jumpbot://localhost/")
         .with_ipc_handler(move |request| {
-            if request.uri().to_string() == HOME {
+            if request.uri() == HOME {
                 if let Ok(action) = serde_json::from_str(request.body()) {
                     let _ = ipc_proxy.send_event(Message::Ui(action));
                 }

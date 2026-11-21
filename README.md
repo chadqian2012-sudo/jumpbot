@@ -9,22 +9,34 @@
 中央示意图随真实按压和落点检查更新，右侧显示本轮分数、跳数和命中率。
 窗口可启动、暂停、恢复、停止、切换识别后端和运行无输入自检。
 
-需要 Windows x64、WebView2 Runtime、Rust 的 MSVC 工具链和项目的 Python 依赖。
-准备好已安装 `requirements.txt` 的 `.venv` 后，在项目目录运行：
+Windows x64 软件目录内双击 `jumpbot-desktop.exe` 打开界面。运行需要系统的 WebView2 Runtime。保留同目录的 `jumpbot.exe`、OpenCV 与 Visual C++ DLL、`config.json` 和 `templates`。这个版本的运行、构建和打包都可在没有 Python 的环境进行。
+
+启动后手动打开小游戏。按 Alt+P 或点面板按钮暂停，等到显示「已暂停」即可切换窗口。恢复时会重新抓图，F8 可停止整轮。日常启动不限跳数，验收时可在命令行单独给出次数。真实中心命中率来自游戏分数的变化，无法读分的跳跃单独统计。
+
+完整包会试用机器现有的 CUDA 或 OpenCL 驱动，自动比较速度。缺少驱动时回退到 CPU。轻量包使用 CPU，有 AVX2 时可以选 SIMD。自检结果中的 `actual` 表示实际运行的后端。
 
 ```powershell
-cargo build --manifest-path desktop/Cargo.toml --workspace --release --locked
-.\desktop\target\release\jumpbot-desktop.exe
+.\jumpbot.exe --selftest
+.\jumpbot.exe --image "D:\frames\board.png" --backend simd
 ```
 
-窗口会从项目目录及其上级查找 `.venv\Scripts\python.exe`。
-也可把环境变量 `JUMPBOT_PYTHON` 设置为现有 Python 的绝对路径。
-EXE 和旁边的 `jumpbot_vision.dll` 应保留在项目目录内。
+单独验收固定跳数时，在源码目录使用 PowerShell 驱动。以下命令会向已打开的游戏窗口发送真实输入。测试数据写入新目录，到达检查点会暂停，按配置的热键继续。
 
-桌面版用 Rust 管理运行进程、接收状态，并计算背景边带和方块边缘。
-Python 继续处理游戏截图、识别判定、暂停热键和鼠标操作，保留已有加速后端。
-启动后等待用户打开小游戏。暂停后等窗口显示「已暂停」再切换应用，停止键仍是 F8。
-关闭窗口会请求脚本释放鼠标并退出。
+```powershell
+.\tools\run_frozen_acceptance.ps1 -ExecuteLive -Exe .\dist-accelerated\jumpbot\jumpbot.exe -Out .\build\acceptance-500 -Jumps 500 -Backend simd
+```
+
+### 从源代码编译
+
+准备 Windows x64 的 Rust MSVC 工具链、Visual Studio C++ Build Tools、Windows SDK 和 OpenCV Windows SDK。将 `JUMPBOT_OPENCV_DIR` 指向同时包含 `include\opencv2` 和 `x64\vc*\lib\opencv_world*.lib` 的 SDK 目录。在 x64 开发者 PowerShell 中运行以下命令。完整包和轻量包的输出分别在 `dist-accelerated\jumpbot` 和 `dist-portable\jumpbot`。
+
+```powershell
+cargo test --manifest-path desktop/Cargo.toml --workspace --locked
+.\tools\build_app.ps1
+.\tools\build_app.ps1 -NoGpu
+```
+
+Rust 工作进程负责窗口、输入、识别流程和驱动调用。图像处理复用原生 OpenCV。历史 Python 源码和分析工具保留供对照旧版结果。下面是 v1.3 及更早版本的记录，其中的 Python 和 PyInstaller 命令适用于对应旧版。
 
 ## 日志流式读取与面板缓存优化（v1.3）
 

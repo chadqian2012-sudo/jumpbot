@@ -1,144 +1,109 @@
-# Package jumpbot as a standalone app folder (PyInstaller onedir).
-# ASCII-only (Windows PowerShell reads .ps1 as ANSI).
-#
-# Usage:
-#   powershell -ExecutionPolicy Bypass -File tools\build_app.ps1            # with GPU (CuPy+CUDA runtime)
-#   powershell -ExecutionPolicy Bypass -File tools\build_app.ps1 -NoGpu     # portable OpenCL+CPU (no CUDA)
+# Run in an x64 Visual Studio developer shell with Rust (MSVC) on PATH.
 param(
-    [string]$Root = "D:\Codex Workspace\jumpbot",
-    [string]$Python = "D:\Codex Workspace\.venv\Scripts\python.exe",
-    [string]$DistRoot = "",
-    [string]$WorkRoot = "",
+    [string]$Root = (Split-Path $PSScriptRoot -Parent),
+    [string]$DistRoot,
+    [string]$WorkRoot,
     [switch]$NoGpu,
     [switch]$Shortcut
 )
-$ErrorActionPreference = "Stop"
-Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility') -ErrorAction Stop
-$env:JUMPBOT_WITH_GPU = if ($NoGpu) { "0" } else { "1" }
-
-# Packaging is CPU heavy; drop to BelowNormal so a running game keeps priority.
-try {
-    [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'BelowNormal'
-    Write-Host "build priority: BelowNormal"
-} catch {
-    Write-Warning "could not lower priority: $_"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility')
+$Root = (Get-Item -LiteralPath $Root).FullName
+$flavor = if ($NoGpu) { 'portable' } else { 'full' }
+if (!$DistRoot) { $DistRoot = Join-Path $Root $(if ($NoGpu) { 'dist-portable' } else { 'dist-accelerated' }) }
+if (!$WorkRoot) {
+    $WorkRoot = Join-Path $Root 'desktop\target'
+    if ($NoGpu) { $WorkRoot = Join-Path $WorkRoot 'portable' }
 }
+$DistRoot = [IO.Path]::GetFullPath($DistRoot)
+$appDir = Join-Path $DistRoot 'jumpbot'
+if (Test-Path -LiteralPath $appDir) { throw "Choose a fresh -DistRoot; app folder already exists: $appDir" }
+$target = 'x86_64-pc-windows-msvc'
+$manifest = Join-Path $Root 'desktop\Cargo.toml'
+$features = @()
+if ($NoGpu) { $features += '--no-default-features' }
+$sourceCommit = git -C $Root rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the source revision.' }
 
-Push-Location $Root
-try {
-    $sourceCommit = (git rev-parse HEAD).Trim()
-    if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'source commit unavailable' }
-    $sourceHashes = [ordered]@{}
-    foreach ($sourceFile in @('jumpbot.py','run_control.py','skin_vision.py','config.json','tools/dashboard.py','tools/_scorelog.py')) {
-        $sourceHashes[$sourceFile] = (Get-FileHash -LiteralPath (Join-Path $Root $sourceFile) -Algorithm SHA256).Hash.ToLowerInvariant()
-    }
-    Write-Host "== PyInstaller build (GPU=$($env:JUMPBOT_WITH_GPU)) =="
-    $buildArgs = @('--noconfirm', '--clean')
-    if ($DistRoot) { $buildArgs += @('--distpath', $DistRoot) }
-    if ($WorkRoot) { $buildArgs += @('--workpath', $WorkRoot) }
-    $buildArgs += (Join-Path $Root "tools\jumpbot.spec")
-    & $Python -m PyInstaller @buildArgs
-    if ($LASTEXITCODE -ne 0) { Write-Error "PyInstaller failed"; exit 3 }
-
-    $distBase = if ($DistRoot) { $DistRoot } else { Join-Path $Root "dist" }
-    $appDir = Join-Path $distBase "jumpbot"
-    $exe = Join-Path $appDir "jumpbot.exe"
-    if (-not (Test-Path $exe)) { Write-Error "exe not found: $exe"; exit 4 }
-
-    Write-Host "== selftest (no game window needed) =="
-    & $exe --selftest
-    if ($LASTEXITCODE -ne 0) { throw "app selftest failed" }
-
-    # Trim files verified as unnecessary (keeps the frozen GPU stack working):
-    #  * opencv ffmpeg decoder (~29MB): we only decode PNG templates
-    #  * nvrtc "alt" variant (~86MB): CuPy uses nvrtc64_120_0.dll
-    #  NOT trimmed: cupy thrust/cub (~108MB) - CuPy imports them, removing kills the GPU path.
-    $trim = @(
-        "cv2\opencv_videoio_ffmpeg*_64.dll",
-        "nvidia\cuda_nvrtc\bin\nvrtc64_*.alt.dll"
-    )
-    $saved = 0
-    foreach ($pattern in $trim) {
-        Get-ChildItem (Join-Path $appDir "_internal") -Recurse -Filter (Split-Path $pattern -Leaf) -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -like ("*" + $pattern.Replace('*', '*')) } |
-            ForEach-Object {
-                $saved += $_.Length
-                Remove-Item -LiteralPath $_.FullName -Force
-                Write-Host ("trimmed: {0} ({1:N1} MB)" -f $_.Name, ($_.Length / 1MB))
-            }
-    }
-    if ($saved -gt 0) { Write-Host ("trim total: {0:N0} MB" -f ($saved / 1MB)) }
-    # Verify the delivered runtime too, after removing optional DLLs.
-    & $exe --selftest
-    if ($LASTEXITCODE -ne 0) { throw "trimmed app selftest failed" }
-    $licenseArgs = @{ AppDir = $appDir; Python = $Python }
-    if (-not $NoGpu) { $licenseArgs.Full = $true }
-    & (Join-Path $Root 'tools\collect_licenses.ps1') @licenseArgs
-    if (-not (Test-Path -LiteralPath (Join-Path $appDir 'config.json'))) {
-        Copy-Item -LiteralPath (Join-Path $Root 'config.json') -Destination (Join-Path $appDir 'config.json')
-    }
-    $size = (Get-ChildItem $appDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
-    Write-Host ("app folder size after trim: {0:N0} MB" -f $size)
-    $longBat = @"
-@echo off
-rem Launch jumpbot in long-run mode (auto-resume when the game window comes back).
-cd /d "%~dp0"
-jumpbot.exe --max-jumps 0 --daemon
-pause
-"@
-    $dryBat = @"
-@echo off
-rem Recognition only - never sends mouse input (safe check).
-cd /d "%~dp0"
-jumpbot.exe --dry-run --samples 3
-pause
-"@
-    $selfBat = @"
-@echo off
-rem Verify dependencies / templates / GPU backend without touching the game.
-cd /d "%~dp0"
-jumpbot.exe --selftest
-pause
-"@
-    $cpuBat = @"
-@echo off
-rem Force CPU SIMD; do not initialize optional CUDA or OpenCL runtimes.
-cd /d "%~dp0"
-jumpbot.exe --backend simd --no-cuda --no-opencl --max-jumps 0 --daemon
-pause
-"@
-    Set-Content -Path (Join-Path $appDir "run_long.bat")   -Value $longBat -Encoding ASCII
-    Set-Content -Path (Join-Path $appDir "run_dryrun.bat") -Value $dryBat  -Encoding ASCII
-    Set-Content -Path (Join-Path $appDir "selftest.bat")   -Value $selfBat -Encoding ASCII
-    Set-Content -Path (Join-Path $appDir "run_cpu.bat")    -Value $cpuBat -Encoding ASCII
-    Copy-Item -LiteralPath (Join-Path $Root 'README.md') -Destination (Join-Path $appDir 'README.md')
-    Write-Host "launchers written: run_long.bat / run_cpu.bat / run_dryrun.bat / selftest.bat"
-    foreach ($sourceFile in $sourceHashes.Keys) {
-        if ($sourceHashes[$sourceFile] -ne (Get-FileHash -LiteralPath (Join-Path $Root $sourceFile) -Algorithm SHA256).Hash.ToLowerInvariant()) {
-            throw "source changed during build: $sourceFile"
+function Get-SourceHashes {
+    $paths = git -C $Root -c core.quotepath=false ls-files --cached --others --exclude-standard -- desktop templates config.json run.bat README.md '*NOTICE*' 'LICENSE*' tools/build_app.ps1 tools/collect_licenses.ps1
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot list build inputs.' }
+    $hashes = [ordered]@{}
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath (Join-Path $Root $path) -PathType Leaf) {
+            $hashes[$path] = (Get-FileHash -LiteralPath (Join-Path $Root $path)).Hash
         }
     }
-    $buildManifest = [ordered]@{
-        commit = $sourceCommit
-        flavor = $(if ($NoGpu) { 'portable' } else { 'full' })
-        exe_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-        source_sha256 = $sourceHashes
-    }
-    [System.IO.File]::WriteAllText((Join-Path $appDir 'build-source.json'), ($buildManifest | ConvertTo-Json -Depth 5), [System.Text.UTF8Encoding]::new($false))
-
-    if ($Shortcut) {
-        $desktop = [Environment]::GetFolderPath("Desktop")
-        $lnk = Join-Path $desktop "jumpbot (long run).lnk"
-        $shell = New-Object -ComObject WScript.Shell
-        $sc = $shell.CreateShortcut($lnk)
-        $sc.TargetPath = $exe
-        $sc.Arguments = "--max-jumps 0 --daemon"
-        $sc.WorkingDirectory = $appDir
-        $sc.Description = "jumpbot - long run mode"
-        $sc.Save()
-        Write-Host "desktop shortcut: $lnk"
-    }
-    Write-Host "== DONE: $exe =="
-} finally {
-    Pop-Location
+    $hashes
 }
+$sourceHashes = Get-SourceHashes
+& cargo build --manifest-path $manifest --release --locked --target $target --target-dir $WorkRoot --bin jumpbot --bin jumpbot-desktop @features
+if ($LASTEXITCODE -ne 0) { throw "Cargo release build failed ($flavor)." }
+$releaseDir = Join-Path $WorkRoot "$target\release"
+$work = Join-Path $DistRoot ('.staging-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+try {
+    foreach ($name in 'jumpbot.exe', 'jumpbot-desktop.exe') {
+        Copy-Item -LiteralPath (Join-Path $releaseDir $name) -Destination $work
+    }
+    $world = @(Get-ChildItem -LiteralPath $releaseDir -Filter 'opencv_world*.dll' -File | Where-Object Name -Match '^opencv_world\d+\.dll$')
+    if ($world.Count -ne 1) { throw "Expected one release OpenCV world DLL staged by Cargo in $releaseDir, found $($world.Count)." }
+    Copy-Item -LiteralPath $world[0].FullName -Destination $work
+
+    $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+    $crt = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Redist\MSVC\**\x64\Microsoft.VC*.CRT\vcruntime140.dll') |
+        Where-Object { $_ -notmatch '\\(debug_nonredist|onecore)\\' } | Sort-Object -Descending | Select-Object -First 1
+    if (!$crt) { throw 'Cannot find the Visual C++ x64 redistributable runtime in Visual Studio.' }
+    Get-ChildItem -LiteralPath (Split-Path $crt) -Filter '*.dll' -File | Copy-Item -Destination $work
+    foreach ($name in 'config.json', 'templates', 'run.bat', 'README.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE-OpenCV.txt') {
+        Copy-Item -LiteralPath (Join-Path $Root $name) -Destination $work -Recurse
+    }
+    $launchers = [ordered]@{
+        'run_long.bat' = '--max-jumps 0 --daemon'
+        'run_dryrun.bat' = '--dry-run --samples 3'
+        'selftest.bat' = '--selftest'
+        'run_cpu.bat' = '--backend simd --no-cuda --no-opencl --max-jumps 0 --daemon'
+    }
+    foreach ($name in $launchers.Keys) {
+        Set-Content -LiteralPath (Join-Path $work $name) -Encoding Ascii -Value @('@echo off', 'cd /d "%~dp0"', ('jumpbot.exe ' + $launchers[$name]), 'set "rc=%errorlevel%"', 'pause', 'exit /b %rc%')
+    }
+    & (Join-Path $Root 'tools\collect_licenses.ps1') -AppDir $work -Root $Root -NoGpu:$NoGpu
+    Push-Location -LiteralPath $work
+    $savedPath = $env:Path
+    try {
+        # Expose only Windows, so an SDK or developer PATH cannot conceal a missing DLL.
+        $env:Path = "$env:SystemRoot\System32;$env:SystemRoot"
+        & '.\jumpbot.exe' --selftest --no-cuda --no-opencl
+        if ($LASTEXITCODE -ne 0) { throw "Packaged CLI self-test failed ($LASTEXITCODE)." }
+    } finally {
+        $env:Path = $savedPath
+        Pop-Location
+    }
+    if ((Get-SourceHashes | ConvertTo-Json -Compress) -cne ($sourceHashes | ConvertTo-Json -Compress)) {
+        throw 'Source changed while building. Run the build again.'
+    }
+    $files = [ordered]@{}
+    $workPrefix = (Get-Item -LiteralPath $work).FullName.Length + 1
+    foreach ($file in Get-ChildItem -LiteralPath $work -File -Recurse) {
+        $relative = $file.FullName.Substring($workPrefix).Replace('\','/')
+        if ($relative -notmatch '^(logs|debug)/') { $files[$relative] = (Get-FileHash -LiteralPath $file.FullName).Hash }
+    }
+    $build = [ordered]@{ commit = $sourceCommit; flavor = $flavor; source_sha256 = $sourceHashes; files_sha256 = $files }
+    [IO.File]::WriteAllText((Join-Path $work 'build-source.json'), ($build | ConvertTo-Json -Depth 4))
+    [IO.Directory]::Move($work, $appDir)
+} finally {
+    if (Test-Path -LiteralPath $work) {
+        $checked = (Get-Item -LiteralPath $work).FullName
+        if ((Split-Path $checked -Parent) -eq (Get-Item $DistRoot).FullName -and (Split-Path $checked -Leaf) -match '^\.staging-[0-9a-f]{32}$') {
+            Remove-Item -LiteralPath $checked -Recurse -Force
+        }
+    }
+}
+if ($Shortcut) {
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'jumpbot (long run).lnk'))
+    $link.TargetPath = Join-Path $appDir 'jumpbot.exe'
+    $link.Arguments = '--max-jumps 0 --daemon'
+    $link.WorkingDirectory = $appDir
+    $link.Save()
+}
+Write-Host "$flavor app: $appDir"

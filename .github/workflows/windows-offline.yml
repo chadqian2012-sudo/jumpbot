@@ -1,24 +1,76 @@
-name: Windows offline safety
+name: Windows Rust packages
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  offline:
+  windows:
     runs-on: windows-latest
     env:
       JUMPBOT_NO_INPUT: '1'
-      JUMPBOT_DISABLE_CUDA: '1'
-      JUMPBOT_DISABLE_OPENCL: '1'
-      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-node@v6
         with:
-          python-version: '3.12'
-      - run: python -m pip install -r requirements.txt pyflakes
-      - run: python -m py_compile jumpbot.py run_control.py skin_vision.py tools/report.py tools/_scorelog.py tools/dashboard.py tools/check_cuda_driver.py tools/live_acceptance.py tools/summarize_acceptance.py tools/skin_regress.py tools/run_frozen_acceptance.py tools/run_skin_acceptance.py
-      - run: python -m pyflakes jumpbot.py run_control.py skin_vision.py tests tools/report.py tools/_scorelog.py tools/dashboard.py tools/check_cuda_driver.py tools/live_acceptance.py tools/summarize_acceptance.py tools/skin_regress.py tools/run_frozen_acceptance.py tools/run_skin_acceptance.py
-      - run: python -m unittest discover -s tests -v
-      - run: python jumpbot.py --selftest --no-cuda --no-opencl
+          node-version: '24'
+          package-manager-cache: false
+      - name: Extract the official OpenCV x64 SDK
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'opencv-4.14.0-windows.exe'
+          Invoke-WebRequest 'https://github.com/opencv/opencv/releases/download/4.14.0/opencv-4.14.0-windows.exe' -OutFile $sdk
+          if ((Get-FileHash $sdk).Hash -ne '5f266a8b73bed535962d7e861a6457e32a0dd5f463ad0a7cf8707a135469be63') { throw 'OpenCV SDK checksum mismatch' }
+          & 7z x $sdk "-o$env:RUNNER_TEMP\cv" -y -bso0
+          if ($LASTEXITCODE -ne 0) { throw 'OpenCV SDK extraction failed' }
+          "JUMPBOT_OPENCV_DIR=$env:RUNNER_TEMP\cv\opencv\build" >> $env:GITHUB_ENV
+      - name: Test both Cargo feature sets
+        shell: pwsh
+        run: |
+          cargo test --manifest-path desktop/Cargo.toml --workspace --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path desktop/Cargo.toml --workspace --locked --target x86_64-pc-windows-msvc --no-default-features
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build both distributions and compile their installers
+        shell: pwsh
+        run: |
+          ./tools/build_app.ps1
+          ./tools/build_app.ps1 -NoGpu
+          ./tools/package_release.ps1 -Version 0.0.0-ci -Candidate -OutputDir "$env:RUNNER_TEMP\packages"
+      - name: Verify ZIPs, installed files, saved configuration and desktop controls
+        shell: pwsh
+        run: |
+          $packages = Join-Path $env:RUNNER_TEMP 'packages'
+          foreach ($line in Get-Content "$packages\SHA256SUMS.txt") {
+            $hash, $name = $line -split '  ', 2
+            if ((Get-FileHash -LiteralPath (Join-Path $packages $name)).Hash -ne $hash) { throw "Checksum mismatch for $name" }
+          }
+          foreach ($flavor in 'full','portable') {
+            $extract = Join-Path $env:RUNNER_TEMP "extract-$flavor"
+            Expand-Archive "$packages\jumpbot-win64-v0.0.0-ci-$flavor.zip" -DestinationPath $extract
+            $app = Join-Path $extract 'jumpbot'
+            node ./tools/test_native_runtime.mjs $app
+            if ($LASTEXITCODE -ne 0) { throw "Desktop and CLI checks failed: $flavor" }
+
+            $install = Join-Path $env:RUNNER_TEMP "installed-$flavor"
+            New-Item -ItemType Directory -Path $install | Out-Null
+            $config = Join-Path $install 'config.json'
+            Set-Content -LiteralPath $config -Value '{"max_jumps":77}' -NoNewline
+            $legacy = New-Item -ItemType Directory -Path "$install\_internal\templates"
+            Copy-Item "$app\templates\digit_1.png" (Join-Path $legacy.FullName 'digit_0.png')
+            $userHash = (Get-FileHash -LiteralPath $config).Hash
+            $argsList = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS','/MERGETASKS=!desktopicon',("/DIR=" + [char]34 + $install + [char]34))
+            $setup = Start-Process "$packages\jumpbot-setup-0.0.0-ci-$flavor.exe" -ArgumentList $argsList -PassThru -Wait -WindowStyle Hidden
+            if ($setup.ExitCode -ne 0 -or (Get-FileHash -LiteralPath $config).Hash -ne $userHash) { throw "Install or config preservation failed: $flavor" }
+            foreach ($file in Get-ChildItem -LiteralPath $app -File -Recurse) {
+              $relative = [IO.Path]::GetRelativePath($app, $file.FullName)
+              if ($relative -eq 'config.json') { continue }
+              if ($relative -eq 'templates\digit_0.png') {
+                if ((Get-FileHash "$install\$relative").Hash -ne (Get-FileHash "$app\templates\digit_1.png").Hash) { throw 'Legacy user template was replaced' }
+                continue
+              }
+              if ((Get-FileHash -LiteralPath (Join-Path $install $relative)).Hash -ne (Get-FileHash -LiteralPath $file.FullName).Hash) { throw "Installer and ZIP differ: $relative" }
+            }
+            & "$install\jumpbot.exe" --selftest --no-cuda --no-opencl
+            if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed: $flavor" }
+          }

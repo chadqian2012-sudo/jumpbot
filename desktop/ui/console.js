@@ -112,8 +112,7 @@ function renderStats() {
   byId("hit").textContent = percentage(state.hit_rate);
   byId("land").textContent = percentage(state.landing_rate);
   byId("actual-backend").textContent = backends[state.mask_backend] || "—";
-  byId("kernel").textContent = state.background_kernel === "rust" ? "Rust" :
-    state.background_kernel === "numpy" ? "NumPy" : "—";
+  byId("kernel").textContent = state.background_kernel === "rust" ? "Rust" : "—";
   byId("shortcuts").textContent = `${state.pause_hotkey || "Alt+P"} 暂停 / F8 停止`;
   const countdown = ["countdown", "resuming"].includes(state.state) ? state.countdown_s : null;
   byId("countdown").textContent = Number.isFinite(countdown) ? `${countdown.toFixed(1)} s` : "—";
