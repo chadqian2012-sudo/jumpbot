@@ -21,7 +21,7 @@ cargo build --manifest-path desktop/Cargo.toml --workspace --release --locked
 也可把环境变量 `JUMPBOT_PYTHON` 设置为现有 Python 的绝对路径。
 EXE 和旁边的 `jumpbot_vision.dll` 应保留在项目目录内。
 
-桌面版用 Rust 管理运行进程、接收状态，并计算背景边带的颜色中位数。
+桌面版用 Rust 管理运行进程、接收状态，并计算背景边带和方块边缘。
 Python 继续处理游戏截图、识别判定、暂停热键和鼠标操作，保留已有加速后端。
 启动后等待用户打开小游戏。暂停后等窗口显示「已暂停」再切换应用，停止键仍是 F8。
 关闭窗口会请求脚本释放鼠标并退出。

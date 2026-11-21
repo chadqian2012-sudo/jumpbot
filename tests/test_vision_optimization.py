@@ -45,6 +45,24 @@ class OptimizationTests(unittest.TestCase):
                     np.testing.assert_array_equal(J.estimate_background_rows(pixels), expected)
                     np.testing.assert_array_equal(pixels, before)
 
+    @unittest.skipUnless(J._FIT_VERTEX is not None, "requires the Rust DLL")
+    def test_native_vertex_matches_segment_selection(self):
+        rng = np.random.default_rng(122)
+        dx_per_dy = 1.0 / 0.5774
+        for corner_x in (11.0, 26.5, 54.2, 72.0):
+            for _ in range(20):
+                mask = rng.random((30, 84)) < 0.04
+                for y in range(1, len(mask)):
+                    span = min(y, len(mask) - y) * dx_per_dy
+                    left = max(0, round(corner_x - span))
+                    right = round(corner_x + span)
+                    if rng.random() > 0.08:
+                        mask[y, left:right + 1] = True
+                expected = J._fit_vertex_numpy(mask, corner_x, 0, len(mask) - 1, dx_per_dy, 3.0)
+                actual = J._FIT_VERTEX(mask.ctypes.data, mask.shape[1], 0, len(mask) - 1,
+                                       corner_x, dx_per_dy, 3.0)
+                self.assertEqual(actual, expected)
+
     def test_vectorized_waist_is_exact_and_does_not_change_rows(self):
         rng = np.random.default_rng(20261011)
         with warnings.catch_warnings():

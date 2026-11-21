@@ -606,18 +606,23 @@ def _mss_factory():
     return getattr(mss_module, "MSS", None) or mss_module.mss
 
 
-def _load_edge_medians():
+def _load_vision_kernels():
     path = os.environ.get("JUMPBOT_VISION_DLL")
     if not path:
-        return None
-    kernel = ctypes.CDLL(path).jumpbot_edge_medians
-    kernel.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
-                       ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
-    kernel.restype = None
-    return kernel
+        return None, None
+    native = ctypes.CDLL(path)
+    medians = native.jumpbot_edge_medians
+    medians.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                        ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    medians.restype = None
+    vertex = native.jumpbot_fit_vertex
+    vertex.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                       ctypes.c_double, ctypes.c_double, ctypes.c_double]
+    vertex.restype = ctypes.c_ssize_t
+    return medians, vertex
 
 
-_EDGE_MEDIANS = _load_edge_medians()
+_EDGE_MEDIANS, _FIT_VERTEX = _load_vision_kernels()
 
 
 def estimate_background_rows(frame: np.ndarray, band_ratio: float = 0.03) -> np.ndarray:
@@ -1089,7 +1094,8 @@ def top_face_center(comp_mask: np.ndarray, slope: float = 0.5774) -> tuple | Non
         if corner_x <= 10 or corner_x >= w - 10:
             # 顶角被画面裁掉：不能用它当中心 x，改走兜底（会按未裁的一侧反推）
             return _top_face_center_fallback(comp_mask, corner_x, y_top, bbox_width)
-        by_edges = _edge_fit_from_corner(comp_mask, corner_x, y_top, slope, bbox_width)
+        by_edges = _edge_fit_from_corner(comp_mask, corner_x, y_top, slope, bbox_width,
+                                         int(rows[-1]))
         if by_edges is not None:
             fitted.append(by_edges)
     if fitted:
@@ -1100,7 +1106,7 @@ def top_face_center(comp_mask: np.ndarray, slope: float = 0.5774) -> tuple | Non
         return _top_face_center_fallback(comp_mask, x_back, y_top, bbox_width)
 
     # ---- 回退路径：等宽平台期规则 ----
-    bbox_height = int(np.flatnonzero(comp_mask.any(axis=1))[-1]) - y_top + 1
+    bbox_height = int(rows[-1]) - y_top + 1
     best_width = 0.0
     best_row = y_top
     last_growth_row = y_top
@@ -1140,19 +1146,32 @@ def top_face_center(comp_mask: np.ndarray, slope: float = 0.5774) -> tuple | Non
 
 
 def _edge_fit_from_corner(comp_mask: np.ndarray, x_back: float, y_top: int,
-                          slope: float, bbox_width: float) -> tuple | None:
+                          slope: float, bbox_width: float, y_bottom: int) -> tuple | None:
     """以给定顶角为起点，按等距投影斜率拟合顶面两条上边缘，求顶面中心。
 
     返回 (cx, cy, 顶宽, y_top)；拟合不成立（例如圆台、或被污染）时返回 None。
     """
-    h, w = comp_mask.shape[:2]
-    rows = np.flatnonzero(comp_mask.any(axis=1))
-    if rows.size == 0:
-        return None
+    w = comp_mask.shape[1]
     dx_per_dy = 1.0 / max(slope, 1e-6)
     tol = max(3.0, 0.025 * bbox_width)
-    y_bottom = int(rows[-1])
     limit = min(y_bottom, y_top + int(0.6 * bbox_width * dx_per_dy) + 4)
+    if (_FIT_VERTEX is not None and comp_mask.dtype in (np.bool_, np.uint8)
+            and comp_mask.flags.c_contiguous):
+        vertex_row = _FIT_VERTEX(comp_mask.ctypes.data, w, y_top, limit, x_back, dx_per_dy, tol)
+    else:
+        vertex_row = _fit_vertex_numpy(comp_mask, x_back, y_top, limit, dx_per_dy, tol)
+    if vertex_row < 0:
+        return None
+    fitted_width = 2.0 * float(vertex_row - y_top) * dx_per_dy
+    # 自洽性：真方块顶宽不会远小于它所在连通域的宽度，否则视为拟合提前收敛
+    if fitted_width < 0.30 * bbox_width:
+        return None
+    return x_back, float(vertex_row), fitted_width, float(y_top)
+
+
+def _fit_vertex_numpy(comp_mask: np.ndarray, x_back: float, y_top: int,
+                      limit: int, dx_per_dy: float, tol: float) -> int:
+    w = comp_mask.shape[1]
     last_edge_row = None
     misses = 0
     last_growth_row = None
@@ -1187,13 +1206,8 @@ def _edge_fit_from_corner(comp_mask: np.ndarray, x_back: float, y_top: int,
             if misses >= 3:
                 break
     if last_edge_row is None or last_edge_row - y_top < 6:
-        return None
-    vertex_row = last_growth_row if last_growth_row is not None else last_edge_row
-    fitted_width = 2.0 * float(vertex_row - y_top) * dx_per_dy
-    # 自洽性：真方块顶宽不会远小于它所在连通域的宽度，否则视为拟合提前收敛
-    if fitted_width < 0.30 * bbox_width:
-        return None
-    return x_back, float(vertex_row), fitted_width, float(y_top)
+        return -1
+    return last_growth_row if last_growth_row is not None else last_edge_row
 
 
 def _top_face_center_fallback(comp_mask: np.ndarray, x_back: float, y_top: int,
