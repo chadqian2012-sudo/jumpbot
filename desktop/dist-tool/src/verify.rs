@@ -2,12 +2,209 @@ use super::*;
 use std::collections::BTreeSet;
 use zip::ZipArchive;
 
+// Published v1.3 installers. Both AppIds are checked before either install starts.
+const LEGACY: [(&str, &str, &str); 2] = [
+    (
+        "full",
+        "{8F3A2C41-7B5E-4D19-9C6A-2E48D1F0B7A3}",
+        "49597ff5952490372da1bbd313bf2af525a758a9f652216f31611ba12ef9f3b4",
+    ),
+    (
+        "portable",
+        "{B5B2F778-6F4B-4B39-A24D-707780C50259}",
+        "9ff8eb769722674db46a433c98b60febf880add5810ec628f5124b1a278630c1",
+    ),
+];
+
+fn registered(app_id: &str) -> Result<bool> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            root: isize,
+            key: *const u16,
+            options: u32,
+            access: u32,
+            handle: *mut isize,
+        ) -> i32;
+        fn RegCloseKey(handle: isize) -> i32;
+    }
+    let key: Vec<u16> =
+        format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{app_id}_is1")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+    for root in [0x8000_0001u32, 0x8000_0002] {
+        // HKCU, HKLM
+        for view in [0x0100, 0x0200] {
+            // 64-bit and 32-bit registry views
+            let mut handle = 0;
+            // key is NUL-terminated and handle is writable for the duration of the call.
+            let status = unsafe {
+                RegOpenKeyExW(root as i32 as isize, key.as_ptr(), 0, 1 | view, &mut handle)
+            };
+            match status {
+                0 => {
+                    unsafe { RegCloseKey(handle) };
+                    return Ok(true);
+                }
+                2 | 3 => continue, // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+                e => return Err(io::Error::from_raw_os_error(e).into()),
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn require_unused_ids(hosted: bool, exists: impl Fn(&str) -> Result<bool>) -> Result<()> {
+    for (_, id, _) in LEGACY {
+        if exists(id)? {
+            return Err(
+                format!("installation already registered ({id}); refusing --install").into(),
+            );
+        }
+    }
+    if !hosted {
+        return Err("--install requires a disposable GitHub-hosted Windows runner".into());
+    }
+    Ok(())
+}
+
+fn install(exe: &Path, target: &Path) -> Result<()> {
+    run(Command::new(exe)
+        .args([
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/NOICONS",
+            "/MERGETASKS=!desktopicon",
+        ])
+        .arg(format!("/DIR={}", target.display())))
+}
+
+fn uninstall(target: &Path, id: &str) -> Result<()> {
+    run(Command::new(target.join("unins000.exe")).args([
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+    ]))?;
+    // Inno's first phase exits before the second phase deletes the uninstaller.
+    // Reinstalling during that interval could reuse a file still awaiting deletion.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while target.join("unins000.exe").try_exists()? {
+        if std::time::Instant::now() >= deadline {
+            return Err("Inno did not finish removing its uninstaller".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if registered(id)? || target.join("jumpbot.exe").try_exists()? {
+        return Err("uninstall did not remove the registered application".into());
+    }
+    Ok(())
+}
+
+fn template_hashes(dir: &Path) -> Result<BTreeMap<PathBuf, String>> {
+    files(dir)?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+        .map(|p| Ok((p.clone(), sha(&dir.join(p))?)))
+        .collect()
+}
+
+fn check_upgrade(
+    root: &Path,
+    app: &Path,
+    exe: &Path,
+    temp: &Path,
+    flavor: &str,
+    id: &str,
+    digest: &str,
+) -> Result<()> {
+    let target = temp.join("installed");
+    let old_name = format!("jumpbot-setup-1.3-{flavor}.exe");
+    let old = temp.join(&old_name);
+    let url =
+        format!("https://github.com/chadqian2012-sudo/jumpbot/releases/download/v1.3/{old_name}");
+    run(Command::new(folder("SystemRoot").join("System32/curl.exe"))
+        .args([
+            "--fail",
+            "--location",
+            "--retry",
+            "3",
+            "--silent",
+            "--show-error",
+            "--output",
+        ])
+        .arg(&old)
+        .arg(url))?;
+    if sha(&old)? != digest {
+        return Err(format!("v1.3 checksum mismatch: {old_name}").into());
+    }
+    install(&old, &target)?;
+    let config = target.join("config.json");
+    let legacy_digit = target.join("_internal/templates/digit_0.png");
+    if !registered(id)? || !config.is_file() || !legacy_digit.is_file() {
+        return Err("v1.3 install did not create the expected registration and user files".into());
+    }
+    let user = b"{\"k\": 2.83, \"gamma\": 0}\n";
+    let custom_digit = app.join("templates/digit_1.png");
+    let legacy_templates = target.join("_internal/templates");
+    let templates = target.join("templates");
+    fs::write(&config, user)?;
+    copy(&custom_digit, &legacy_digit)?;
+    copy(&custom_digit, &legacy_templates.join("custom/nested.png"))?;
+    let mut expected_templates = template_hashes(&app.join("templates"))?;
+    expected_templates.extend(template_hashes(&legacy_templates)?);
+    install(exe, &target)?;
+    if fs::read(&config)? != user || template_hashes(&templates)? != expected_templates {
+        return Err("upgrade replaced v1.3 settings or templates".into());
+    }
+    for p in files(app)? {
+        if p != Path::new("config.json")
+            && !p.starts_with("templates")
+            && sha(&target.join(&p))? != sha(&app.join(&p))?
+        {
+            return Err(format!("upgrade mismatch: {}", p.display()).into());
+        }
+    }
+    run_cli(root, &target)?;
+    // Preserve edits made after upgrading as well as the original v1.3 values.
+    let edited = b"{\"k\": 2.92, \"gamma\": 0}\n";
+    fs::write(&config, edited)?;
+    copy(
+        &app.join("templates/digit_2.png"),
+        &templates.join("digit_0.png"),
+    )?;
+    expected_templates.insert(
+        "digit_0.png".into(),
+        sha(&app.join("templates/digit_2.png"))?,
+    );
+    let saved = target.join("config.jumpbot-preserved.json");
+    uninstall(&target, id)?;
+    if fs::read(&saved)? != edited || template_hashes(&templates)? != expected_templates {
+        return Err("uninstall lost user settings or templates".into());
+    }
+    install(exe, &target)?;
+    if fs::read(&config)? != edited
+        || template_hashes(&templates)? != expected_templates
+        || saved.exists()
+    {
+        return Err("reinstall did not restore user settings and templates".into());
+    }
+    uninstall(&target, id)
+}
+
 pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root")
         .to_path_buf();
+    if install {
+        let hosted = env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+            && env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted");
+        require_unused_ids(hosted, registered)?;
+    }
     let sums = fs::read_to_string(packages.join("SHA256SUMS.txt"))?;
     let mut verified = BTreeSet::new();
     for line in sums.lines() {
@@ -19,7 +216,7 @@ pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Resul
             return Err(format!("invalid checksum: {name}").into());
         }
     }
-    for flavor in ["full", "portable"] {
+    for (flavor, id, digest) in LEGACY {
         let zip_name = format!("jumpbot-win64-v{version}-{flavor}.zip");
         let exe_name = format!("jumpbot-setup-{version}-{flavor}.exe");
         if !verified.contains(&zip_name) || !verified.contains(&exe_name) {
@@ -50,40 +247,16 @@ pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Resul
         let app = temp.path().join("jumpbot");
         verify_manifest(&app, flavor, version)?;
         run_cli(&root, &app)?;
-        let target = temp.path().join("installed");
         if install {
-            fs::create_dir_all(target.join("_internal/templates"))?;
-            let user = b"{\"k\": 2.61, \"gamma\": 0}\n";
-            fs::write(target.join("config.json"), user)?;
-            copy(
-                &app.join("templates/digit_1.png"),
-                &target.join("_internal/templates/digit_0.png"),
+            check_upgrade(
+                &root,
+                &app,
+                &packages.join(exe_name),
+                temp.path(),
+                flavor,
+                id,
+                digest,
             )?;
-            run(Command::new(packages.join(exe_name))
-                .args([
-                    "/VERYSILENT",
-                    "/SUPPRESSMSGBOXES",
-                    "/NORESTART",
-                    "/CURRENTUSER",
-                    "/NOICONS",
-                    "/MERGETASKS=!desktopicon",
-                ])
-                .arg(format!("/DIR={}", target.display())))?;
-            for p in files(&app)? {
-                let expected = if p == Path::new("templates/digit_0.png") {
-                    app.join("templates/digit_1.png")
-                } else {
-                    app.join(&p)
-                };
-                if p == Path::new("config.json") {
-                    if fs::read(target.join(&p))? != user {
-                        return Err("installer replaced user settings".into());
-                    }
-                } else if sha(&target.join(&p))? != sha(&expected)? {
-                    return Err(format!("installed file mismatch {}", p.display()).into());
-                }
-            }
-            run_cli(&root, &target)?;
         }
         println!("{flavor} {} ZIP payload files verified", names.len());
         if std::env::var_os("JUMPBOT_TEST_GUI").is_some() {
@@ -199,4 +372,20 @@ fn run_cli(root: &Path, app: &Path) -> Result<()> {
         return Err("packaged worker failed recognition fixtures".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn installer_preflight_refuses_local_registered_or_unreadable_accounts() {
+        assert!(require_unused_ids(false, |_| Ok(false)).is_err());
+        for (_, present, _) in LEGACY {
+            for hosted in [true, false] {
+                assert!(require_unused_ids(hosted, |id| Ok(id == present)).is_err());
+            }
+        }
+        assert!(require_unused_ids(true, |_| Err("access denied".into())).is_err());
+        assert!(require_unused_ids(true, |_| Ok(false)).is_ok());
+    }
 }
