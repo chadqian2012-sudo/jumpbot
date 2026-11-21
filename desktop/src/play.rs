@@ -108,13 +108,12 @@ impl Game<'_> {
                 let Ok(guard) = self.ctl.guard(g, false) else {
                     continue;
                 };
-                let resized = w.resize_to_config(self.c)?;
                 let foreground = self.o.background || w.is_foreground();
-                if !resized && !foreground {
+                if !foreground {
                     let _ = w.activate();
                 }
                 drop(guard);
-                if !resized && foreground {
+                if foreground {
                     let id = (g, w.hwnd, w.pid, w.client_rect);
                     let (old, start) = countdown.get_or_insert((id, Instant::now()));
                     if *old != id {
@@ -132,11 +131,7 @@ impl Game<'_> {
                     self.ctl.sleep(g, left.min(ms(100.)));
                     continue;
                 }
-                reason = if resized {
-                    "等待窗口调整尺寸"
-                } else {
-                    "请将游戏窗口切到前台"
-                };
+                reason = "请将游戏窗口切到前台";
             }
             countdown = None;
             if timeout.is_some_and(|t| elapsed >= t) {
@@ -147,7 +142,12 @@ impl Game<'_> {
             self.ctl.sleep(g, poll);
         }
     }
-    fn press(&self, w: &Window, g: u64, p: (f64, f64), duration: f64) -> Result<bool> {
+    fn recognition_frame(&self, w: &Window) -> Result<Option<Frame>> {
+        w.capture(self.mode)?
+            .map(|raw| raw.for_recognition(self.c))
+            .transpose()
+    }
+    fn press(&self, w: &Window, g: u64, p: (f64, f64), duration: f64) -> Result<PressOutcome> {
         if self.o.dry_run {
             return Err("只读检测模式已阻止按压".into());
         }
@@ -155,10 +155,9 @@ impl Game<'_> {
         match w.press(p, ms(duration), self.o.background, || {
             self.ctl.guard(g, true).inspect_err(|_| denied = true)
         }) {
-            Ok(PressOutcome::Sent) => Ok(true),
             Ok(PressOutcome::Suppressed) => Err("无输入模式已阻止按压".into()),
-            Err(_) if denied => Ok(false),
-            Err(e) => Err(e),
+            Err(_) if denied => Ok(PressOutcome::Suppressed),
+            result => result,
         }
     }
     fn ensure_artifact(&self, name: &str, frame: &Frame) -> Result<()> {
@@ -187,7 +186,7 @@ impl Game<'_> {
         g: u64,
         previous: Option<i32>,
         before: &Frame,
-    ) -> Result<Landing> {
+    ) -> Result<Option<Landing>> {
         let reference = before.motion_sample(self.c)?;
         let mut departed = false;
         let mut small = None;
@@ -198,17 +197,19 @@ impl Game<'_> {
         while start.elapsed() < sec(self.c.f("settle_timeout_s")) {
             if self.ctl.state().stopped {
                 outcome.result = "stopped";
-                return Ok(outcome);
+                return Ok(Some(outcome));
             }
             if self.ctl.generation() != g {
                 if self.status["state"] != "pausing" {
                     self.report("pausing", json!({}))
                 }
                 if !w.is_foreground() {
-                    return Ok(outcome);
+                    return Ok(Some(Landing::default()));
                 }
             }
-            let frame = w.capture(self.mode)?;
+            let Some(frame) = self.recognition_frame(w)? else {
+                return Ok(None);
+            };
             let current = frame.motion_sample(self.c)?;
             let mean_diff = |a: &[u8], b: &[u8]| {
                 a.iter()
@@ -273,7 +274,9 @@ impl Game<'_> {
                 if self.ctl.guard(g, true).is_err() {
                     break;
                 }
-                let f = w.capture(self.mode)?;
+                let Some(f) = self.recognition_frame(w)? else {
+                    return Ok(None);
+                };
                 if self.screen.button(&f)?.is_some_and(|(dead, _)| dead) {
                     outcome.result = "dead";
                     outcome.score = self.screen.score(&f, self.c);
@@ -287,12 +290,11 @@ impl Game<'_> {
             }
         }
         outcome.result = score_verdict(outcome.result, previous, outcome.score);
-        if self.ctl.state().stopped && outcome.result == "unknown" {
-            outcome.result = "stopped";
-            outcome.score = None
+        if !w.still_current()? {
+            return Ok(None);
         }
         outcome.score_ms = t.elapsed().as_secs_f64() * 1000.;
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 }
 fn score_verdict(observed: &'static str, previous: Option<i32>, now: Option<i32>) -> &'static str {
@@ -361,16 +363,10 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
     let find = || Window::find(cfg, (1, 1))?.ok_or_else(|| "未找到游戏窗口".to_string());
     let g = game.ctl.generation();
     let mut w = find()?;
-    if o.probe && !o.dry_run && !o.no_activate {
-        let resized = {
-            let _guard = game.ctl.guard(g, true)?;
-            w.resize_to_config(cfg)?
-        };
-        if resized {
-            game.ctl.sleep(g, ms(120.));
-            w = find()?
-        }
-    }
+    let raw_frame = |w: &Window| {
+        w.capture(game.mode)?
+            .ok_or_else(|| "客户区已变化，取消本次诊断".to_string())
+    };
     if !o.dry_run && !o.no_activate && !o.background {
         {
             let _guard = game.ctl.guard(g, true)?;
@@ -381,11 +377,12 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
     }
     if let Some(xy) = &o.click_xy {
         let (x, y) = xy.split_once(',').ok_or("click-xy 需要两个比例")?;
-        let frame = w.capture(game.mode)?;
+        drop(game.ctl.guard(g, true)?);
+        let frame = raw_frame(&w)?.for_recognition(cfg)?;
         if frame.modal(cfg) {
             return Err("弹窗遮挡，取消探测点击".into());
         }
-        if !game.press(
+        if game.press(
             &w,
             g,
             (
@@ -393,7 +390,8 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                 y.parse().map_err(|_| "y 无效")?,
             ),
             60.,
-        )? {
+        )? != PressOutcome::Sent
+        {
             return Err("控制请求已取消探测点击".into());
         }
         game.ctl.sleep(g, ms(400.));
@@ -411,8 +409,9 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
             game.vision.reset_prior()
         }
         w = fresh;
-        let mut f = w.capture(game.mode)?;
+        let raw = raw_frame(&w)?;
         if o.dry_run || jump {
+            let mut f = raw.for_recognition(cfg)?;
             let mut d = game.vision.detect(&f)?;
             if i == 0 && jump {
                 let first = d.target.as_ref().map(|t| (t.x, t.y));
@@ -426,7 +425,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                 game.ctl
                     .sleep(g, ms(cfg.f("acquire_poll_ms")).max(game.frame_period));
                 drop(game.ctl.guard(g, true)?);
-                f = w.capture(game.mode)?;
+                f = raw_frame(&w)?.for_recognition(cfg)?;
                 d = game.vision.detect(&f)?;
                 if game.screen.button(&f)?.is_some()
                     || f.modal(cfg)
@@ -440,7 +439,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                     .as_f64()
                     .ok_or("无法确认棋子和目标")?;
                 let duration = if o.hold_ms > 0. { o.hold_ms } else { hold };
-                if !game.press(
+                if game.press(
                     &w,
                     g,
                     (cfg.at("press_point", 0), cfg.at("press_point", 1)),
@@ -448,7 +447,8 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                         cfg.f("press_duration_min_ms"),
                         cfg.f("press_duration_max_ms"),
                     ),
-                )? {
+                )? != PressOutcome::Sent
+                {
                     return Err("控制请求已取消试跳".into());
                 }
             }
@@ -467,7 +467,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
             } else {
                 format!("sample_{i:03}.png")
             };
-            game.ensure_artifact(&name, &f)?
+            game.ensure_artifact(&name, &raw)?
         }
         if i + 1 < count {
             game.ctl.sleep(
@@ -521,8 +521,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut previous_center = None;
     let mut attempts = 0;
     let mut rejects = 0;
-    let mut blind = 0;
-    let mut last_hold = 0.;
+    let mut blind = Some(0);
+    let mut last_hold: f64 = 0.;
     let adaptive = !o.calibrate && cfg.f("gamma") > 0.;
     let mut last_error = None;
     let mut acquisition = Instant::now();
@@ -536,15 +536,15 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut warned = false;
     let limit = cfg.0["max_jumps"].as_u64().unwrap();
     let end = loop {
-        let Some((w, g)) = window.take() else {
-            break End::Stopped;
-        };
         if game.ctl.state().stopped {
             break End::Stopped;
         }
-        if limit != 0 && records.index >= limit {
+        if limit != 0 && records.index >= limit && !game.ctl.state().pause {
             break End::Finished("达到最大跳跃次数");
         }
+        let g = window
+            .as_ref()
+            .map_or_else(|| game.ctl.generation(), |(_, g)| *g);
         let interrupted = game.ctl.guard(g, true).is_err();
         let fresh = if interrupted {
             None
@@ -552,9 +552,12 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             Window::find(cfg, (1, 1))?
         };
         if interrupted
-            || fresh
+            || window
                 .as_ref()
-                .is_none_or(|f| !same_window(f, &w) || (!o.background && !f.is_foreground()))
+                .zip(fresh.as_ref())
+                .is_none_or(|((w, _), f)| {
+                    !same_window(f, w) || (!o.background && !f.is_foreground())
+                })
         {
             let missing = !interrupted && fresh.is_none();
             baseline = true;
@@ -562,7 +565,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             previous_center = None;
             attempts = 0;
             rejects = 0;
-            blind = 0;
             ema = 0.;
             last_hold = 0.;
             pressed_button = None;
@@ -573,6 +575,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             } else {
                 Some(sec(cfg.f("window_wait_s")))
             };
+            // Reacquisition starts from a fresh board, including after a pause.
+            // Allow blind retries only after a new target passes both frame checks.
+            blind = None;
             window = game.gate(false, timeout)?;
             if window.is_none() && !game.ctl.state().stopped {
                 if o.daemon && missing {
@@ -585,6 +590,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             warned = false;
             continue;
         }
+        // Taking the snapshot invalidates the plan unless this iteration explicitly keeps it.
+        let (w, g) = window.take().unwrap();
         let clock = game.ctl.clock();
         if cfg.f("max_runtime_s") > 0.
             && clock.saturating_sub(active_start) >= sec(cfg.f("max_runtime_s"))
@@ -595,8 +602,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             eprintln!("已有 90 秒未完成一跳，请检查窗口");
             warned = true;
         }
-        let f = match w.capture(game.mode) {
-            Ok(frame) => frame,
+        let f = match game.recognition_frame(&w) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
             Err(reason) => {
                 game.report(
                     "blocked_modal",
@@ -621,10 +629,15 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 "acquiring",
                 json!({"game_state":if dead{"game_over"}else{"start_page"}}),
             );
-            if pressed_button != Some(dead)
-                && game.press(&w, g, (p[0] / f.width as f64, p[1] / f.height as f64), 60.)?
-            {
-                pressed_button = Some(dead)
+            if pressed_button != Some(dead) {
+                match game.press(&w, g, (p[0] / f.width as f64, p[1] / f.height as f64), 60.)? {
+                    PressOutcome::Sent => pressed_button = Some(dead),
+                    PressOutcome::WindowChanged => continue,
+                    PressOutcome::Suppressed => {
+                        window = Some((w, g));
+                        continue;
+                    }
+                }
             }
             attempts += 1;
             if attempts >= cfg.i("detect_retry_limit") {
@@ -674,7 +687,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 continue;
             }
             attempts = 0;
-            blind = 0;
             let (axis, mut dist, cross) =
                 axis_components(t.x - p.x, t.y - p.y, cfg.f("axis_slope"));
             if dist <= 0.
@@ -694,6 +706,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 continue;
             }
             rejects = 0;
+            blind = Some(0);
             if cfg.f("low_ratio_trim_ratio") > 0.
                 && t.top_width < cfg.f("low_ratio_gate") * t.bbox[2] as f64
             {
@@ -741,10 +754,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if d.piece.is_none() && cfg.b("piece_skin_shape_enabled") {
                 return Err("无法可靠识别人物或皮肤，已停止".into());
             }
-            if blind >= cfg.i("blind_jump_limit") {
+            let Some(used) = blind.as_mut().filter(|n| **n < cfg.i("blind_jump_limit")) else {
                 return Err("识别重试次数已用尽".into());
-            }
-            blind += 1;
+            };
+            *used += 1;
             attempts = 0;
             let hold = if last_hold > 0. { last_hold } else { k * 270. };
             (
@@ -758,20 +771,32 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             )
         };
         let acquire = acquisition.elapsed().as_secs_f64() * 1000.;
-        if !game.press(
+        match game.press(
             &w,
             g,
             (cfg.at("press_point", 0), cfg.at("press_point", 1)),
             hold,
         )? {
-            window = Some((w, g));
-            continue;
+            PressOutcome::Sent => (),
+            PressOutcome::WindowChanged => continue,
+            PressOutcome::Suppressed => {
+                window = Some((w, g));
+                continue;
+            }
         }
         game.vision.reset_prior();
         previous_center = None;
         game.report("landing", json!({"last_hold_ms":hold,"last_dist_px":dist}));
         let land_start = Instant::now();
-        let (landed, settle_error) = Landing::after_input(game.settle(&w, g, records.prev, &f));
+        let observation = game.settle(&w, g, records.prev, &f);
+        let changed = matches!(observation, Ok(None));
+        let (mut landed, settle_error) = Landing::after_input(
+            observation.and_then(|o| o.ok_or_else(|| "落地观测期间客户区已变化".to_string())),
+        );
+        if game.ctl.state().stopped && landed.result == "unknown" {
+            landed.result = "stopped";
+            landed.score = None;
+        }
         let landing_ms = (land_start.elapsed().as_secs_f64() * 1000. - landed.score_ms).max(0.);
         let t = pair.map(|(_, t)| t);
         let err = if landed.result == "landed" {
@@ -911,6 +936,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         );
         if game.ctl.state().stopped {
             break End::Stopped;
+        }
+        if changed {
+            continue;
         }
         if outcome.result == "unknown"
             && game.ctl.guard(g, true).is_ok()

@@ -226,18 +226,16 @@ impl Window {
         self.hwnd as HWND
     }
 
-    fn check_window(&self) -> Result<()> {
+    pub(crate) fn still_current(&self) -> Result<bool> {
+        let _dpi = PhysicalPixels::enter()?;
         let hwnd = self.handle();
         if unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
             || pid(hwnd) != self.pid
             || title(hwnd) != self.title
         {
-            return Err("目标窗口已关闭、最小化或更换".into());
+            return Ok(false);
         }
-        if client_rect(hwnd)? != self.client_rect {
-            return Err("客户区已移动或变更大小，请重新定位和截图".into());
-        }
-        Ok(())
+        Ok(client_rect(hwnd)? == self.client_rect)
     }
 
     pub fn is_foreground(&self) -> bool {
@@ -247,7 +245,9 @@ impl Window {
     /// One foreground request. The owner handles countdown, retries and pause.
     pub fn activate(&self) -> Result<()> {
         let _dpi = PhysicalPixels::enter()?;
-        self.check_window()?;
+        if !self.still_current()? {
+            return Err("目标窗口已改变".into());
+        }
         if !self.is_foreground() && !no_input() {
             unsafe { SetForegroundWindow(self.handle()) };
         }
@@ -256,57 +256,6 @@ impl Window {
         } else {
             Err("请将游戏窗口切到前台".into())
         }
-    }
-
-    /// After a resize the owner must find the window again before capturing it.
-    pub fn resize_to_config(&self, cfg: &Config) -> Result<bool> {
-        if cfg.s("window_size_policy") != "auto" || no_input() {
-            return Ok(false);
-        }
-        let _dpi = PhysicalPixels::enter()?;
-        self.check_window()?;
-        let width = cfg.i("window_ref_width");
-        let height = cfg.i("window_ref_height");
-        let tolerance = cfg.i("window_size_tol_px").max(0) as u64;
-        if width <= 0 || height <= 0 {
-            return Err("标定尺寸必须为正数".into());
-        }
-        if width.abs_diff(self.width() as i64) <= tolerance
-            && height.abs_diff(self.height() as i64) <= tolerance
-        {
-            return Ok(false);
-        }
-        let mut outer = RECT::default();
-        if unsafe { GetWindowRect(self.handle(), &mut outer) } == 0 {
-            return Err(os_error("GetWindowRect"));
-        }
-        let adjust = |target: i64, client: usize, left: i32, right: i32| {
-            let border = i64::from(right) - i64::from(left) - client as i64;
-            target
-                .checked_add(border)
-                .and_then(|n| i32::try_from(n).ok())
-                .filter(|n| *n > 0)
-                .ok_or("标定尺寸超出 Windows 范围")
-        };
-        let cx = adjust(width, self.width(), outer.left, outer.right)?;
-        let cy = adjust(height, self.height(), outer.top, outer.bottom)?;
-        if unsafe {
-            SetWindowPos(
-                self.handle(),
-                null_mut(),
-                0,
-                0,
-                cx,
-                cy,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
-            )
-        } == 0
-        {
-            return Err(os_error("SetWindowPos"));
-        }
-        // A queued resize may be ignored by a fixed-size window. Only restart
-        // the owner's countdown when the observed geometry actually changed.
-        Ok(client_rect(self.handle())? != self.client_rect)
     }
 
     fn check_screen(&self) -> Result<()> {
@@ -336,9 +285,11 @@ impl Window {
 
     /// Screen reads visible desktop pixels. PrintWindow requests client pixels
     /// from the target itself and can be used when the desktop is occluded.
-    pub fn capture(&self, mode: CaptureMode) -> Result<Frame> {
+    pub fn capture(&self, mode: CaptureMode) -> Result<Option<Frame>> {
         let _dpi = PhysicalPixels::enter()?;
-        self.check_window()?;
+        if !self.still_current()? {
+            return Ok(None);
+        }
         if mode == CaptureMode::Screen {
             self.check_screen()?;
         }
@@ -368,7 +319,7 @@ impl Window {
                 };
                 ReleaseDC(null_mut(), screen);
                 result
-            })?,
+            }),
             CaptureMode::PrintWindow => {
                 const PW_RENDERFULLCONTENT: u32 = 2;
                 let print = |flags| {
@@ -383,16 +334,18 @@ impl Window {
                 // Some Windows desktops report success for full-content rendering
                 // while returning a black surface. Request the plain client DC there.
                 match print(PW_CLIENTONLY | PW_RENDERFULLCONTENT) {
-                    Ok(frame) if frame.bgr.iter().any(|&byte| byte != 0) => frame,
-                    _ => print(PW_CLIENTONLY)?,
+                    Ok(frame) if frame.bgr.iter().any(|&byte| byte != 0) => Ok(frame),
+                    _ => print(PW_CLIENTONLY),
                 }
             }
         };
-        self.check_window()?;
+        if !self.still_current()? {
+            return Ok(None);
+        }
         if mode == CaptureMode::Screen {
             self.check_screen()?;
         }
-        Ok(frame)
+        frame.map(Some)
     }
 
     /// The admission callback returns the parent's locked control guard after
@@ -419,22 +372,16 @@ impl Window {
                 if no_input() {
                     return Err("JUMPBOT_NO_INPUT 已禁止按压".into());
                 }
-                self.check_window()?;
                 let cx = (point.0 * self.width() as f64) as i32;
                 let cy = (point.1 * self.height() as f64) as i32;
-                if background {
+                let target = if background {
                     if cx > i16::MAX as i32 || cy > i16::MAX as i32 {
                         return Err("后台按压点超出 Windows 消息范围".into());
                     }
-                    let target = ButtonTarget::Client(self.handle(), ((cy << 16) | cx) as LPARAM);
-                    target.post(WM_MOUSEMOVE, 0)?;
-                    Ok(target)
+                    ButtonTarget::Client(self.handle(), ((cy << 16) | cx) as LPARAM)
                 } else {
                     let x = self.client_rect[0] + cx;
                     let y = self.client_rect[1] + cy;
-                    if !self.is_foreground() || !point_is_target(self.handle(), POINT { x, y }) {
-                        return Err("游戏窗口不在前台或按压点被遮挡".into());
-                    }
                     let absolute = |p: i32, origin, extent| {
                         let start = unsafe { GetSystemMetrics(origin) };
                         let size = i64::from(unsafe { GetSystemMetrics(extent) });
@@ -444,17 +391,35 @@ impl Window {
                         }
                         Ok(((2 * offset + 1) * 32768 / size) as i32)
                     };
-                    Ok(ButtonTarget::Desktop(
+                    ButtonTarget::Desktop(
                         absolute(x, SM_XVIRTUALSCREEN, SM_CXVIRTUALSCREEN)?,
                         absolute(y, SM_YVIRTUALSCREEN, SM_CYVIRTUALSCREEN)?,
-                    ))
+                    )
+                };
+                let visible = background
+                    || (self.is_foreground()
+                        && point_is_target(
+                            self.handle(),
+                            POINT {
+                                x: self.client_rect[0] + cx,
+                                y: self.client_rect[1] + cy,
+                            },
+                        ));
+                if !self.still_current()? {
+                    return Ok(None);
                 }
+                if !visible {
+                    return Err("游戏窗口不在前台或按压点被遮挡".into());
+                }
+                if background {
+                    target.post(WM_MOUSEMOVE, 0)?;
+                }
+                Ok(Some(target))
             },
             ButtonTarget::down,
             ButtonTarget::up,
             || hold_precise(duration),
-        )?;
-        Ok(PressOutcome::Sent)
+        )
     }
 }
 
@@ -467,6 +432,7 @@ pub enum CaptureMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressOutcome {
     Sent,
+    WindowChanged,
     Suppressed,
 }
 
@@ -677,13 +643,15 @@ impl<F: FnOnce() -> Result<()>> Drop for Release<F> {
 
 fn dispatch_press<G, T>(
     admit: impl FnOnce() -> Result<G>,
-    prepare: impl FnOnce() -> Result<T>,
+    prepare: impl FnOnce() -> Result<Option<T>>,
     down: impl FnOnce(&T) -> Result<()>,
     up: impl FnOnce(&T) -> Result<()>,
     hold: impl FnOnce(),
-) -> Result<()> {
+) -> Result<PressOutcome> {
     let guard = admit()?;
-    let target = prepare()?;
+    let Some(target) = prepare()? else {
+        return Ok(PressOutcome::WindowChanged);
+    };
     let mut release = Release(Some(|| up(&target)));
     let started = down(&target);
     drop(guard);
@@ -691,7 +659,7 @@ fn dispatch_press<G, T>(
         hold();
     }
     release.0.take().unwrap()()?;
-    started
+    started.map(|_| PressOutcome::Sent)
 }
 
 fn hold_precise(duration: Duration) {
@@ -887,6 +855,33 @@ mod tests {
                 client_rect: client_rect(hwnd).unwrap(),
             };
             assert_eq!(window.title, caption);
+            // Only this private fixture window moves. Its old capture must be discarded
+            // even when the HWND and PID are unchanged.
+            assert_ne!(
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    35,
+                    32,
+                    110,
+                    70,
+                    SWP_NOACTIVATE | SWP_NOZORDER
+                ),
+                0
+            );
+            assert!(window.capture(CaptureMode::PrintWindow).unwrap().is_none());
+            assert_ne!(
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    30,
+                    30,
+                    90,
+                    60,
+                    SWP_NOACTIVATE | SWP_NOZORDER
+                ),
+                0
+            );
             assert!(window.unobscured());
             let overlay = make_window(
                 "Click-through overlay",
@@ -979,7 +974,7 @@ mod tests {
         let phase = Cell::new(0);
         dispatch_press(
             || Ok(lock.lock().unwrap()),
-            || Ok(()),
+            || Ok(Some(())),
             |_| {
                 assert!(lock.try_lock().is_err());
                 phase.set(1);
@@ -997,9 +992,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(phase.get(), 3);
+        let moved = dispatch_press(
+            || Ok(()),
+            || Ok(None::<()>),
+            |_| panic!("stale down"),
+            |_| panic!("unowned release"),
+            || panic!("stale hold"),
+        );
+        assert_eq!(moved, Ok(PressOutcome::WindowChanged));
         let denied = dispatch_press(
             || Err::<(), _>("paused".into()),
-            || -> Result<()> { panic!() },
+            || -> Result<Option<()>> { panic!() },
             |_| panic!(),
             |_| panic!(),
             || panic!(),
@@ -1016,7 +1019,7 @@ mod tests {
         };
         let failed = dispatch_press(
             || Ok(()),
-            || Ok(()),
+            || Ok(Some(())),
             |_| Err("down failed".into()),
             up,
             || panic!(),
@@ -1025,7 +1028,7 @@ mod tests {
         assert_eq!(releases.get(), 1);
         assert!(catch_unwind(AssertUnwindSafe(|| dispatch_press(
             || Ok(()),
-            || Ok(()),
+            || Ok(Some(())),
             |_| Ok(()),
             up,
             || panic!("interrupted hold")
