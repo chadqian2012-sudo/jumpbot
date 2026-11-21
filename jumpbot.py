@@ -3078,15 +3078,18 @@ def start_console_watcher() -> None:
 def _desktop_command_watcher() -> None:
     control = _CONTROL
     try:
-        for line in sys.stdin:
-            command = line.rstrip("\r\n")
-            with control.lock:
-                if control.stopped or command == "stop":
-                    break
-                if (command in ("pause", "resume") and
-                        (command == "pause" or control.hotkey_registered) and
-                        control.pause_requested != (command == "pause")):
-                    control.toggle("desktop")
+        # A daemon blocked in BufferedReader can hold its lock during Python
+        # shutdown when F8 stops the run before the desktop closes the pipe.
+        with open(sys.stdin.fileno(), "rb", buffering=0, closefd=False) as pipe:
+            for line in pipe:
+                command = line.rstrip(b"\r\n")
+                with control.lock:
+                    if control.stopped or command == b"stop":
+                        break
+                    if (command in (b"pause", b"resume") and
+                            (command == b"pause" or control.hotkey_registered) and
+                            control.pause_requested != (command == b"pause")):
+                        control.toggle("desktop")
     finally:
         control.stop("用户停止（桌面控制台）")
 
@@ -3140,7 +3143,9 @@ def control_ready_window(cfg: Config, initial: bool = False,
     countdown = None
     countdown_hwnd = None
     next_report = 0.0
-    log(f"等待你手动打开微信「跳一跳」；{control.hotkey} 暂停/恢复，F8 / q / Esc 停止")
+    pause_controls = "桌面按钮" if _DESKTOP_PIPE else "控制台 P"
+    stop_keys = "F8" if _DESKTOP_PIPE else "F8 / q / Esc"
+    log(f"等待你手动打开微信「跳一跳」；{control.hotkey} / {pause_controls} 暂停/恢复，{stop_keys} 停止")
     while True:
         if poll_stop_key():
             raise ControlInterrupted(control.stop_reason)
@@ -3148,11 +3153,11 @@ def control_ready_window(cfg: Config, initial: bool = False,
             new_pause = control.paused_at is None
             control.acknowledge_pause()
             if new_pause or time.monotonic() >= next_report:
-                status_write(state="paused", alive=True, stop_reason=f"已暂停；{control.hotkey} / 控制台 P 恢复",
+                status_write(state="paused", alive=True, stop_reason=f"已暂停；{control.hotkey} / {pause_controls} 恢复",
                              countdown_s=None, stuck_s=0)
                 next_report = time.monotonic() + 1.0
             if new_pause and control.paused_at is not None:
-                log(f"已暂停，鼠标已释放；可以做其他事情。{control.hotkey} / 控制台 P 恢复，F8 停止")
+                log(f"已暂停，鼠标已释放；可以做其他事情。{control.hotkey} / {pause_controls} 恢复，F8 停止")
             control.changed.wait(0.05)
             control.changed.clear()
             countdown = None
@@ -4802,10 +4807,13 @@ def main(argv=None) -> int:
         _CONTROL = RunControl(live_cfg.pause_hotkey, notify=control_event)
         listener = WindowsHotkeyListener(_CONTROL, poll_stop_key)
         if listener.start():
-            log(f"全局暂停/恢复：{live_cfg.pause_hotkey}；控制台 P 也可切换；停止键保持不变")
+            pause_controls = "桌面按钮" if _DESKTOP_PIPE else "控制台 P"
+            log(f"全局暂停/恢复：{live_cfg.pause_hotkey}；{pause_controls}也可切换")
         else:
+            recovery = ("请从桌面窗口停止脚本，释放快捷键后重新启动。" if _DESKTOP_PIPE else
+                        "可在本控制台按 P 继续，或修改 --pause-hotkey 后重启。")
             log(f"暂停热键未启用：{_CONTROL.hotkey_error}。保持暂停，不发输入；"
-                "可在本控制台按 P 继续，或修改 --pause-hotkey 后重启。")
+                f"{recovery}")
         start_console_watcher()
         if not args.no_dashboard:
             spawn_dashboard()      # 实时状态面板（独立控制台窗口，失败不影响运行）

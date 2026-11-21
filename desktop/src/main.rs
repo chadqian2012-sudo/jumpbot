@@ -146,6 +146,10 @@ impl Session {
     fn stop(&mut self) {
         // EOF requests cooperative stop, including on unexpected host exit.
         self.child.stdin.take();
+        if self.selftest {
+            // Selftest never opens a game window or owns mouse input.
+            let _ = self.child.kill();
+        }
     }
 
     fn send(&mut self, command: &[u8]) -> std::io::Result<()> {
