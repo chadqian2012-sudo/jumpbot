@@ -5,7 +5,6 @@ use std::{
 
 fn main() {
     println!("cargo:rerun-if-env-changed=JUMPBOT_OPENCV_DIR");
-    println!("cargo:rerun-if-changed=native");
     let sdk = env::var_os("JUMPBOT_OPENCV_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/cv-sdk"));
@@ -42,24 +41,4 @@ fn main() {
             fs::copy(&dll, &dest).expect("stage OpenCV runtime");
         }
     }
-    let mut compiler = cc::Build::new();
-    compiler
-        .cpp(true)
-        .std("c++17")
-        .flag_if_supported("/EHsc")
-        .flag_if_supported("/utf-8")
-        .include(sdk.join("include"));
-    let mut sources: Vec<_> = fs::read_dir("native")
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "cpp"))
-        .collect();
-    sources.sort();
-    compiler.files(sources).compile("jumpbot_cv");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        vc.join("lib").display()
-    );
-    println!("cargo:rustc-link-lib=dylib={stem}");
 }

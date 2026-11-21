@@ -1,5 +1,5 @@
 [workspace]
-members = ["vision"]
+members = ["vision", "dist-tool", "qa-tools"]
 resolver = "2"
 
 [package]
@@ -16,13 +16,15 @@ opencl = []
 
 [dependencies]
 jumpbot-vision = {path = "vision"}
+opencv = {version = "0.102", default-features = false, features = ["imgproc", "imgcodecs", "clang-runtime"]}
+image = {version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"]}
+rustfft = "6"
 tempfile = "3"
-windows-sys = {version = "0.61", features=["Win32_Foundation","Win32_Security","Win32_System_Threading","Win32_System_Console","Win32_Graphics_Gdi","Win32_Graphics_Dwm","Win32_Storage_Xps","Win32_UI_HiDpi","Win32_UI_Input_KeyboardAndMouse","Win32_UI_WindowsAndMessaging"]}
+windows-sys = {version = "0.61", features=["Win32_Foundation","Win32_Security","Win32_System_LibraryLoader","Win32_System_Registry","Win32_UI_Controls","Win32_System_Threading","Win32_System_Diagnostics_ToolHelp","Win32_System_Console","Win32_Graphics_Gdi","Win32_Graphics_Dwm","Win32_Storage_Xps","Win32_UI_HiDpi","Win32_UI_Input_KeyboardAndMouse","Win32_UI_WindowsAndMessaging"]}
 ctrlc = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tao = "0.37"
-wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_System_Ole", "Win32_System_Variant"] }
 regex = "1"
 crc32fast = "1"
 libloading = "0.8"
@@ -30,9 +32,6 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 glob = "0.3"
-
-[build-dependencies]
-cc = "1"
 
 [profile.release]
 lto = "thin"

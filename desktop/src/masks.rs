@@ -1,4 +1,5 @@
 use crate::{Config, Frame};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 use std::{
     env,
     time::{Duration, Instant},
@@ -7,6 +8,7 @@ use std::{
 #[cfg(target_arch = "x86_64")]
 #[path = "../native/masks_avx2.rs"]
 mod avx2;
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 #[path = "../native/masks_gpu.rs"]
 mod gpu;
 
@@ -202,15 +204,21 @@ enum Mode {
 pub struct Masks {
     mode: Mode,
     simd: bool,
+    ratios: [f64; 2],
+    table: Tables,
+    last: &'static str,
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
+    gpu: GpuSelection,
+}
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+struct GpuSelection {
     cuda: bool,
     opencl: bool,
     selector: String,
-    ratios: [f64; 2],
-    table: Tables,
     // None until the first real frame can be used for device validation.
     devices: Option<Vec<gpu::Device>>,
     chosen: Option<usize>,
-    last: &'static str,
     calls: u64,
     cpu_ms: f64,
     samples: Vec<f64>,
@@ -235,26 +243,31 @@ impl Masks {
         let simd = mode != Mode::Cpu && cfg.b("masks_simd") && is_x86_feature_detected!("avx2");
         #[cfg(not(target_arch = "x86_64"))]
         let simd = false;
+        #[cfg(any(feature = "cuda", feature = "opencl"))]
         let enabled =
             |key: &str, disable: &str| cfg.b(key) && env::var(disable).as_deref() != Ok("1");
         Self {
             mode,
             simd,
-            cuda: cfg!(feature = "cuda") && enabled("cuda_enabled", "JUMPBOT_DISABLE_CUDA"),
-            opencl: cfg!(feature = "opencl") && enabled("opencl_enabled", "JUMPBOT_DISABLE_OPENCL"),
-            selector: if cfg.s("opencl_device").is_empty() {
-                env::var("JUMPBOT_OPENCL_DEVICE").unwrap_or_default()
-            } else {
-                cfg.s("opencl_device").into()
-            },
             ratios: [cfg.f("top_bar_ratio"), 1. - cfg.f("bottom_bar_ratio")],
             table: tables(cfg),
-            devices: None,
-            chosen: None,
             last: if simd { "simd" } else { "cpu" },
-            calls: 0,
-            cpu_ms: 0.,
-            samples: Vec::new(),
+            #[cfg(any(feature = "cuda", feature = "opencl"))]
+            gpu: GpuSelection {
+                cuda: cfg!(feature = "cuda") && enabled("cuda_enabled", "JUMPBOT_DISABLE_CUDA"),
+                opencl: cfg!(feature = "opencl")
+                    && enabled("opencl_enabled", "JUMPBOT_DISABLE_OPENCL"),
+                selector: if cfg.s("opencl_device").is_empty() {
+                    env::var("JUMPBOT_OPENCL_DEVICE").unwrap_or_default()
+                } else {
+                    cfg.s("opencl_device").into()
+                },
+                devices: None,
+                chosen: None,
+                calls: 0,
+                cpu_ms: 0.,
+                samples: Vec::new(),
+            },
         }
     }
 
@@ -262,23 +275,24 @@ impl Masks {
         self.last
     }
 
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
     fn select(&mut self, f: &Frame, rows: [usize; 2]) {
-        if self.devices.is_none() {
+        if self.gpu.devices.is_none() {
             let mut devices = Vec::new();
-            if self.cuda && matches!(self.mode, Mode::Auto | Mode::Cuda) {
+            if self.gpu.cuda && matches!(self.mode, Mode::Auto | Mode::Cuda) {
                 match gpu::Device::cuda(&self.table) {
                     Ok(d) => devices.push(d),
                     Err(e) => eprintln!("CUDA: {e}"),
                 }
             }
-            if self.opencl && matches!(self.mode, Mode::Auto | Mode::Opencl) {
-                devices.extend(gpu::opencl_devices(&self.selector, &self.table));
+            if self.gpu.opencl && matches!(self.mode, Mode::Auto | Mode::Opencl) {
+                devices.extend(gpu::opencl_devices(&self.gpu.selector, &self.table));
             }
-            self.devices = Some(devices);
+            self.gpu.devices = Some(devices);
         }
-        self.chosen = None;
-        self.samples.clear();
-        let devices = self.devices.as_mut().unwrap();
+        self.gpu.chosen = None;
+        self.gpu.samples.clear();
+        let devices = self.gpu.devices.as_mut().unwrap();
         if devices.is_empty() {
             return;
         }
@@ -286,13 +300,13 @@ impl Masks {
         let expected = cpu(f, &bg, &self.table, rows, false);
         let mut best = f64::INFINITY;
         if self.mode == Mode::Auto {
-            self.cpu_ms =
+            self.gpu.cpu_ms =
                 benchmark(|| Ok(cpu(f, &background(f), &self.table, rows, self.simd))).unwrap();
-            best = self.cpu_ms / 1.5;
+            best = self.gpu.cpu_ms / 1.5;
             eprintln!(
                 "{}: {:.3} ms",
                 if self.simd { "SIMD" } else { "CPU" },
-                self.cpu_ms
+                self.gpu.cpu_ms
             );
         }
         devices.retain_mut(|device| {
@@ -317,11 +331,12 @@ impl Masks {
         for (index, device) in devices.iter().enumerate() {
             if device.ms <= best {
                 best = device.ms;
-                self.chosen = Some(index);
+                self.gpu.chosen = Some(index);
             }
         }
         if self.mode == Mode::Auto {
             let selected = self
+                .gpu
                 .chosen
                 .map(|i| devices[i].name.as_str())
                 .unwrap_or(if self.simd { "SIMD" } else { "CPU" });
@@ -341,31 +356,35 @@ impl Masks {
             let index = (r * f.height as f64).round_ties_even() as i64;
             (if index < 0 { h + index } else { index }).clamp(0, h) as usize
         });
-        if matches!(self.mode, Mode::Auto | Mode::Cuda | Mode::Opencl)
-            && (self.devices.is_none()
-                || (self.mode == Mode::Auto && self.calls.is_multiple_of(300)))
-        {
-            self.select(f, rows);
-        }
-        self.calls = self.calls.wrapping_add(1);
-        let start = Instant::now();
+        #[cfg(any(feature = "cuda", feature = "opencl"))]
+        let start = {
+            if matches!(self.mode, Mode::Auto | Mode::Cuda | Mode::Opencl)
+                && (self.gpu.devices.is_none()
+                    || (self.mode == Mode::Auto && self.gpu.calls.is_multiple_of(300)))
+            {
+                self.select(f, rows);
+            }
+            self.gpu.calls = self.gpu.calls.wrapping_add(1);
+            Instant::now()
+        };
         let bg = background(f);
-        if let Some(i) = self.chosen {
-            let devices = self.devices.as_mut().unwrap();
+        #[cfg(any(feature = "cuda", feature = "opencl"))]
+        if let Some(i) = self.gpu.chosen {
+            let devices = self.gpu.devices.as_mut().unwrap();
             let d = &mut devices[i];
             match d.compute(f, &bg, rows) {
                 Ok(pair) => {
                     self.last = d.kind();
                     if self.mode == Mode::Auto {
-                        if self.samples.len() == 20 {
-                            self.samples.remove(0);
+                        if self.gpu.samples.len() == 20 {
+                            self.gpu.samples.remove(0);
                         }
-                        self.samples.push(start.elapsed().as_secs_f64() * 1000.);
-                        if self.samples.len() >= 10 {
-                            let mut sorted = self.samples.clone();
+                        self.gpu.samples.push(start.elapsed().as_secs_f64() * 1000.);
+                        if self.gpu.samples.len() >= 10 {
+                            let mut sorted = self.gpu.samples.clone();
                             sorted.sort_unstable_by(f64::total_cmp);
-                            if sorted[sorted.len() / 2] > (2. * self.cpu_ms).max(30.) {
-                                self.chosen = None;
+                            if sorted[sorted.len() / 2] > (2. * self.gpu.cpu_ms).max(30.) {
+                                self.gpu.chosen = None;
                                 eprintln!("{} slowed down; switching to CPU", d.name);
                             }
                         }
@@ -375,7 +394,7 @@ impl Masks {
                 Err(e) => {
                     eprintln!("{} failed: {e}; retrying on CPU", d.name);
                     devices.remove(i);
-                    self.chosen = None;
+                    self.gpu.chosen = None;
                 }
             }
         }
@@ -384,6 +403,7 @@ impl Masks {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 fn benchmark(mut run: impl FnMut() -> Result<Pair, String>) -> Result<f64, String> {
     let mut samples = [Duration::ZERO; 5];
     for t in &mut samples {
@@ -397,7 +417,15 @@ fn benchmark(mut run: impl FnMut() -> Result<Pair, String>) -> Result<f64, Strin
 
 /// Entry point for the driver's disposable preflight process, before game/UI initialization.
 pub fn opencl_probe(selector: &str) -> bool {
-    cfg!(feature = "opencl") && gpu::probe(selector, &tables(&Config::default()))
+    #[cfg(feature = "opencl")]
+    {
+        gpu::probe(selector, &tables(&Config::default()))
+    }
+    #[cfg(not(feature = "opencl"))]
+    {
+        let _ = selector;
+        false
+    }
 }
 
 #[cfg(test)]

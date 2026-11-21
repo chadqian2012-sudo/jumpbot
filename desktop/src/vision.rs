@@ -1,6 +1,6 @@
+use crate::regions::{Mask, Regions};
 use crate::{Config, Frame};
 use serde::Serialize;
-use std::{ffi::c_void, mem::MaybeUninit, slice};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Piece {
@@ -31,102 +31,13 @@ pub struct Detection {
     pub block_mask: Vec<u8>,
 }
 
-#[repr(C)]
-struct NativeRegions {
-    labels: *const i32,
-    stats: *const [i32; 5],
-    count: i32,
-    owner: *mut c_void,
-}
-
-extern "C" {
-    fn jb_regions_free(owner: *mut c_void);
-    fn jb_piece_regions(pixels: *const u8, w: i32, h: i32, out: *mut NativeRegions) -> i32;
-    fn jb_block_regions(
-        pixels: *const u8,
-        piece: *const u8,
-        w: i32,
-        h: i32,
-        out: *mut NativeRegions,
-    ) -> i32;
-    fn jb_dot_regions(
-        pixels: *const u8,
-        w: i32,
-        h: i32,
-        bounds: *const i32,
-        min_value: i32,
-        max_sat: i32,
-        out: *mut NativeRegions,
-    ) -> i32;
-    fn jb_piece_score(
-        pixels: *const u8,
-        w: i32,
-        h: i32,
-        bounds: *const i32,
-        tpl: *const u8,
-        tw: i32,
-        th: i32,
-        score: *mut f64,
-    ) -> i32;
-    fn jb_piece_scan(
-        pixels: *const u8,
-        w: i32,
-        h: i32,
-        top: i32,
-        tpl: *const u8,
-        tw: i32,
-        th: i32,
-        x: *mut i32,
-        y: *mut i32,
-        score: *mut f64,
-    ) -> i32;
-}
-
-struct Regions {
-    raw: NativeRegions,
-    width: usize,
-    height: usize,
-}
-
-impl Drop for Regions {
-    fn drop(&mut self) {
-        unsafe { jb_regions_free(self.raw.owner) };
-    }
-}
-
 impl Regions {
-    fn new(
-        width: usize,
-        height: usize,
-        operation: &str,
-        label: impl FnOnce(*mut NativeRegions) -> i32,
-    ) -> Result<Self, String> {
-        let mut raw = MaybeUninit::uninit();
-        if label(raw.as_mut_ptr()) != 0 {
-            return Err(format!("OpenCV {operation} failed"));
-        }
-        // The native labeler owns the two contiguous matrices until Drop.
-        Ok(Self {
-            raw: unsafe { raw.assume_init() },
-            width,
-            height,
-        })
-    }
-
-    fn stats(&self) -> &[[i32; 5]] {
-        unsafe { slice::from_raw_parts(self.raw.stats, self.raw.count as usize) }
-    }
-
-    fn labels(&self) -> &[i32] {
-        unsafe { slice::from_raw_parts(self.raw.labels, self.width * self.height) }
-    }
-
     fn foreground_in(&self, bounds: [i32; 4], silhouette: Option<&[u8]>) -> usize {
         let [x, y, w, h] = bounds.map(|n| n as usize);
         let mut count = 0;
         for row in 0..h {
             let start = (y + row) * self.width + x;
-            let labels = &self.labels()[start..start + w];
+            let labels = &self.labels[start..start + w];
             count += match silhouette {
                 Some(mask) => labels
                     .iter()
@@ -167,7 +78,12 @@ pub(crate) fn segments(row: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ 
     })
 }
 
-fn face_center(parts: &Regions, id: usize, stats: [i32; 5], slope: f64) -> Option<(f64, f64, f64)> {
+pub(crate) fn face_center(
+    parts: &Regions,
+    id: usize,
+    stats: [i32; 5],
+    slope: f64,
+) -> Option<(f64, f64, f64)> {
     let [bx, by, bw, bh, _] = stats.map(|v| v as usize);
     let w = parts.width;
     // Keep screen x coordinates for the clipped-edge rules, and rebase rows at
@@ -177,7 +93,7 @@ fn face_center(parts: &Regions, id: usize, stats: [i32; 5], slope: f64) -> Optio
         let start = (by + row) * w + bx;
         for (dst, &label) in band[bx..bx + bw]
             .iter_mut()
-            .zip(&parts.labels()[start..start + bw])
+            .zip(&parts.labels[start..start + bw])
         {
             *dst = u8::from(label == id as i32);
         }
@@ -282,21 +198,28 @@ fn find_dot_if(
         return Ok(None);
     }
     let (w, h) = (bounds[2] as usize, bounds[3] as usize);
-    let regions = Regions::new(w, h, "center dot components", |out| unsafe {
-        jb_dot_regions(
-            frame.bgr.as_ptr(),
-            frame.width as i32,
-            frame.height as i32,
-            bounds.as_ptr(),
-            cfg.f("center_dot_val_min").ceil() as i32,
-            cfg.f("center_dot_sat_max").floor() as i32,
-            out,
-        )
-    })?;
-    let labels = regions.labels();
+    let min_value = cfg.f("center_dot_val_min").ceil() as i32;
+    let max_sat = cfg.f("center_dot_sat_max").floor() as i32;
+    let mut mask = Vec::with_capacity(w * h);
+    for row in y0..y1 {
+        let start = (row as usize * frame.width + x0 as usize) * 3;
+        for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
+            let v = i32::from(*pixel.iter().max().unwrap());
+            let d = v - i32::from(*pixel.iter().min().unwrap());
+            let divisor = if v == 0 {
+                0
+            } else {
+                ((255 << 12) as f64 / v as f64).round_ties_even() as i32
+            };
+            let saturation = (d * divisor + 2048) >> 12;
+            mask.push(u8::from(v >= min_value && saturation <= max_sat));
+        }
+    }
+    let regions = Mask::from_pixels(&mask, w, h).regions();
+    let labels = &regions.labels;
     let mut nearest = None;
     let mut best_distance = f64::INFINITY;
-    for (id, &[x, y, bw, bh, area]) in regions.stats().iter().enumerate().skip(1) {
+    for (id, &[x, y, bw, bh, area]) in regions.stats.iter().enumerate().skip(1) {
         if (area as f64) < cfg.f("center_dot_min_area")
             || area as f64 > cfg.f("center_dot_max_area")
             || bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64
@@ -369,26 +292,17 @@ fn find_target(
     cfg: &Config,
 ) -> Result<Option<Block>, String> {
     let (w, h) = (frame.width as f64, frame.height as f64);
-    let parts = Regions::new(
+    let parts = Mask::from_pixels(block_mask, frame.width, frame.height).blocks(Mask::from_pixels(
+        piece_mask,
         frame.width,
         frame.height,
-        "block components",
-        |out| unsafe {
-            jb_block_regions(
-                block_mask.as_ptr(),
-                piece_mask.as_ptr(),
-                frame.width as i32,
-                frame.height as i32,
-                out,
-            )
-        },
-    )?;
+    ));
     let slope = cfg.f("axis_slope");
     let min_area = cfg.f("block_min_area_ratio") * (w * h);
     let max_area = cfg.f("block_max_area_ratio") * (w * h);
     let low_gate = cfg.f("low_ratio_gate");
     let mut candidates = Vec::new();
-    for (id, &stats) in parts.stats().iter().enumerate().skip(1) {
+    for (id, &stats) in parts.stats.iter().enumerate().skip(1) {
         let [bx, by, bw, bh, area] = stats;
         let (width, height, a) = (bw as f64, bh as f64, area as f64);
         if a > max_area {
@@ -565,22 +479,7 @@ fn template_score(frame: &Frame, bbox: [i32; 4], templates: &[Frame]) -> Result<
     }
     let mut best: f64 = 0.0;
     for tpl in templates {
-        let mut score = 0.0;
-        let status = unsafe {
-            jb_piece_score(
-                frame.bgr.as_ptr(),
-                frame.width as i32,
-                frame.height as i32,
-                bbox.as_ptr(),
-                tpl.bgr.as_ptr(),
-                tpl.width as i32,
-                tpl.height as i32,
-                &mut score,
-            )
-        };
-        if status != 0 {
-            return Err("OpenCV piece template score failed".into());
-        }
+        let score = crate::template::score(frame, bbox, tpl).map_err(|e| e.to_string())?;
         best = best.max(score);
     }
     Ok(best)
@@ -591,24 +490,7 @@ fn template_scan(frame: &Frame, tpl: &Frame, cfg: &Config) -> Result<Option<Piec
     if tpl.height >= frame.height - top || tpl.width >= frame.width {
         return Ok(None);
     }
-    let (mut x, mut y, mut score) = (0, 0, 0.0);
-    let status = unsafe {
-        jb_piece_scan(
-            frame.bgr.as_ptr(),
-            frame.width as i32,
-            frame.height as i32,
-            top as i32,
-            tpl.bgr.as_ptr(),
-            tpl.width as i32,
-            tpl.height as i32,
-            &mut x,
-            &mut y,
-            &mut score,
-        )
-    };
-    if status != 0 {
-        return Err("OpenCV piece template scan failed".into());
-    }
+    let (x, y, score) = crate::template::scan(frame, top, tpl).map_err(|e| e.to_string())?;
     let foot_y = (y + tpl.height as i32 - 1) as f64;
     if score < cfg.f("piece_scan_min_score")
         || foot_y < cfg.f("piece_min_y_ratio") * frame.height as f64
@@ -712,14 +594,7 @@ impl Vision {
     ) -> Result<Option<Piece>, String> {
         let (w, h) = (frame.width as f64, frame.height as f64);
         let cfg = &self.cfg;
-        let parts = Regions::new(
-            frame.width,
-            frame.height,
-            "piece components",
-            |out| unsafe {
-                jb_piece_regions(pm.as_ptr(), frame.width as i32, frame.height as i32, out)
-            },
-        )?;
+        let parts = Mask::from_pixels(pm, frame.width, frame.height).piece();
         let min_area = cfg.f("piece_min_area_ratio") * (w * h);
         let max_area = cfg.f("piece_max_area_ratio") * (w * h);
         let foot_ratio = cfg.f("piece_min_y_ratio");
@@ -727,7 +602,7 @@ impl Vision {
         let auto_skin = cfg.b("piece_skin_shape_enabled");
         let mut candidates = Vec::new();
         let mut horizontal = false;
-        for &[x, y, bw, bh, area] in &parts.stats()[1..] {
+        for &[x, y, bw, bh, area] in &parts.stats[1..] {
             let foot_y = (y + bh) as f64;
             if !(min_area..=max_area).contains(&(area as f64)) || foot_y < foot_ratio * h {
                 continue;

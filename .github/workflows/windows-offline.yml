@@ -11,97 +11,26 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          package-manager-cache: false
-      - name: Extract the official OpenCV x64 SDK
+      - name: Locate LLVM and the pinned OpenCV SDK
         shell: pwsh
         run: |
           $sdk = Join-Path $env:RUNNER_TEMP 'opencv-4.14.0-windows.exe'
           Invoke-WebRequest 'https://github.com/opencv/opencv/releases/download/4.14.0/opencv-4.14.0-windows.exe' -OutFile $sdk
           if ((Get-FileHash $sdk).Hash -ne '5f266a8b73bed535962d7e861a6457e32a0dd5f463ad0a7cf8707a135469be63') { throw 'OpenCV SDK checksum mismatch' }
           & 7z x $sdk "-o$env:RUNNER_TEMP\cv" -y -bso0
-          if ($LASTEXITCODE -ne 0) { throw 'OpenCV SDK extraction failed' }
-          "JUMPBOT_OPENCV_DIR=$env:RUNNER_TEMP\cv\opencv\build" >> $env:GITHUB_ENV
-      - name: Test both Cargo feature sets
-        shell: pwsh
-        run: |
-          cargo test --manifest-path desktop/Cargo.toml --workspace --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --manifest-path desktop/Cargo.toml --workspace --locked --target x86_64-pc-windows-msvc --no-default-features
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build both distributions and compile their installers
-        shell: pwsh
-        run: |
-          ./tools/build_app.ps1
-          ./tools/build_app.ps1 -NoGpu
-          ./tools/package_release.ps1 -Version 0.0.0-ci -Candidate -OutputDir "$env:RUNNER_TEMP\packages"
-      - name: Ensure Microsoft Evergreen WebView2 Runtime for packaged GUI tests
-        shell: pwsh
-        timeout-minutes: 5
-        run: |
-          function Find-WebView2Runtime {
-            $client = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
-            foreach ($install in @(
-              @{ Key = "HKLM:\SOFTWARE\WOW6432Node\$client"; Root = [Environment]::GetFolderPath('ProgramFilesX86') }
-              @{ Key = "HKCU:\SOFTWARE\$client"; Root = $env:LOCALAPPDATA }
-            )) {
-              $version = (Get-ItemPropertyValue -LiteralPath $install.Key -Name pv -ErrorAction SilentlyContinue) -as [version]
-              if ($version -gt [version]'0.0.0.0') {
-                $exe = Join-Path $install.Root "Microsoft\EdgeWebView\Application\$version\msedgewebview2.exe"
-                if (Test-Path -LiteralPath $exe -PathType Leaf) { return Get-Item -LiteralPath $exe }
-              }
-            }
-          }
-          $runtime = Find-WebView2Runtime
-          if (!$runtime) {
-            $setup = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
-            Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $setup
-            $signature = Get-AuthenticodeSignature -LiteralPath $setup
-            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Microsoft Corporation') {
-              throw "Unverified WebView2 bootstrapper ($($signature.Status))"
-            }
-            $installer = Start-Process -FilePath $setup -ArgumentList '/silent','/install' -Wait -PassThru -WindowStyle Hidden
-            $runtime = Find-WebView2Runtime
-            Write-Host "WebView2 installer exit code $($installer.ExitCode)"
-            if (!$runtime) { throw 'Evergreen registration and runtime executable missing after setup' }
-          }
-          Write-Host "WebView2 $($runtime.VersionInfo.ProductVersion) at $($runtime.FullName) on $env:ImageOS $env:ImageVersion"
-      - name: Verify ZIPs, installed files, saved configuration and desktop controls
-        shell: pwsh
-        run: |
-          $packages = Join-Path $env:RUNNER_TEMP 'packages'
-          foreach ($line in Get-Content "$packages\SHA256SUMS.txt") {
-            $hash, $name = $line -split '  ', 2
-            if ((Get-FileHash -LiteralPath (Join-Path $packages $name)).Hash -ne $hash) { throw "Checksum mismatch for $name" }
-          }
-          foreach ($flavor in 'full','portable') {
-            $extract = Join-Path $env:RUNNER_TEMP "extract-$flavor"
-            Expand-Archive "$packages\jumpbot-win64-v0.0.0-ci-$flavor.zip" -DestinationPath $extract
-            $app = Join-Path $extract 'jumpbot'
-            node ./tools/test_native_runtime.mjs $app
-            if ($LASTEXITCODE -ne 0) { throw "Desktop and CLI checks failed: $flavor" }
-
-            $install = Join-Path $env:RUNNER_TEMP "installed-$flavor"
-            New-Item -ItemType Directory -Path $install | Out-Null
-            $config = Join-Path $install 'config.json'
-            Set-Content -LiteralPath $config -Value '{"max_jumps":77}' -NoNewline
-            $legacy = New-Item -ItemType Directory -Path "$install\_internal\templates"
-            Copy-Item "$app\templates\digit_1.png" (Join-Path $legacy.FullName 'digit_0.png')
-            $userHash = (Get-FileHash -LiteralPath $config).Hash
-            $argsList = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER','/NOICONS','/MERGETASKS=!desktopicon',("/DIR=" + [char]34 + $install + [char]34))
-            $setup = Start-Process "$packages\jumpbot-setup-0.0.0-ci-$flavor.exe" -ArgumentList $argsList -PassThru -Wait -WindowStyle Hidden
-            if ($setup.ExitCode -ne 0 -or (Get-FileHash -LiteralPath $config).Hash -ne $userHash) { throw "Install or config preservation failed: $flavor" }
-            foreach ($file in Get-ChildItem -LiteralPath $app -File -Recurse) {
-              $relative = [IO.Path]::GetRelativePath($app, $file.FullName)
-              if ($relative -eq 'config.json') { continue }
-              if ($relative -eq 'templates\digit_0.png') {
-                if ((Get-FileHash "$install\$relative").Hash -ne (Get-FileHash "$app\templates\digit_1.png").Hash) { throw 'Legacy user template was replaced' }
-                continue
-              }
-              if ((Get-FileHash -LiteralPath (Join-Path $install $relative)).Hash -ne (Get-FileHash -LiteralPath $file.FullName).Hash) { throw "Installer and ZIP differ: $relative" }
-            }
-            & "$install\jumpbot.exe" --selftest --no-cuda --no-opencl
-            if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed: $flavor" }
-          }
+          $root = Join-Path $env:RUNNER_TEMP 'cv\opencv\build'
+          $lib = Get-ChildItem "$root\x64\vc*\lib\opencv_world*.lib" | Where-Object BaseName -Match '^opencv_world\d+$' | Select-Object -First 1
+          if (!$lib) { throw 'OpenCV release import library missing' }
+          $clang = (Get-Command clang.exe -ErrorAction Stop).Source
+          @("JUMPBOT_OPENCV_DIR=$root", "OPENCV_INCLUDE_PATHS=$root\include", "OPENCV_LINK_LIBS=$($lib.BaseName)", "OPENCV_LINK_PATHS=$($lib.DirectoryName)", "LIBCLANG_PATH=$(Split-Path $clang)") >> $env:GITHUB_ENV
+      - name: Test the accelerated Rust build
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked
+      - name: Test the CPU-only Rust build
+        run: cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked --no-default-features
+      - name: Build installers and ZIPs from the same payload
+        run: cargo run --manifest-path desktop/Cargo.toml --locked -p jumpbot-dist -- --version 0.0.0-ci --candidate --output build/ci-package
+      - name: Verify ZIP contents, installer upgrade and native desktop controls
+        env:
+          JUMPBOT_TEST_GUI: '1'
+        run: cargo run --manifest-path desktop/Cargo.toml --locked -p jumpbot-dist -- --version 0.0.0-ci --output build/ci-package --verify --install

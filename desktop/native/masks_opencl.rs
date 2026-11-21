@@ -147,7 +147,7 @@ impl Candidate {
             check(rc, "clCreateContext")?;
             cl.queue = (api.clCreateCommandQueue)(cl.context, self.id, 0, &mut rc);
             check(rc, "clCreateCommandQueue")?;
-            let src = include_str!("masks_kernel.cl");
+            let src = kernel::generate(kernel::Target::OpenCl);
             cl.program = (api.clCreateProgramWithSource)(
                 cl.context,
                 1,
@@ -306,6 +306,77 @@ impl Drop for Opencl {
             if !self.context.is_null() {
                 (self.api.clReleaseContext)(self.context);
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "opencl"))]
+mod tests {
+    use super::*;
+    use crate::{masks::Masks, Config};
+
+    #[test]
+    #[ignore = "requires an OpenCL GPU and a working vendor driver"]
+    fn rejected_upload_recomputes_the_current_frame() {
+        let cfg = Config::default();
+        let mut scalar = Masks::new(&cfg, "cpu");
+        let frame = |w| Frame {
+            width: w,
+            height: 23,
+            bgr: (0..w * 23 * 3).map(|i| (i * 43 + i / 13) as u8).collect(),
+        };
+        let adapters = candidates("").unwrap();
+        assert!(!adapters.is_empty());
+        for adapter in adapters {
+            let mut masks = Masks::new(&cfg, "opencl");
+            let name = adapter.name.clone();
+            let cl = adapter.open(&masks.table).unwrap();
+            // Unit test executables cannot serve as the CLI preflight child.
+            // Install this actual device, then use the normal frame entry point.
+            masks.gpu.devices = Some(vec![Device {
+                runtime: Runtime::Opencl(cl),
+                name: name.clone(),
+                ms: 0.,
+            }]);
+            masks.gpu.chosen = Some(0);
+            let small = frame(37);
+            assert_eq!(
+                masks.compute(&small).unwrap(),
+                scalar.compute(&small).unwrap()
+            );
+            assert_eq!(masks.backend(), "opencl", "{name}");
+
+            let large = frame(71);
+            let Runtime::Opencl(cl) = &mut masks.gpu.devices.as_mut().unwrap()[0].runtime else {
+                unreachable!()
+            };
+            // A CL_MEM_HOST_NO_ACCESS buffer is valid device memory, but the
+            // driver must reject an upload to it with CL_INVALID_OPERATION.
+            let mut rc = 0;
+            let device_only = unsafe {
+                (cl.api.clCreateBuffer)(
+                    cl.context,
+                    4 | (1 << 9),
+                    large.bgr.len(),
+                    ptr::null_mut(),
+                    &mut rc,
+                )
+            };
+            check(rc, "create device-only test buffer").unwrap();
+            let old = std::mem::replace(&mut cl.buffers[0], device_only);
+            check(
+                unsafe { (cl.api.clReleaseMemObject)(old) },
+                "release old test buffer",
+            )
+            .unwrap();
+            cl.capacities[0] = large.bgr.len();
+            assert_eq!(
+                masks.compute(&large).unwrap(),
+                scalar.compute(&large).unwrap(),
+                "{name}"
+            );
+            assert!(matches!(masks.backend(), "simd" | "cpu"), "{name}");
+            assert!(masks.gpu.devices.as_ref().unwrap().is_empty());
         }
     }
 }

@@ -44,6 +44,8 @@ fn check(status: i32, operation: &str) -> Result<(), String> {
 mod cl;
 #[path = "masks_cuda.rs"]
 mod cuda;
+#[path = "masks_kernel.rs"]
+mod kernel;
 
 enum Runtime {
     Cuda(cuda::Cuda),
