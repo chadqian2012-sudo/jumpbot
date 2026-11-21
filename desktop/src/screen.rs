@@ -113,7 +113,7 @@ impl Frame {
         } else {
             decoded.into_rgb8().into_raw()
         };
-        for pixel in bgr.chunks_exact_mut(3) {
+        for pixel in bgr.as_chunks_mut::<3>().0 {
             pixel.swap(0, 2)
         }
         Ok(Self { width, height, bgr })
@@ -123,7 +123,7 @@ impl Frame {
             return Err("PNG 编码失败".into());
         }
         let mut rgb = self.bgr.clone();
-        for p in rgb.chunks_exact_mut(3) {
+        for p in rgb.as_chunks_mut::<3>().0 {
             p.swap(0, 2)
         }
         fs::write(
@@ -343,7 +343,9 @@ pub(super) fn segment_glyphs(
     let min_height = 6.max((0.35 * (b - t) as f64) as i32);
     let mut boxes: Vec<_> = stats
         .data_typed::<i32>()?
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .skip(1)
         .filter(|s| s[3] >= min_height && s[4] >= 25)
         .map(|s| Rect::new(s[0], s[1], s[2], s[3]))
@@ -380,7 +382,7 @@ pub(super) fn glyph_feature(glyph: &GrayImage) -> opencv::Result<Vec<f32>> {
     for (src, row) in scaled
         .data_bytes()?
         .chunks_exact(fitted)
-        .zip(out.chunks_exact_mut(24))
+        .zip(out.as_chunks_mut::<24>().0)
     {
         for (&p, v) in src.iter().zip(&mut row[(24 - fitted) / 2..]) {
             *v = f32::from(p) / 255.
@@ -441,7 +443,7 @@ impl Screen {
         let mut buttons = Vec::with_capacity(2);
         for name in ["ui_start.png", "ui_restart.png"] {
             let f = Frame::read(&path.join(name))?;
-            let pixels: Vec<_> = f.bgr.chunks_exact(3).map(gray).collect();
+            let pixels: Vec<_> = f.bgr.as_chunks::<3>().0.iter().map(|p| gray(p)).collect();
             let mean = pixels.iter().map(|p| f64::from(*p)).sum::<f64>() / pixels.len() as f64;
             let norm = pixels
                 .iter()
@@ -529,7 +531,7 @@ impl Screen {
             });
         }
         let c = cache.as_ref().unwrap();
-        let pixels: Vec<_> = f.bgr.chunks_exact(3).map(gray).collect();
+        let pixels: Vec<_> = f.bgr.as_chunks::<3>().0.iter().map(|p| gray(p)).collect();
         let spectrum = c.grid.spectrum(w, h, |x, y| f32::from(pixels[y * w + x]));
         let stride = w + 1;
         let mut integral = vec![[0f64; 2]; stride * (h + 1)];
@@ -596,5 +598,66 @@ impl Screen {
             }
         }
         Ok(best)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pasted_buttons_return_their_center_after_frame_dimensions_change() {
+        let dir = crate::asset_dir().join("templates");
+        let screen = Screen::new(&dir, &Config::default()).unwrap();
+        for (file, restart) in [("ui_start.png", false), ("ui_restart.png", true)] {
+            let t = Frame::read(&dir.join(file)).unwrap();
+            let (width, height) = (t.width + 51, t.height + 49);
+            let mut frame = Frame {
+                width,
+                height,
+                bgr: vec![127; width * height * 3],
+            };
+            assert_eq!(screen.button(&frame).unwrap(), None);
+            for (y, row) in t.bgr.chunks_exact(t.width * 3).enumerate() {
+                let offset = ((13 + y) * width + 7) * 3;
+                frame.bgr[offset..offset + row.len()].copy_from_slice(row);
+            }
+            assert_eq!(
+                screen.button(&frame).unwrap(),
+                Some((
+                    restart,
+                    [7. + t.width as f64 / 2., 13. + t.height as f64 / 2.]
+                ))
+            );
+        }
+    }
+    #[test]
+    fn phase_reports_signed_motion_and_rejects_untextured_frames() {
+        let (width, height) = (80, 60);
+        let a = Frame {
+            width,
+            height,
+            bgr: (0..width * height)
+                .flat_map(|i| {
+                    let n = (i as u32).wrapping_mul(0x9e3779b9);
+                    let [b, g, r, _] = (n ^ n.rotate_left(13)).to_le_bytes();
+                    [b, g, r]
+                })
+                .collect(),
+        };
+        let mut b = Frame {
+            width,
+            height,
+            bgr: vec![0; width * height * 3],
+        };
+        assert_eq!(b.shift(&b, 0.1), None);
+        for y in 2..height {
+            for x in 0..width - 3 {
+                let src = ((y - 2) * width + x + 3) * 3;
+                let out = (y * width + x) * 3;
+                b.bgr[out..out + 3].copy_from_slice(&a.bgr[src..src + 3]);
+            }
+        }
+        let (dx, dy) = a.shift(&b, 0.1).unwrap();
+        assert!((dx + 3.).hypot(dy - 2.) < 0.3, "({dx}, {dy})");
     }
 }

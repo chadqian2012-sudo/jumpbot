@@ -89,18 +89,28 @@ fn installed(program: &str, paths: &[PathBuf]) -> Result<PathBuf> {
 fn folder(var: &str) -> PathBuf {
     env::var_os(var).map(PathBuf::from).unwrap_or_default()
 }
+fn sdk_import(sdk: &Path) -> Result<PathBuf> {
+    let mut libs = Vec::new();
+    for item in WalkDir::new(sdk.join("x64")).max_depth(3) {
+        let item = item?;
+        let name = item.file_name().to_string_lossy();
+        if item.file_type().is_file()
+            && name
+                .strip_prefix("opencv_world")
+                .and_then(|s| s.strip_suffix(".lib"))
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|x| x.is_ascii_digit()))
+        {
+            libs.push(item.into_path());
+        }
+    }
+    libs.sort();
+    libs.pop()
+        .ok_or_else(|| "OpenCV SDK release import library missing".into())
+}
 fn cargo(root: &Path, sdk: &Path) -> Result<Command> {
     let mut c = Command::new("cargo");
     c.current_dir(root);
-    let lib = WalkDir::new(sdk.join("x64"))
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .find(|e| {
-            let n = e.file_name().to_string_lossy();
-            n.starts_with("opencv_world") && n.ends_with(".lib") && !n.ends_with("d.lib")
-        })
-        .ok_or("OpenCV SDK release import library missing")?
-        .into_path();
+    let lib = sdk_import(sdk)?;
     c.env("JUMPBOT_OPENCV_DIR", sdk)
         .env("OPENCV_LINK_PATHS", lib.parent().unwrap())
         .env("OPENCV_LINK_LIBS", lib.file_stem().unwrap())
@@ -219,17 +229,41 @@ fn build(root: &Path, sdk: &Path, stage: &Path, flavor: &str) -> Result<()> {
         "--release",
         "--manifest-path",
         "desktop/Cargo.toml",
-        "--bins",
+        "--target",
+        "x86_64-pc-windows-msvc",
+        "--bin",
+        "jumpbot",
+        "--bin",
+        "jumpbot-desktop",
+        "--bin",
+        "jumpbot-launch",
+        "--message-format=json-render-diagnostics",
         "--target-dir",
     ])
     .arg(&target);
     if light {
         c.arg("--no-default-features");
     }
-    run(&mut c)?;
-    let release = target.join("release");
-    for name in ["jumpbot.exe", "jumpbot-desktop.exe"] {
-        copy(&release.join(name), &stage.join(name))?;
+    let artifacts = output(&mut c)?;
+    let mut binaries = BTreeMap::new();
+    for line in artifacts.lines() {
+        let event: Value = serde_json::from_str(line)?;
+        if event["reason"] == "compiler-artifact" {
+            if let (Some(name), Some(path)) = (
+                event["target"]["name"].as_str(),
+                event["executable"].as_str(),
+            ) {
+                binaries.insert(name.to_owned(), PathBuf::from(path));
+            }
+        }
+    }
+    let binary = |name: &str| {
+        binaries
+            .get(name)
+            .ok_or_else(|| format!("Cargo did not build {name}"))
+    };
+    for name in ["jumpbot", "jumpbot-desktop"] {
+        copy(binary(name)?, &stage.join(format!("{name}.exe")))?;
     }
     for name in [
         "run.exe",
@@ -238,23 +272,17 @@ fn build(root: &Path, sdk: &Path, stage: &Path, flavor: &str) -> Result<()> {
         "run_dryrun.exe",
         "selftest.exe",
     ] {
-        copy(&release.join("jumpbot-launch.exe"), &stage.join(name))?;
+        copy(binary("jumpbot-launch")?, &stage.join(name))?;
     }
-    let worlds: Vec<_> = fs::read_dir(&release)?
-        .collect::<io::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|e| {
-            let n = e.file_name();
-            let n = n.to_string_lossy();
-            n.strip_prefix("opencv_world")
-                .and_then(|s| s.strip_suffix(".dll"))
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
-        })
-        .collect();
-    if worlds.len() != 1 {
-        return Err("expected exactly one OpenCV runtime DLL".into());
-    }
-    copy(&worlds[0].path(), &stage.join(worlds[0].file_name()))?;
+    let lib = sdk_import(sdk)?;
+    let dll = lib
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("invalid SDK layout")?
+        .join("bin")
+        .join(lib.file_name().unwrap())
+        .with_extension("dll");
+    copy(&dll, &stage.join(dll.file_name().unwrap()))?;
     let vswhere = folder("ProgramFiles(x86)").join("Microsoft Visual Studio/Installer/vswhere.exe");
     let crt = output(Command::new(vswhere).args([
         "-latest",
@@ -361,15 +389,18 @@ fn package(o: Args) -> Result<()> {
         return Err("invalid package version".into());
     }
     if o.verify {
-        return verify::run_checks(&o.version, &o.output.canonicalize()?, o.install);
+        return verify::run_checks(&o.version, &std::path::absolute(&o.output)?, o.install);
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
-    let sdk = std::env::var_os("JUMPBOT_OPENCV_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("build/cv-sdk"))
-        .canonicalize()?;
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf();
+    let sdk = std::path::absolute(
+        std::env::var_os("JUMPBOT_OPENCV_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("build/cv-sdk")),
+    )?;
     let dest = std::path::absolute(&o.output)?;
     if dest.exists() {
         return Err(format!("Output exists: {}", dest.display()).into());

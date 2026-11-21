@@ -5,6 +5,10 @@ use std::{
     path::Path,
 };
 fn main() {
+    if env::var_os("JUMPBOT_QA_HOLD_TEXT").is_some() {
+        let _ = io::stdin().lock().lines().next();
+        return;
+    }
     let args: Vec<_> = env::args().collect();
     let log = Path::new(&args[args.iter().position(|a| a == "--log-dir").unwrap() + 1]);
     fs::create_dir_all(log).unwrap();

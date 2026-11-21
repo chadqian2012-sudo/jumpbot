@@ -197,7 +197,7 @@ impl Automation {
     unsafe fn named(&self, id: &str, name: &str) -> Result<IUIAutomationElement> {
         until(&format!("{id} = {name}"), || {
             let e = self.find(id).ok()?;
-            (e.CurrentName().ok()?.to_string() == name).then_some(e)
+            (e.CurrentName().ok()? == name).then_some(e)
         })
     }
     unsafe fn invoke(&self, id: &str, name: &str) -> Result<()> {

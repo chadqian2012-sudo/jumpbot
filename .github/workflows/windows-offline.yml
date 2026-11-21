@@ -22,7 +22,16 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'cv\opencv\build'
           $lib = Get-ChildItem "$root\x64\vc*\lib\opencv_world*.lib" | Where-Object BaseName -Match '^opencv_world\d+$' | Select-Object -First 1
           if (!$lib) { throw 'OpenCV release import library missing' }
-          $clang = (Get-Command clang.exe -ErrorAction Stop).Source
+          $llvm = Join-Path $env:RUNNER_TEMP 'llvm-22.1.8'
+          $archive = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.8-win64.exe'
+          Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe' -OutFile $archive
+          if ((Get-FileHash $archive).Hash -ne '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c') { throw 'LLVM checksum mismatch' }
+          & 7z x $archive "-o$llvm" -y -bso0 'bin/clang.exe' 'bin/libclang.dll' 'lib/clang/22/include/*'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clang = Join-Path $llvm 'bin/clang.exe'
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Split-Path $clang) >> $env:GITHUB_PATH
           @("JUMPBOT_OPENCV_DIR=$root", "OPENCV_INCLUDE_PATHS=$root\include", "OPENCV_LINK_LIBS=$($lib.BaseName)", "OPENCV_LINK_PATHS=$($lib.DirectoryName)", "LIBCLANG_PATH=$(Split-Path $clang)") >> $env:GITHUB_ENV
       - name: Test the accelerated Rust build
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked

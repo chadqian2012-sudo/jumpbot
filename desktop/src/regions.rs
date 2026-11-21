@@ -18,7 +18,7 @@ impl Mask {
                 #[cfg(target_arch = "x86_64")]
                 {
                     use std::arch::x86_64::*;
-                    for lane in word.chunks_exact(16) {
+                    for lane in word.as_chunks::<16>().0 {
                         // SSE2 is part of x86-64. Each load is wholly inside this slice.
                         let nonzero = unsafe {
                             let v = _mm_loadu_si128(lane.as_ptr().cast());

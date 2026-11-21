@@ -4,8 +4,10 @@ use zip::ZipArchive;
 
 pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
+        .ancestors()
+        .nth(2)
+        .expect("workspace root")
+        .to_path_buf();
     let sums = fs::read_to_string(packages.join("SHA256SUMS.txt"))?;
     let mut verified = BTreeSet::new();
     for line in sums.lines() {

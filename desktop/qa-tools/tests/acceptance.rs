@@ -59,6 +59,12 @@ fn bounded_round_and_suite_with_text_only_worker() {
         .output()
         .unwrap();
     assert!(!no_input.status.success() && !p.join("disabled").exists());
+    let mut offline = Command::new(&exe)
+        .args(["--config", "with spaces.json", "--image", "q a.png"])
+        .env("JUMPBOT_QA_HOLD_TEXT", "1")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
     let out = command(p, "run-frozen-acceptance", "pass")
         .args(["--jumps", "2", "--pause-every", "1", "--backend", "simd"])
         .output()
@@ -71,6 +77,30 @@ fn bounded_round_and_suite_with_text_only_worker() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(fs::read_to_string(p.join("received")).unwrap(), "pause\n");
+    drop(offline.stdin.take());
+    assert!(offline.wait().unwrap().success());
+    let mut ambiguous = Command::new(&exe)
+        .args(["--config", "directory --image frame/config.json"])
+        .env("JUMPBOT_QA_HOLD_TEXT", "1")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let blocked = command(p, "run-frozen-acceptance", "blocked")
+        .output()
+        .unwrap();
+    drop(ambiguous.stdin.take());
+    assert!(ambiguous.wait().unwrap().success());
+    assert!(!blocked.status.success() && !p.join("blocked").exists());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains(&ambiguous.id().to_string()));
+    fs::write(p.join("suite-stop"), "").unwrap();
+    assert!(!command(p, "run-frozen-acceptance", "pre-stopped")
+        .arg("--suite-stop-file")
+        .arg(p.join("suite-stop"))
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(read(&p.join("pre-stopped/test-status.json"))["child_pid"].is_null());
     let state = read(&p.join("pass/test-status.json"));
     assert_eq!(state["pause_requests"], 1);
     assert_eq!(state["stats"]["hits"], 2);

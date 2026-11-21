@@ -83,13 +83,11 @@ pub(super) fn measure(cfg: &Config, dir: &Path, tol: f64, truth: Option<bool>) -
                 let err = (land.x - x) * axis.0 + (anchor - y) * axis.1;
                 observed.push(err);
                 estimates.push(est);
-                if list {
-                    println!(
-                        "{} estimate={est:.1} true={err:.1} dot_offset={:.1}",
-                        name(&before),
-                        (center.0 - x).hypot(center.1 - y)
-                    )
-                }
+                println!(
+                    "{} estimate={est:.1} true={err:.1} dot_offset={:.1}",
+                    name(&before),
+                    (center.0 - x).hypot(center.1 - y)
+                )
             } else if list {
                 println!("{} estimate={est:.1} 白点缺失", name(&before))
             }
@@ -128,34 +126,6 @@ pub(super) fn measure(cfg: &Config, dir: &Path, tol: f64, truth: Option<bool>) -
     }
     Ok(true)
 }
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn replay_uses_only_complete_numbered_raw_pairs() {
-        let d = tempfile::tempdir().unwrap();
-        for s in [
-            "001_raw",
-            "001_raw_after",
-            "002_before",
-            "002_after",
-            "002_raw",
-            "foo_raw",
-            "foo_raw_after",
-        ] {
-            std::fs::write(d.path().join(format!("jump_{s}.png")), []).unwrap();
-        }
-        assert_eq!(
-            super::paired(d.path(), true).unwrap(),
-            [(
-                d.path().join("jump_001_raw.png"),
-                d.path().join("jump_001_raw_after.png")
-            )]
-        );
-    }
-}
-
-/// A pair has exactly two distinct observations. Replay the saved takeoff twice for
-/// target consistency, then the saved landing until the recorded image is stable.
 pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usize) -> Report<bool> {
     use crate::screen::Screen;
     use std::time::Instant;
@@ -272,4 +242,30 @@ pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usiz
         )
     }
     Ok(stable_count == n && acquired_count == n)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn replay_uses_only_complete_numbered_raw_pairs() {
+        let d = tempfile::tempdir().unwrap();
+        for s in [
+            "001_raw",
+            "001_raw_after",
+            "002_before",
+            "002_after",
+            "002_raw",
+            "foo_raw",
+            "foo_raw_after",
+        ] {
+            std::fs::write(d.path().join(format!("jump_{s}.png")), []).unwrap();
+        }
+        assert_eq!(
+            super::paired(d.path(), true).unwrap(),
+            [(
+                d.path().join("jump_001_raw.png"),
+                d.path().join("jump_001_raw_after.png")
+            )]
+        );
+    }
 }
