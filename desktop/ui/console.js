@@ -116,8 +116,11 @@ function renderStats() {
   byId("shortcuts").textContent = `${state.pause_hotkey || "Alt+P"} 暂停 / F8 停止`;
   const countdown = ["countdown", "resuming"].includes(state.state) ? state.countdown_s : null;
   byId("countdown").textContent = Number.isFinite(countdown) ? `${countdown.toFixed(1)} s` : "—";
-  byId("window").textContent = !["waiting_window", "starting", "stopped"].includes(state.state) && state.window?.title ||
-    "窗口未连接";
+  const gameWindow = state.window;
+  const rect = gameWindow?.client;
+  const size = rect ? ` · ${rect[2] - rect[0]} × ${rect[3] - rect[1]}` : "";
+  byId("window").textContent = gameWindow?.title && !["waiting_window", "starting", "stopped"].includes(state.state)
+    ? gameWindow.title + size : "窗口未连接";
   renderElapsed();
 }
 

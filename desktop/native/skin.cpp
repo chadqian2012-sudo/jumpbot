@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <utility>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -224,21 +225,8 @@ Mat density_region(const Mat& material, const Mat& flecks, double coverage, int 
     return substantial_texture(material & (density >= std::clamp(coverage * .6, .25, .5)), width);
 }
 
-std::vector<Shape> material_bodies(const Mat& lab, Rect head, const Material& sample) {
-    const double diameter = (head.width + head.height) * .5, cx = head.x + head.width * .5;
-    const int left = std::max(0, static_cast<int>(std::floor(cx - diameter * .85)) - 2);
-    const int right = std::min(lab.cols, static_cast<int>(std::ceil(cx + diameter * .85)) + 2);
-    const int top = head.br().y;
-    const int bottom = std::min(lab.rows, static_cast<int>(std::ceil(top + diameter * 4.15)) + 2);
-    if (top >= bottom || left >= right) return {};
-    const Rect roi(Point(left, top), Point(right, bottom));
-    const Mat material = material_plane(lab(roi), sample);
-    const int cap = std::max(3, rounded(lab.cols * 7. / 553) | 1);
-    const int repair_width = std::clamp(rounded(diameter * .20) | 1, 3, cap);
-    std::vector<Mat> planes{morph(material, cv::MORPH_CLOSE, 3)};
-    if (repair_width > 3) planes.push_back(morph(material, cv::MORPH_CLOSE, repair_width));
-    const size_t material_count = planes.size();
-
+void add_texture_planes(const Mat& lab, Rect head, Rect roi, const Material& sample,
+                        const Mat& material, int width, std::vector<Mat>& planes) {
     Mat head_l;
     cv::extractChannel(lab(head), head_l, 0);
     const Mat texture = detail(head_l);
@@ -248,7 +236,6 @@ std::vector<Shape> material_bodies(const Mat& lab, Rect head, const Material& sa
         for (int x = 0; x < head.width; ++x)
             if (sample.core.at<uchar>(y, x)) ++bins[texture.at<uchar>(y, x)];
     const double grain = median_bin(bins, core_size);
-    const int width = std::max(3, rounded(diameter * .14) | 1);
     if (grain >= 1) {
         const double threshold = std::clamp(grain * .5, 2., 4.);
         Mat roi_l;
@@ -263,6 +250,55 @@ std::vector<Shape> material_bodies(const Mat& lab, Rect head, const Material& sa
                                / static_cast<double>(core_size);
     if (fine_coverage >= .6)
         planes.push_back(density_region(material, detail(lab(roi)) >= 1, fine_coverage, width));
+}
+
+// Interpolation can erase head flecks and join the body to a flat platform.
+// Repeated colours outside the body's search corridor describe that backdrop.
+Mat without_backdrop(const Mat& patch, const Mat& material, int width) {
+    std::map<std::array<uchar, 3>, int> counts;
+    for (int y = 0; y < patch.rows; ++y) {
+        const auto* row = patch.ptr<cv::Vec3b>(y);
+        for (int x : {0, 1, patch.cols - 2, patch.cols - 1}) {
+            const auto& p = row[x];
+            ++counts[{p[0], p[1], p[2]}];
+        }
+    }
+    Mat remaining = material.clone(), same;
+    for (const auto& [p, count] : counts) {
+        if (count < width) continue;
+        const cv::Scalar colour(p[0], p[1], p[2]);
+        const auto rounding = cv::Scalar::all(2);
+        cv::inRange(patch, colour - rounding, colour + rounding, same);
+        remaining.setTo(0, same);
+    }
+    return substantial_texture(remaining, width);
+}
+
+std::vector<Shape> material_bodies(const Mat& lab, Rect head, const Material& sample,
+                                   bool separate_backdrop) {
+    const double diameter = (head.width + head.height) * .5, cx = head.x + head.width * .5;
+    const int left = std::max(0, static_cast<int>(std::floor(cx - diameter * .85)) - 2);
+    const int right = std::min(lab.cols, static_cast<int>(std::ceil(cx + diameter * .85)) + 2);
+    const int top = head.br().y;
+    const int bottom = std::min(lab.rows, static_cast<int>(std::ceil(top + diameter * 4.15)) + 2);
+    if (top >= bottom || left >= right) return {};
+    const Rect roi(Point(left, top), Point(right, bottom));
+    const Mat material = material_plane(lab(roi), sample);
+    const int cap = std::max(3, rounded(lab.cols * 7. / 553) | 1);
+    const int repair_width = std::clamp(rounded(diameter * .20) | 1, 3, cap);
+    const int width = std::max(3, rounded(diameter * .14) | 1);
+    std::vector<Mat> planes;
+    size_t material_count = 0;
+    if (separate_backdrop) {
+        if (!cv::countNonZero(material.colRange(0, 2)) &&
+            !cv::countNonZero(material.colRange(material.cols - 2, material.cols))) return {};
+        planes.push_back(without_backdrop(lab(roi), material, width));
+    } else {
+        planes.push_back(morph(material, cv::MORPH_CLOSE, 3));
+        if (repair_width > 3) planes.push_back(morph(material, cv::MORPH_CLOSE, repair_width));
+        material_count = planes.size();
+        add_texture_planes(lab, head, roi, sample, material, width, planes);
+    }
 
     std::vector<Shape> bodies;
     auto add = [&](Contours contours, bool repaired) {
@@ -318,30 +354,30 @@ bool supported(const Mat& mask, int x, int y, int top, double diameter,
     return !best.empty();
 }
 
-void measure_body(const Mat& lab, const Mat& support, int top, size_t head_id,
+bool measure_body(const Mat& lab, const Mat& support, int top, size_t head_id,
                   const Head& head, const Material& sample, const Shape& body,
                   const std::vector<Platform>& platforms, void* context, const Rules& rules) {
     const Rect b = body.box, h = head.box;
     const Bounds head_box = bounds(h, top), body_box = bounds(b, top);
-    if (!rules.upright(context, head_id, head_box, body_box, body.solidity, body.repaired)) return;
+    if (!rules.upright(context, head_id, head_box, body_box, body.solidity, body.repaired)) return false;
     const Mat mask = filled(body.contour, b);
     const Mat core = inner_core(mask);
-    if (!cv::countNonZero(core)) return;
+    if (!cv::countNonZero(core)) return false;
     const Mat patch = lab(b);
     const double diameter = (h.width + h.height) * .5;
     const int start = std::max(0, b.height - std::max(3, rounded(diameter * .25)));
     const Mat base = core.rowRange(start, b.height);
-    if (!cv::countNonZero(base)) return;
+    if (!cv::countNonZero(base)) return false;
     const cv::Vec3d base_delta = sample.colour - median_colour(patch.rowRange(start, b.height), base);
     std::vector<int> widths(b.height);
     for (int y = 0; y < b.height; ++y) widths[y] = cv::countNonZero(mask.row(y));
     if (!rules.material_and_waist(widths.data(), widths.size(),
             cv::norm(sample.colour - median_colour(patch, core)), cv::norm(base_delta),
-            std::hypot(base_delta[1], base_delta[2]), sample.chroma_tolerance)) return;
+            std::hypot(base_delta[1], base_delta[2]), sample.chroma_tolerance)) return false;
 
     std::vector<Point> support_pixels;
     if (!supported(support, rounded(b.x + b.width*.5), b.br().y + top,
-                   top, diameter, platforms, support_pixels)) return;
+                   top, diameter, platforms, support_pixels)) return false;
     // Each support witness contains at most five rows of nine pixels.
     int points[45][2];
     for (size_t i = 0; i < support_pixels.size(); ++i) {
@@ -356,6 +392,7 @@ void measure_body(const Mat& lab, const Mat& support, int top, size_t head_id,
                         head.circularity, body.solidity, body.repaired,
                         static_cast<int>(support_pixels.size()), silhouette.data, points};
     rules.consider(context, &candidate);
+    return true;
 }
 
 double circularity(const Contour& hull, double area) {
@@ -363,7 +400,7 @@ double circularity(const Contour& hull, double area) {
     return 4 * CV_PI * area / std::max(perimeter*perimeter, 1.);
 }
 
-void visit_skin(const Mat& frame, const Mat& support, void* context, const Rules& rules) {
+void visit_skin(const Mat& frame, const Mat& support, bool allow_backdrop, void* context, const Rules& rules) {
     const int height = frame.rows, width = frame.cols, top = static_cast<int>(height * .35);
     if (!support.empty()) {
         const int active = cv::countNonZero(support);
@@ -414,25 +451,35 @@ void visit_skin(const Mat& frame, const Mat& support, void* context, const Rules
         }
     }
 
-    for (size_t i = 0; i < heads.size(); ++i) {
-        const Head& head = heads[i];
-        const auto sample = sample_head(lab, head.hull, head.box);
-        if (!sample) continue;
-        for (const Shape& body : shapes)
-            measure_body(lab, support, top, i, head, *sample, body, platforms, context, rules);
-        for (const Shape& body : material_bodies(lab, head.box, *sample))
-            measure_body(lab, support, top, i, head, *sample, body, platforms, context, rules);
-    }
+    auto visit_heads = [&](bool separate_backdrop) {
+        bool matched = false;
+        for (size_t i = 0; i < heads.size(); ++i) {
+            const Head& head = heads[i];
+            const auto sample = sample_head(lab, head.hull, head.box);
+            if (!sample) continue;
+            auto measure = [&](const Shape& body) {
+                if (measure_body(lab, support, top, i, head, *sample, body, platforms, context, rules))
+                    matched = true;
+            };
+            if (!separate_backdrop)
+                for (const Shape& body : shapes) measure(body);
+            for (const Shape& body : material_bodies(lab, head.box, *sample, separate_backdrop))
+                measure(body);
+        }
+        return matched;
+    };
+    // An ambiguous first pass already has candidates. Never retry to pick a winner.
+    if (!visit_heads(false) && allow_backdrop) visit_heads(true);
 }
 } // namespace
 
 extern "C" int jb_skin_visit(const unsigned char* bgr, int width, int height,
-                             const unsigned char* support, void* context, const Rules* rules) noexcept {
+                             const unsigned char* support, int allow_backdrop, void* context, const Rules* rules) noexcept {
     try {
         const Mat frame(height, width, CV_8UC3, const_cast<unsigned char*>(bgr));
         Mat platform;
         if (support) platform = Mat(height, width, CV_8U, const_cast<unsigned char*>(support));
-        visit_skin(frame, platform, context, *rules);
+        visit_skin(frame, platform, allow_backdrop != 0, context, *rules);
         return 1;
     } catch (...) {
         return 0;

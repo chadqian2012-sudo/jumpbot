@@ -71,6 +71,7 @@ extern "C" {
         width: i32,
         height: i32,
         support: *const u8,
+        allow_backdrop: i32,
         context: *mut c_void,
         rules: *const Rules,
     ) -> i32;
@@ -248,6 +249,7 @@ pub fn detect_skin(
     frame: &Frame,
     support: Option<&[u8]>,
     min_foot_ratio: f64,
+    allow_backdrop: bool,
 ) -> Option<SkinMatch> {
     let width = i32::try_from(frame.width).ok()?;
     let height = i32::try_from(frame.height).ok()?;
@@ -277,6 +279,7 @@ pub fn detect_skin(
             width,
             height,
             support.map_or(ptr::null(), |m| m.as_ptr()),
+            i32::from(allow_backdrop),
             (&mut selection as *mut Selection).cast(),
             &RULES,
         )
@@ -318,7 +321,7 @@ mod tests {
             ("skin-gold-cardboard-bonus", 200., 630., 1.),
             ("purple-cylinder-stall", 264., 593., 2.),
         ] {
-            let m = detect_skin(&fixture(name), None, 0.5).expect(name);
+            let m = detect_skin(&fixture(name), None, 0.5, true).expect(name);
             assert!(
                 (m.x - x).abs() <= tolerance && (m.y - y).abs() <= tolerance,
                 "{name}: foot ({}, {})",
@@ -345,7 +348,7 @@ mod tests {
                 frame.bgr[i..i + 3].copy_from_slice(&[60, 63, 65]);
             }
         }
-        let m = detect_skin(&frame, None, 0.5).unwrap();
+        let m = detect_skin(&frame, None, 0.5, true).unwrap();
         assert_eq!((m.x, m.y), (173., 646.));
         assert_eq!(m.bbox, (153, 538, 40, 108));
     }
@@ -360,7 +363,7 @@ mod tests {
                 .copy_within(start..start + 40 * 3, (row * frame.width + 145) * 3);
         }
         assert!(
-            detect_skin(&frame, None, 0.5).is_none(),
+            detect_skin(&frame, None, 0.5, true).is_none(),
             "two complete people"
         );
         let mut frame = fixture("skin-gold-yellow-badge");
@@ -370,21 +373,24 @@ mod tests {
                 frame.bgr[(row * frame.width + x) * 3..][..3].copy_from_slice(&background);
             }
         }
-        assert!(detect_skin(&frame, None, 0.5).is_none(), "missing body");
+        assert!(
+            detect_skin(&frame, None, 0.5, true).is_none(),
+            "missing body"
+        );
     }
 
     #[test]
     fn support_requires_a_valid_mask_and_two_rows_under_one_foot() {
         let frame = fixture("skin-gold-narrow-pylon");
         let mut support = vec![0; frame.width * frame.height];
-        assert!(detect_skin(&frame, Some(&support), 0.5).is_none());
+        assert!(detect_skin(&frame, Some(&support), 0.5, true).is_none());
         support.fill(255);
-        assert!(detect_skin(&frame, Some(&support), 0.5).is_none());
+        assert!(detect_skin(&frame, Some(&support), 0.5, true).is_none());
         support.fill(0);
         support[(649 + 6) * frame.width + 166] = 255;
-        assert!(detect_skin(&frame, Some(&support), 0.5).is_none());
+        assert!(detect_skin(&frame, Some(&support), 0.5, true).is_none());
         support[(649 + 10) * frame.width + 166] = 255;
-        let m = detect_skin(&frame, Some(&support), 0.5).unwrap();
+        let m = detect_skin(&frame, Some(&support), 0.5, true).unwrap();
         assert_eq!((m.x, m.y), (166., 649.));
         assert!(m.support_points.is_empty());
 
@@ -392,7 +398,7 @@ mod tests {
         let frame = fixture("skin-gold-play");
         let mut outside = vec![0; frame.width * frame.height];
         outside[0] = 255;
-        let m = detect_skin(&frame, Some(&outside), 0.5).unwrap();
+        let m = detect_skin(&frame, Some(&outside), 0.5, true).unwrap();
         let xs = m.x.round_ties_even() as usize;
         let ys = m.y as usize;
         let expected: Vec<_> = [6, 10, 14, 18, 24]
@@ -400,6 +406,36 @@ mod tests {
             .flat_map(|dy| (xs - 4..=xs + 4).map(move |x| (x, ys + dy)))
             .collect();
         assert_eq!(m.support_points, expected);
+    }
+
+    #[test]
+    fn resampled_skins_keep_their_feet_and_reject_falls() {
+        let reference = crate::Config::default();
+        let mut vision = crate::vision::Vision::new(&reference, "simd").unwrap();
+        for (name, width, height, foot) in [
+            ("skin-gold-cardboard-bonus", 360, 684, Some((200., 630.))),
+            ("skin-gold-cardboard-seam", 360, 684, Some((338., 606.))),
+            ("skin-gold-cardboard", 360, 684, Some((391., 643.))),
+            ("skin-gold-yellow-badge", 830, 1575, Some((364., 626.))),
+            ("skin-gold-falling", 360, 684, None),
+            ("purple-horizontal-fall", 830, 1575, None),
+        ] {
+            let mut capture_size = reference.clone();
+            capture_size.0["window_ref_width"] = width.into();
+            capture_size.0["window_ref_height"] = height.into();
+            let capture = fixture(name).for_recognition(&capture_size).unwrap();
+            let frame = capture.for_recognition(&reference).unwrap();
+            vision.reset_prior();
+            let result = vision.detect(&frame).unwrap();
+            if let Some((x, y)) = foot {
+                let piece = result.piece.expect(name);
+                assert_eq!(piece.source, "skin-shape", "{name}");
+                assert!((piece.x - x).hypot(piece.y - y) <= 4., "{name}: {piece:?}");
+                assert!(result.target.is_some(), "{name}");
+            } else {
+                assert!(result.piece.is_none() && result.target.is_none(), "{name}");
+            }
+        }
     }
 
     #[test]

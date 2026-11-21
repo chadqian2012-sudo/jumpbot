@@ -89,6 +89,21 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
+        let dim = |key: &str| {
+            self.0[key]
+                .as_u64()
+                .filter(|n| *n > 0 && *n <= i32::MAX as u64)
+        };
+        let pixels = dim("window_ref_width")
+            .zip(dim("window_ref_height"))
+            .map(|(w, h)| w * h);
+        if pixels.is_none_or(|n| n > 32 * 1024 * 1024)
+            || self.0["window_size_tol_px"].as_u64().is_none()
+        {
+            return Err(
+                "标定宽高必须为正整数，总像素不能超过 33554432，尺寸容差必须为非负整数".into(),
+            );
+        }
         for key in [
             "startup_wait_s",
             "start_delay_s",

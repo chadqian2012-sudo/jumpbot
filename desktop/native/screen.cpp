@@ -19,6 +19,15 @@ extern "C" int jb_decode(const unsigned char* bytes, size_t count, void* context
     } catch (...) { return 0; }
 }
 
+extern "C" int jb_resize_bgr(const unsigned char* pixels, int w, int h, unsigned char* output, int out_w, int out_h) noexcept {
+    try {
+        const cv::Mat source(h, w, CV_8UC3, const_cast<unsigned char*>(pixels));
+        cv::Mat dest(out_h, out_w, CV_8UC3, output);
+        cv::resize(source, dest, dest.size(), 0, 0, out_w <= w && out_h <= h ? cv::INTER_AREA : cv::INTER_LINEAR);
+        return 1;
+    } catch (...) { return 0; }
+}
+
 extern "C" int jb_encode(const unsigned char* pixels,int w,int h,void* context,Pixels copy) noexcept {
     try {
         std::vector<unsigned char> data;

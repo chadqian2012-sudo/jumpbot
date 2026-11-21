@@ -7,6 +7,14 @@ use std::{
 };
 type Pixels = extern "C" fn(*mut c_void, c_int, c_int, *const u8);
 extern "C" {
+    fn jb_resize_bgr(
+        data: *const u8,
+        w: c_int,
+        h: c_int,
+        out: *mut u8,
+        out_w: c_int,
+        out_h: c_int,
+    ) -> c_int;
     fn jb_decode(bytes: *const u8, size: usize, ctx: *mut c_void, cb: Pixels) -> c_int;
     fn jb_encode(bytes: *const u8, w: c_int, h: c_int, ctx: *mut c_void, cb: Pixels) -> c_int;
     fn jb_templates() -> *mut c_void;
@@ -33,6 +41,38 @@ extern "C" {
     fn jb_cv_threads(n: c_int);
 }
 impl Frame {
+    /// Keep templates, axis projection and calibration in one coordinate system.
+    pub(crate) fn resized_for_recognition(&self, cfg: &Config) -> Result<Option<Self>> {
+        let width = cfg.i("window_ref_width") as usize;
+        let height = cfg.i("window_ref_height") as usize;
+        let tolerance = cfg.i("window_size_tol_px") as usize;
+        if self.width.abs_diff(width) <= tolerance && self.height.abs_diff(height) <= tolerance {
+            return Ok(None);
+        }
+        if !self.valid() {
+            return Err("截图像素无效".into());
+        }
+        let mut bgr = vec![0; width * height * 3];
+        if unsafe {
+            jb_resize_bgr(
+                self.bgr.as_ptr(),
+                self.width as _,
+                self.height as _,
+                bgr.as_mut_ptr(),
+                width as _,
+                height as _,
+            )
+        } == 0
+        {
+            return Err("无法将客户区截图换算到标定尺寸".into());
+        }
+        Ok(Some(Self { width, height, bgr }))
+    }
+
+    pub(crate) fn for_recognition(self, cfg: &Config) -> Result<Self> {
+        Ok(self.resized_for_recognition(cfg)?.unwrap_or(self))
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         extern "C" fn copy(ctx: *mut c_void, w: i32, h: i32, p: *const u8) {
             unsafe {

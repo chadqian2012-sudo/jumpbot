@@ -247,11 +247,16 @@ fn face_center(parts: &Regions, id: usize, stats: [i32; 5], slope: f64) -> Optio
             if ((first - l as f64) - (r as f64 - first)).abs() > (0.045 * span).max(3.0) {
                 return (width > 0.0).then_some((first, (by + best_row) as f64, width));
             }
-            if span > width + 1.5 {
-                best_row = row;
+            if span > width {
+                // Rounded edges can widen one pixel at a time after resampling.
+                // Keep the last pronounced expansion, or advance the center when
+                // gradual widening continues for a full plateau window.
+                if span > width + 1.5 || row - best_row >= 8 {
+                    best_row = row;
+                }
                 growth = row;
+                width = span;
             }
-            width = width.max(span);
         }
     }
     if width <= 0.0 || width < 0.15 * bw as f64 {
@@ -751,7 +756,7 @@ impl Vision {
         if auto_skin {
             candidates.retain(|p| p.tpl_score >= score_min);
             if candidates.is_empty() {
-                skin = crate::skin::detect_skin(frame, Some(bm), foot_ratio);
+                skin = crate::skin::detect_skin(frame, Some(bm), foot_ratio, !horizontal);
                 if let Some(m) = &skin {
                     let (x, y, bw, bh) = m.bbox;
                     let covered = parts
