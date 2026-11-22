@@ -158,6 +158,39 @@ class RunControl:
                         input_active=bool(self.inputs))
 
 
+def console_keys():
+    """Read only this console. Ignore key repeats and modified shortcuts."""
+    import ctypes
+    import msvcrt
+    import struct
+    from ctypes import wintypes
+
+    read = ctypes.WinDLL("kernel32", use_last_error=True).ReadConsoleInputW
+    read.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD)]
+    read.restype = wintypes.BOOL
+    # INPUT_RECORD with its KEY_EVENT_RECORD union member (Windows SDK).
+    event = struct.Struct("<H2xiHHHHI")
+    buf = ctypes.create_string_buffer(event.size)
+    count = wintypes.DWORD()
+    with open("CONIN$", "rb", buffering=0) as console:
+        handle = msvcrt.get_osfhandle(console.fileno())
+        p_down = False
+        while read(handle, buf, 1, ctypes.byref(count)):
+            kind, down, _, vk, _, char, modifiers = event.unpack(buf.raw)
+            if kind == 16 and not down:  # FOCUS_EVENT: key-up can go to another console.
+                p_down = False
+            if kind != 1:
+                continue
+            if vk == ord("P"):
+                first = down and not p_down
+                p_down = bool(down)
+                if first and not modifiers & 15:
+                    yield "p"
+            elif down and char in (ord("q"), ord("Q"), 27):
+                yield chr(char)
+
+
 class WindowsHotkeyListener:
     """Message pump owns registration/unregistration on the same thread."""
     def __init__(self, control: RunControl, poll_stop):

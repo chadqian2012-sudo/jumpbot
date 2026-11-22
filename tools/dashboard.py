@@ -322,11 +322,20 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
     lines.append("=" * 62)
 
     # 等待游戏窗口时只显示最简信息（用户要求：就一句"正在等待游戏窗口"）
+    backend_line = ""
+    if status and (status.get("mask_backend_requested") or status.get("mask_backend")):
+        actual = status.get("mask_backend") or "待首帧确认"
+        requested = status.get("mask_backend_requested")
+        detail = status.get("mask_backend_note") or status.get("mask_bench_ms")
+        backend_line = ("识别后端   : " + (f"请求 {requested} / " if requested else "")
+                        + f"实际 {'cuda' if actual == 'gpu' else actual}" + (f"（{detail}）" if detail else ""))
     if status and status.get("state") == "waiting_window":
         lines.append(f"脚本 PID   : {status.get('pid')}")
         lines.append("")
         lines.append("正在等待游戏窗口…")
         lines.append(f"{status.get('pause_hotkey', 'Alt+P')} 暂停/恢复；F8 停止脚本")
+        if backend_line:
+            lines.append(backend_line)
         waited = status.get("waited_s")
         if waited:
             lines.append(f"已等待 {int(waited)} 秒")
@@ -346,17 +355,16 @@ def render(status: dict | None, csv_stats: dict | None, bot_pid: int | None, ans
             lines.append(f"游戏窗口   : hwnd={win.get('hwnd')} pid={win.get('pid')} "
                          f"客户区={win.get('client')}")
         lines.append(f"运行时长   : {elapsed_text(status)}    {jump_progress(status)}")
-        lines.append(f"暂停/恢复  : {status.get('pause_hotkey', 'Alt+P')} / 控制台 P"
+        lines.append(f"暂停/恢复  : {status.get('pause_hotkey', 'Alt+P')} / 脚本窗口 P"
                      f"    已暂停 {status.get('pause_total_s', 0):.1f} 秒")
         if status.get('hotkey_registered') is False:
-            lines.append("全局热键   : 未启用（只有控制台 P 可切换暂停）")
+            lines.append("全局热键   : 未启用（可在脚本窗口按 P）")
         if status.get('hotkey_error'):
-            lines.append(f"热键提示   : {status['hotkey_error']}（控制台 P 可用）")
+            lines.append(f"热键提示   : {status['hotkey_error']}（脚本窗口 P 可用）")
         if status.get('countdown_s') is not None:
             lines.append(f"倒计时     : {status['countdown_s']:.1f} 秒")
-        if status.get("mask_backend"):
-            lines.append(f"掩码后端   : {status.get('mask_backend')}"
-                         f"{'（' + str(status.get('mask_bench_ms')) + '）' if status.get('mask_bench_ms') else ''}")
+        if backend_line:
+            lines.append(backend_line)
         if status.get('piece_source'):
             mode = '自动颜色/轮廓适配' if status.get('skin_auto_enabled') else '旧模板模式'
             source = ('完整头身几何' if status['piece_source'] == 'skin-shape' else '初始颜色/模板')
@@ -428,6 +436,7 @@ def main() -> int:
     ap.add_argument("--status", default=str(DEFAULT_STATUS))
     ap.add_argument("--csv", default="", help="指定 CSV；默认选最新")
     ap.add_argument("--interval", type=float, default=0.25)
+    ap.add_argument("--control-handle", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--once", action="store_true", help="只渲染一帧")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
@@ -437,6 +446,23 @@ def main() -> int:
     status_reader = StatusReader(status_path)
     interval = max(args.interval, 0.2)
     lower_priority()
+    if args.control_handle is not None:
+        import msvcrt
+        import threading
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from run_control import console_keys
+
+        def send_keys():
+            with os.fdopen(msvcrt.open_osfhandle(args.control_handle, os.O_WRONLY),
+                           "wb", buffering=0) as channel:
+                try:
+                    for key in console_keys():
+                        if key == "p":
+                            channel.write(b"p")
+                except OSError:
+                    return  # The owning worker stopped or the console closed.
+
+        threading.Thread(target=send_keys, name="panel-P", daemon=True).start()
     try:
         while True:
             frame_start = time.monotonic()
@@ -457,6 +483,8 @@ def main() -> int:
             else:
                 pid, _cmd = bot_process()
             text = render(status, csv_stats, pid, ansi)
+            if args.control_handle is not None:
+                text += "\n本面板按 P 可暂停 / 恢复"
             if args.once:
                 print(text.replace("\x1b[2J\x1b[H", ""))
                 return 0

@@ -1,5 +1,11 @@
 # 跳一跳 屏幕识别自动脚本（自适应版）
 
+### Python 源码 ZIP
+
+在解压目录运行 `run.bat`。启动器优先使用已激活的环境，再找解压目录和上一级的 `.venv`。普通识别安装 `python -m pip install -r requirements.txt`，NVIDIA CUDA 环境安装 `python -m pip install -r requirements-cuda.txt`。
+在脚本窗口或它自动打开的实时面板中按 **P** 暂停，再按一次恢复。全局快捷键是 **Alt+P**。脚本窗口的 **Q / Esc** 和全局 **F8** 停止本轮。
+用 `run.bat --backend cuda --selftest` 在合成图上验证当前 Python 环境；指定后端无法执行时自检返回非零。运行时用 `run.bat --backend cuda` 指定后端，面板分别显示请求和实际值；设备不可用时沿用 CPU 回退并显示原因。CLI 的 `--backend` 优先于环境变量 `JUMPBOT_MASKS_BACKEND` 和配置文件。
+
 在 Windows 上截取微信小游戏「跳一跳」窗口画面，用 OpenCV 识别棋子与目标方块，
 模拟鼠标按住蓄力完成自动跳跃。当前配置按压系数固定为 k=2.61，在线自适应关闭。
 
