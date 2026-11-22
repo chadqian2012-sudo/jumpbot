@@ -328,6 +328,7 @@ impl View {
             v.send(Backend, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
         }
         v.send(Backend, CB_SETCURSEL, 0, 0);
+        v.send(Daemon, BM_SETCHECK, BST_CHECKED as usize, 0);
         Ok(v)
     }
     unsafe fn child(&self, id: Id) -> HWND {
@@ -461,6 +462,7 @@ impl View {
         self.text(
             ActualBackend,
             match st["mask_backend"].as_str() {
+                Some("pending") => "等待首帧",
                 Some("cuda" | "gpu") => "CUDA",
                 Some("simd") => "CPU SIMD",
                 Some("cpu") => "CPU",

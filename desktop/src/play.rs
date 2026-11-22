@@ -607,8 +607,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             Ok(None) => continue,
             Err(reason) => {
                 game.report(
-                    "blocked_modal",
-                    json!({"game_state":"blocked_modal","stop_reason":reason}),
+                    "capture_blocked",
+                    json!({"game_state":"capture_blocked","stop_reason":reason}),
                 );
                 previous_center = None;
                 baseline = true;

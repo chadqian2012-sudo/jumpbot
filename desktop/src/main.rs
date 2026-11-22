@@ -57,11 +57,12 @@ impl Engine {
 
 enum Event {
     Status(Value),
-    Log(String),
+    Log { line: String, stderr: bool },
 }
 fn read_worker(
     stream: impl std::io::Read + Send + 'static,
     tx: Sender<Event>,
+    stderr: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
@@ -71,7 +72,7 @@ fn read_worker(
                 };
                 Event::Status(status)
             } else {
-                Event::Log(line)
+                Event::Log { line, stderr }
             };
             if tx.send(event).is_err() {
                 break;
@@ -83,27 +84,31 @@ struct Session {
     child: Child,
     selftest: bool,
     events: Receiver<Event>,
+    last_stderr: Option<String>,
     readers: [thread::JoinHandle<()>; 2],
 }
 impl Session {
     fn new(mut child: Child, selftest: bool) -> Self {
         let (tx, events) = mpsc::channel();
         let readers = [
-            read_worker(child.stdout.take().unwrap(), tx.clone()),
-            read_worker(child.stderr.take().unwrap(), tx),
+            read_worker(child.stdout.take().unwrap(), tx.clone(), false),
+            read_worker(child.stderr.take().unwrap(), tx, true),
         ];
         Self {
             child,
             selftest,
             events,
+            last_stderr: None,
             readers,
         }
     }
     fn stop(&mut self) {
-        self.child.stdin.take(); // EOF requests cooperative stop after release.
         if self.selftest {
             let _ = self.child.kill();
+        } else {
+            let _ = self.send(b"stop\n");
         }
+        self.child.stdin.take();
     }
     fn send(&mut self, command: &[u8]) -> std::io::Result<()> {
         self.child
@@ -144,6 +149,13 @@ impl Host {
             Ok(child) => {
                 self.session = Some(Session::new(child, selftest));
                 self.ui.started(selftest);
+                if !selftest {
+                    self.ui.log(format!(
+                        "已启动。请求后端：{}；窗口重开后{}。",
+                        BACKENDS[index].0,
+                        if daemon { "继续" } else { "结束本轮" }
+                    ));
+                }
             }
             Err(e) => self.ui.notice = e.to_string(),
         }
@@ -187,12 +199,22 @@ impl Host {
             .filter(|_| run.readers.iter().all(thread::JoinHandle::is_finished));
         for event in run.events.try_iter() {
             match event {
-                Event::Log(s) => self.ui.log(s),
+                Event::Log { line, stderr } => {
+                    if stderr && !line.trim().is_empty() {
+                        run.last_stderr = Some(line.clone());
+                    }
+                    self.ui.log(line);
+                }
                 Event::Status(s) => self.ui.update(s),
             }
         }
         if let Some(code) = exit {
-            self.ui.exited(run.selftest, code.success(), code.code());
+            self.ui.exited(
+                run.selftest,
+                code.success(),
+                code.code(),
+                run.last_stderr.as_deref(),
+            );
             self.session = None;
         }
     }
