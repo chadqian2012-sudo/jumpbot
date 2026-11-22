@@ -1,21 +1,62 @@
 use serde_json::Value;
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pose {
+    pub along: f32,
+    pub lift: f32,
+    pub squash: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Jump {
     pub started: Instant,
-    pub from: f32,
+    from: Pose,
     pub to: f32,
 }
 
 impl Jump {
-    pub const DURATION: std::time::Duration = std::time::Duration::from_millis(680);
+    pub fn next(previous: Option<Self>, now: Instant) -> Self {
+        Self {
+            started: now,
+            from: previous.map_or_else(Pose::default, |jump| jump.pose(now)),
+            to: previous.map_or(1., |jump| 1. - jump.to),
+        }
+    }
 
-    pub fn position(self, now: Instant) -> f32 {
-        let t = (now.saturating_duration_since(self.started).as_secs_f32()
-            / Self::DURATION.as_secs_f32())
-        .min(1.);
-        let eased = t * t * (3. - 2. * t);
-        self.from * (1. - eased) + self.to * eased
+    pub fn duration(self) -> Duration {
+        Duration::from_millis(if self.to == 1. { 440 } else { 260 })
+    }
+
+    pub fn rest(self) -> Pose {
+        Pose {
+            along: self.to,
+            ..Pose::default()
+        }
+    }
+
+    pub fn pose(self, now: Instant) -> Pose {
+        let t = now.saturating_duration_since(self.started).as_secs_f32()
+            / self.duration().as_secs_f32();
+        if t >= 1. {
+            return self.rest();
+        }
+        // Reserve the final part of the movement for a single, foot-anchored landing.
+        let flight = (t / 0.80).min(1.);
+        let u = flight * flight * (3. - 2. * flight);
+        let air = 4. * u * (1. - u);
+        let apex: f32 = if self.to == 1. { 0.31 } else { 0.16 };
+        let settle = ((t - 0.80) / 0.20).max(0.);
+        let contact = 4. * settle * (1. - settle);
+        Pose {
+            along: self.from.along + (self.to - self.from.along) * u,
+            lift: self.from.lift * (1. - u)
+                + (apex - self.from.lift).max(0.) * (self.to - self.from.along).abs() * air,
+            squash: self.from.squash * (1. - u) + contact * contact,
+        }
     }
 }
 
@@ -135,11 +176,7 @@ impl Console {
             }
             if self.mode == Mode::Live && phase != self.phase {
                 if phase == "landing" {
-                    self.landed = Some(Jump {
-                        started: self.observed,
-                        from: self.landed.map_or(0., |jump| jump.position(self.observed)),
-                        to: self.landed.map_or(1., |jump| 1. - jump.to),
-                    });
+                    self.landed = Some(Jump::next(self.landed, self.observed));
                 }
                 self.phase = phase.into();
             }
@@ -268,6 +305,21 @@ impl Console {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn return_takes_a_lower_faster_arc_and_retargeting_preserves_the_pose() {
+        let now = Instant::now();
+        let out = Jump::next(None, now);
+        let back = Jump::next(Some(out), now + out.duration());
+        let mid_flight = |j: Jump| j.started + j.duration().mul_f32(0.4);
+        assert!(back.duration() < out.duration());
+        assert!(back.pose(mid_flight(back)).lift < out.pose(mid_flight(out)).lift);
+        for fraction in [0.4, 0.9] {
+            let interrupt = now + out.duration().mul_f32(fraction);
+            let turn = Jump::next(Some(out), interrupt);
+            assert_eq!(turn.pose(interrupt), out.pose(interrupt));
+            assert_eq!(turn.pose(interrupt + turn.duration()), Pose::default());
+        }
+    }
     #[test]
     fn generation_conflict_and_stop_gate_controls() {
         let mut s = Console::new(None);

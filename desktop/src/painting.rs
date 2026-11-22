@@ -1,9 +1,13 @@
 //! Parent surface and owner-drawn push buttons. All geometry is in logical pixels.
 use crate::{
-    console::Jump,
+    console::{Jump, Pose},
     native::{wide, Id},
 };
-use std::{cell::RefCell, ptr::null_mut, time::Instant};
+use std::{
+    cell::RefCell,
+    ptr::null_mut,
+    time::{Duration, Instant},
+};
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
@@ -85,6 +89,22 @@ impl Layout {
     pub fn px(self, v: i32) -> i32 {
         (v as f32 * self.scale).round() as i32
     }
+    fn diagram(self) -> RECT {
+        let top = self.top + 86;
+        let bottom = self.split - 49 - 8; // Leave a gap above the footer rule.
+        rect(42, top, self.left - 36, bottom - top)
+    }
+    pub fn diagram_pixels(self) -> RECT {
+        self.pixels(self.diagram())
+    }
+    fn pixels(self, b: RECT) -> RECT {
+        RECT {
+            left: self.px(b.left),
+            top: self.px(b.top),
+            right: self.px(b.right),
+            bottom: self.px(b.bottom),
+        }
+    }
     pub fn bounds(self, id: Id) -> RECT {
         use Id::*;
         let Self {
@@ -161,12 +181,7 @@ impl Layout {
                 (h - body - 85).max(56),
             ),
         };
-        RECT {
-            left: self.px(b.left),
-            top: self.px(b.top),
-            right: self.px(b.right),
-            bottom: self.px(b.bottom),
-        }
+        self.pixels(b)
     }
 }
 pub struct Fonts {
@@ -241,30 +256,30 @@ pub struct Scene {
     pub fonts: Fonts,
     pub motion: bool,
     pub transition: Instant,
+    pub frame_time: Instant,
     pub landing: Option<Jump>,
     pub notice: bool,
 }
 thread_local! {pub static SCENE:RefCell<Option<Scene>>=const{RefCell::new(None)};}
+pub const ENTRY_DURATION: Duration = Duration::from_millis(400);
 fn animation_frame(
     motion: bool,
     now: Instant,
     transition: Instant,
     landing: Option<Jump>,
-) -> (f32, Option<(Jump, f32)>) {
+) -> (f32, Pose) {
     if !motion {
-        return (1., None);
+        return (1., landing.map_or_else(Pose::default, Jump::rest));
     }
-    let entry = (now.saturating_duration_since(transition).as_secs_f32() / 0.4).min(1.);
-    (entry, landing.map(|jump| (jump, jump.position(now))))
+    let entry = (now.saturating_duration_since(transition).as_secs_f32()
+        / ENTRY_DURATION.as_secs_f32())
+    .min(1.);
+    (
+        entry,
+        landing.map_or_else(Pose::default, |jump| jump.pose(now)),
+    )
 }
 impl Scene {
-    pub fn moving(&self) -> bool {
-        self.motion
-            && (self.transition.elapsed().as_secs_f32() < 0.4
-                || self
-                    .landing
-                    .is_some_and(|jump| jump.started.elapsed() < Jump::DURATION))
-    }
     pub fn bg(&self, id: Option<Id>) -> u32 {
         match id {
             Some(Id::Shortcuts) => self.colors.paper,
@@ -272,7 +287,26 @@ impl Scene {
             _ => self.colors.panel,
         }
     }
-    pub unsafe fn draw(&self, dc: HDC) {
+    unsafe fn draw(&self, dc: HDC, dirty: RECT) {
+        let l = self.layout;
+        let board = l.diagram_pixels();
+        let (t, pose) =
+            animation_frame(self.motion, self.frame_time, self.transition, self.landing);
+        let amount = 1. - (1. - t).powi(3);
+        if dirty.left >= board.left
+            && dirty.top >= board.top
+            && dirty.right <= board.right
+            && dirty.bottom <= board.bottom
+        {
+            fill(dc, dirty, self.colors.panel);
+        } else {
+            self.draw_panels(dc, amount);
+        }
+        if IntersectRect(&mut RECT::default(), &board, &dirty) != 0 {
+            self.diagram(dc, l.diagram(), amount, pose, self.frame_time);
+        }
+    }
+    unsafe fn draw_panels(&self, dc: HDC, amount: f32) {
         let l = self.layout;
         let c = self.colors;
         let f = &self.fonts;
@@ -300,8 +334,6 @@ impl Scene {
         text(24, 60, 310, 24, f.latin, c.muted, "//  JUMP CONSOLE");
         text(22, 82, 430, 48, f.title, c.ink, "跳一跳控制台");
         box_at(24, 132, l.w - 48, 1, c.ink);
-        let (t, jump) = animation_frame(self.motion, Instant::now(), self.transition, self.landing);
-        let amount = 1. - (1. - t).powi(3);
         for (x, y, w, h, en, cn) in [
             (
                 24,
@@ -386,126 +418,120 @@ impl Scene {
         text(42, l.split + 64, 130, 20, f.small, c.muted, "识别后端");
         let foot = l.split - 49;
         box_at(42, foot, l.left - 36, 1, c.rule);
-        self.diagram(
-            dc,
-            rect(42, l.top + 86, l.left - 36, foot - l.top - 94),
-            amount,
-            jump,
-        );
     }
-    unsafe fn diagram(&self, dc: HDC, bounds: RECT, entry: f32, jump: Option<(Jump, f32)>) {
-        let (x, y, w, h) = (
-            bounds.left,
-            bounds.top,
-            bounds.right - bounds.left,
-            bounds.bottom - bounds.top,
-        );
-        if h < 24 {
+    unsafe fn diagram(&self, dc: HDC, bounds: RECT, entry: f32, pose: Pose, now: Instant) {
+        let w = (bounds.right - bounds.left) as f32;
+        let h = (bounds.bottom - bounds.top) as f32;
+        if h < 24. {
             return;
         }
-        let l = self.layout;
+        let scale = self.layout.scale;
         let c = self.colors;
-        let pt = |a: f32, b: f32| POINT {
-            x: ((x as f32 + w as f32 * a) * l.scale).round() as i32,
-            y: ((y as f32 + h as f32 * b) * l.scale).round() as i32,
+        let pt = |x: f32, y: f32| POINT {
+            x: ((bounds.left as f32 + x) * scale).round() as i32,
+            y: ((bounds.top as f32 + y) * scale).round() as i32,
         };
-        let line = |a: POINT, b: POINT, color| {
-            SetDCPenColor(dc, color);
-            MoveToEx(dc, a.x, a.y, null_mut());
-            LineTo(dc, b.x, b.y);
+        let ground = |along: f32| {
+            (
+                w * (0.23 + 0.54 * along),
+                h * (0.72 - 0.17 * along + (1. - entry) * 0.025),
+            )
+        };
+        let feet = |pose: Pose| {
+            let (x, y) = ground(pose.along);
+            (x, y - pose.lift * h)
         };
         SelectObject(dc, GetStockObject(DC_PEN));
         SelectObject(dc, GetStockObject(DC_BRUSH));
-        for i in 0..25 {
-            let v = i as f32 / 24.;
-            line(pt(v, 0.02), pt(v, 0.97), c.rule);
-        }
-        for i in 0..8 {
-            let v = i as f32 / 8.;
-            line(pt(0., v), pt(1., v), c.rule);
-        }
-        let diamond = |cx: f32, cy: f32, rx: f32, ry: f32, ink, fill| {
-            let a = [
-                pt(cx - rx, cy),
-                pt(cx, cy - ry),
-                pt(cx + rx, cy),
-                pt(cx, cy + ry),
-            ];
-            SetDCPenColor(dc, ink);
-            SetDCBrushColor(dc, fill);
-            Polygon(dc, a.as_ptr(), 4);
+        let face = |points: &[POINT], color| {
+            SetDCPenColor(dc, color);
+            SetDCBrushColor(dc, color);
+            Polygon(dc, points.as_ptr(), points.len() as i32);
         };
-        let target = jump.map_or(1., |(jump, _)| jump.to);
-        for (side, (cx, cy)) in [(0.24, 0.70), (0.76, 0.51)].into_iter().enumerate() {
-            let cy = cy + (1. - entry) * 0.14;
-            let sides = [
-                pt(cx - 0.155, cy),
-                pt(cx, cy + 0.115),
-                pt(cx + 0.155, cy),
-                pt(cx + 0.155, cy + 0.07),
-                pt(cx, cy + 0.185),
-                pt(cx - 0.155, cy + 0.07),
-            ];
-            SetDCPenColor(dc, c.ink);
-            SetDCBrushColor(dc, c.chip);
-            Polygon(dc, sides.as_ptr(), 6);
-            for i in 1..14 {
-                let t = i as f32 / 14.;
-                line(
-                    pt(cx - 0.155 * (1. - t), cy + 0.115 * t + 0.01),
-                    pt(cx - 0.155 * (1. - t) + 0.013, cy + 0.115 * t + 0.065),
-                    c.rule,
+        let oval = |a: POINT, b: POINT, color| {
+            SetDCPenColor(dc, color);
+            SetDCBrushColor(dc, color);
+            Ellipse(dc, a.x, a.y, b.x + 1, b.y + 1);
+        };
+
+        // Keep the tiles and the pawn in proportion even in a shallow window.
+        let tile = (w * 0.14).min(h * 0.40);
+        let rim = tile * 0.36;
+        let depth = tile * 0.22;
+        let target = self.landing.map_or(0., |jump| jump.to);
+        for side in [0., 1.] {
+            let (x, y) = ground(side);
+            let left = pt(x - tile, y);
+            let front = pt(x, y + rim);
+            let right = pt(x + tile, y);
+            let bottom = pt(x, y + rim + depth);
+            face(&[left, front, bottom, pt(x - tile, y + depth)], c.rule);
+            face(&[front, right, pt(x + tile, y + depth), bottom], c.paper);
+            face(&[left, pt(x, y - rim), right, front], c.chip);
+            if side == target {
+                let mark = tile * 0.13;
+                face(
+                    &[
+                        pt(x - mark, y),
+                        pt(x, y - mark * 0.36),
+                        pt(x + mark, y),
+                        pt(x, y + mark * 0.36),
+                    ],
+                    AMBER,
                 );
             }
-            line(pt(cx, cy + 0.115), pt(cx, cy + 0.185), c.ink);
-            diamond(cx, cy, 0.155, 0.115, c.ink, c.paper);
-            if side as f32 == target {
-                diamond(cx, cy, 0.027, 0.021, c.ink, c.panel);
+        }
+
+        // Only the most recent stretch of actual flight leaves a trace.
+        if let Some(jump) = self.landing.filter(|_| self.motion) {
+            let age = now.saturating_duration_since(jump.started);
+            if age < jump.duration() {
+                for (ms, color) in [(48, c.rule), (32, c.rule), (16, c.muted), (0, c.muted)] {
+                    let past = if ms == 0 {
+                        pose
+                    } else {
+                        jump.pose(jump.started + age.saturating_sub(Duration::from_millis(ms)))
+                    };
+                    let (x, y) = feet(past);
+                    let p = pt(x, y);
+                    if ms == 48 {
+                        MoveToEx(dc, p.x, p.y, null_mut());
+                    } else {
+                        SetDCPenColor(dc, color);
+                        LineTo(dc, p.x, p.y);
+                    }
+                }
             }
         }
-        let offset = (1. - entry) * 0.14;
-        let arc = |t: f32| {
-            pt(
-                0.24 + 0.52 * t,
-                0.70 + offset - 0.19 * t - 1.61 * t * (1. - t),
-            )
-        };
-        let (from, position) = jump.map_or((0., 0.), |(jump, p)| (jump.from, p));
-        let color = if jump.is_some() { c.ink } else { c.muted };
-        for i in 0..40 {
-            let mut start = i as f32 / 40.;
-            let mut end = (i + 1) as f32 / 40.;
-            if i % 2 != 0 {
-                start = start.max(from.min(position));
-                end = end.min(from.max(position));
-            }
-            if start < end {
-                line(arc(start), arc(end), color);
-            }
-        }
-        let p = arc(position);
-        // At the apex the feet are about 19.7% below the top. Reserve room for the full 3k silhouette.
-        let k = (l.px(h) / 16).clamp(1, l.px(15));
-        SetDCBrushColor(dc, c.ink);
-        SetDCPenColor(dc, c.ink);
-        Ellipse(dc, p.x - k / 2, p.y - 3 * k, p.x + k / 2 + 1, p.y - 2 * k);
-        let body = [
-            POINT {
-                x: p.x - k / 3,
-                y: p.y - 2 * k,
-            },
-            POINT {
-                x: p.x + k / 3,
-                y: p.y - 2 * k,
-            },
-            POINT { x: p.x + k, y: p.y },
-            POINT {
-                x: p.x,
-                y: p.y + k / 4,
-            },
-            POINT { x: p.x - k, y: p.y },
+        let (x, y) = feet(pose);
+        let k = (tile * 0.155).min(h * 0.064).min(15.);
+        let width = k * (1. + 0.12 * pose.squash);
+        let height = k * (1. - 0.16 * pose.squash);
+        let pawn = |a: f32, b: f32| pt(x + a * width, y - b * height);
+        // A rounded base and a lightly tapered neck, with the foot anchored on contact.
+        BeginPath(dc);
+        let top = pawn(-0.32, 1.84);
+        MoveToEx(dc, top.x, top.y, null_mut());
+        let contour = [
+            pawn(-0.32, 2.06),
+            pawn(0.32, 2.06),
+            pawn(0.32, 1.84),
+            pawn(0.33, 1.25),
+            pawn(0.65, 0.62),
+            pawn(0.77, 0.28),
+            pawn(0.92, -0.09),
+            pawn(-0.92, -0.09),
+            pawn(-0.77, 0.28),
+            pawn(-0.65, 0.62),
+            pawn(-0.33, 1.25),
+            top,
         ];
-        Polygon(dc, body.as_ptr(), 5);
+        PolyBezierTo(dc, contour.as_ptr(), contour.len() as u32);
+        CloseFigure(dc);
+        EndPath(dc);
+        SetDCBrushColor(dc, c.ink);
+        FillPath(dc);
+        oval(pawn(-0.48, 3.10), pawn(0.48, 2.14), c.ink);
     }
 }
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
@@ -526,35 +552,40 @@ unsafe fn label(dc: HDC, mut r: RECT, font: HFONT, color: u32, s: &str, align: u
     );
     SelectObject(dc, old);
 }
+unsafe fn paint_region(scene: &Scene, dc: HDC, dirty: RECT) {
+    let (w, h) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let mem = CreateCompatibleDC(dc);
+    let bmp = CreateCompatibleBitmap(dc, w, h);
+    let mut copied = false;
+    if !mem.is_null() && !bmp.is_null() {
+        let old = SelectObject(mem, bmp);
+        if !old.is_null() {
+            // Both drawing and BitBlt's source use client coordinates in this DC.
+            if SetWindowOrgEx(mem, dirty.left, dirty.top, null_mut()) != 0 {
+                scene.draw(mem, dirty);
+                copied = BitBlt(
+                    dc, dirty.left, dirty.top, w, h, mem, dirty.left, dirty.top, SRCCOPY,
+                ) != 0;
+            }
+            SelectObject(mem, old);
+        }
+    }
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    if !copied {
+        scene.draw(dc, dirty);
+    }
+}
+
 pub unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut ps);
     SCENE.with_borrow(|s| {
         if let Some(s) = s {
-            let mut r = RECT::default();
-            GetClientRect(hwnd, &mut r);
-            let mem = CreateCompatibleDC(dc);
-            let bmp = CreateCompatibleBitmap(dc, r.right.max(1), r.bottom.max(1));
-            if !mem.is_null() && !bmp.is_null() {
-                let old = SelectObject(mem, bmp);
-                s.draw(mem);
-                BitBlt(
-                    dc,
-                    ps.rcPaint.left,
-                    ps.rcPaint.top,
-                    ps.rcPaint.right - ps.rcPaint.left,
-                    ps.rcPaint.bottom - ps.rcPaint.top,
-                    mem,
-                    ps.rcPaint.left,
-                    ps.rcPaint.top,
-                    SRCCOPY,
-                );
-                SelectObject(mem, old);
-            } else {
-                s.draw(dc);
-            }
-            DeleteObject(bmp);
-            DeleteDC(mem);
+            paint_region(s, dc, ps.rcPaint);
         }
     });
     EndPaint(hwnd, &ps);
@@ -653,17 +684,13 @@ mod tests {
     #[test]
     fn reduced_motion_is_static_and_normal_motion_finishes() {
         let start = Instant::now();
-        let jump = Jump {
-            started: start,
-            from: 0.,
-            to: 1.,
-        };
+        let jump = Jump::next(None, start);
         let during = start + std::time::Duration::from_millis(100);
         let frame = animation_frame(true, during, start, Some(jump));
-        assert!(frame.0 > 0. && frame.0 < 1. && frame.1.is_some());
+        assert!(frame.0 > 0. && frame.0 < 1. && frame.1.lift > 0.);
         assert_eq!(
             animation_frame(false, during, start, Some(jump)),
-            (1., None)
+            (1., jump.rest())
         );
         assert_eq!(
             animation_frame(
@@ -672,7 +699,7 @@ mod tests {
                 start,
                 Some(jump)
             ),
-            (1., Some((jump, 1.)))
+            (1., jump.rest())
         );
     }
 }
