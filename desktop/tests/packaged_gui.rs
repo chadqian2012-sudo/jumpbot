@@ -333,6 +333,7 @@ fn packaged_gui() -> Result<()> {
                 assert_eq!(worker(pid, &app.join("jumpbot.exe"))?.0, worker_pid);
                 ui.invoke("stop", "停止")?;
                 ui.named("phase", "已停止")?;
+                ui.named("phase-note", "控制端要求停止")?;
                 ui.named("primary", "启动脚本")?;
             }
             assert_eq!(

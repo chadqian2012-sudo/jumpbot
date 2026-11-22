@@ -1,5 +1,8 @@
 //! Parent surface and owner-drawn push buttons. All geometry is in logical pixels.
-use crate::native::{wide, Id};
+use crate::{
+    console::Jump,
+    native::{wide, Id},
+};
 use std::{cell::RefCell, ptr::null_mut, time::Instant};
 use windows_sys::Win32::{
     Foundation::*,
@@ -238,7 +241,7 @@ pub struct Scene {
     pub fonts: Fonts,
     pub motion: bool,
     pub transition: Instant,
-    pub landing: Option<(Instant, bool)>,
+    pub landing: Option<Jump>,
     pub notice: bool,
 }
 thread_local! {pub static SCENE:RefCell<Option<Scene>>=const{RefCell::new(None)};}
@@ -246,32 +249,21 @@ fn animation_frame(
     motion: bool,
     now: Instant,
     transition: Instant,
-    landing: Option<(Instant, bool)>,
-) -> (f32, Option<f32>) {
+    landing: Option<Jump>,
+) -> (f32, Option<(Jump, f32)>) {
     if !motion {
         return (1., None);
     }
     let entry = (now.saturating_duration_since(transition).as_secs_f32() / 0.4).min(1.);
-    let jump = landing.map(|(start, right)| {
-        let t = (now.saturating_duration_since(start).as_secs_f32() / 0.68).min(1.);
-        let eased = t * t * (3. - 2. * t);
-        if right {
-            eased
-        } else {
-            1. - eased
-        }
-    });
-    (entry, jump)
+    (entry, landing.map(|jump| (jump, jump.position(now))))
 }
 impl Scene {
     pub fn moving(&self) -> bool {
-        let (entry, _) =
-            animation_frame(self.motion, Instant::now(), self.transition, self.landing);
-        entry < 1.
-            || (self.motion
-                && self
+        self.motion
+            && (self.transition.elapsed().as_secs_f32() < 0.4
+                || self
                     .landing
-                    .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 0.68))
+                    .is_some_and(|jump| jump.started.elapsed() < Jump::DURATION))
     }
     pub fn bg(&self, id: Option<Id>) -> u32 {
         match id {
@@ -401,7 +393,7 @@ impl Scene {
             jump,
         );
     }
-    unsafe fn diagram(&self, dc: HDC, bounds: RECT, entry: f32, jump: Option<f32>) {
+    unsafe fn diagram(&self, dc: HDC, bounds: RECT, entry: f32, jump: Option<(Jump, f32)>) {
         let (x, y, w, h) = (
             bounds.left,
             bounds.top,
@@ -443,7 +435,8 @@ impl Scene {
             SetDCBrushColor(dc, fill);
             Polygon(dc, a.as_ptr(), 4);
         };
-        for (cx, cy) in [(0.24, 0.70), (0.76, 0.51)] {
+        let target = jump.map_or(1., |(jump, _)| jump.to);
+        for (side, (cx, cy)) in [(0.24, 0.70), (0.76, 0.51)].into_iter().enumerate() {
             let cy = cy + (1. - entry) * 0.14;
             let sides = [
                 pt(cx - 0.155, cy),
@@ -466,26 +459,33 @@ impl Scene {
             }
             line(pt(cx, cy + 0.115), pt(cx, cy + 0.185), c.ink);
             diamond(cx, cy, 0.155, 0.115, c.ink, c.paper);
+            if side as f32 == target {
+                diamond(cx, cy, 0.027, 0.021, c.ink, c.panel);
+            }
         }
         let offset = (1. - entry) * 0.14;
-        diamond(0.76, 0.51 + offset, 0.027, 0.021, c.ink, c.panel);
         let arc = |t: f32| {
             pt(
                 0.24 + 0.52 * t,
                 0.70 + offset - 0.19 * t - 1.61 * t * (1. - t),
             )
         };
+        let (from, position) = jump.map_or((0., 0.), |(jump, p)| (jump.from, p));
+        let color = if jump.is_some() { c.ink } else { c.muted };
         for i in 0..40 {
-            if i % 2 == 0 || jump.is_some_and(|v| i as f32 / 40. < v) {
-                line(
-                    arc(i as f32 / 40.),
-                    arc((i + 1) as f32 / 40.),
-                    if jump.is_some() { c.ink } else { c.muted },
-                );
+            let mut start = i as f32 / 40.;
+            let mut end = (i + 1) as f32 / 40.;
+            if i % 2 != 0 {
+                start = start.max(from.min(position));
+                end = end.min(from.max(position));
+            }
+            if start < end {
+                line(arc(start), arc(end), color);
             }
         }
-        let p = arc(jump.unwrap_or(0.));
-        let k = l.px((h / 11).clamp(5, 15));
+        let p = arc(position);
+        // At the apex the feet are about 19.7% below the top. Reserve room for the full 3k silhouette.
+        let k = (l.px(h) / 16).clamp(1, l.px(15));
         SetDCBrushColor(dc, c.ink);
         SetDCPenColor(dc, c.ink);
         Ellipse(dc, p.x - k / 2, p.y - 3 * k, p.x + k / 2 + 1, p.y - 2 * k);
@@ -653,11 +653,16 @@ mod tests {
     #[test]
     fn reduced_motion_is_static_and_normal_motion_finishes() {
         let start = Instant::now();
+        let jump = Jump {
+            started: start,
+            from: 0.,
+            to: 1.,
+        };
         let during = start + std::time::Duration::from_millis(100);
-        let frame = animation_frame(true, during, start, Some((start, true)));
+        let frame = animation_frame(true, during, start, Some(jump));
         assert!(frame.0 > 0. && frame.0 < 1. && frame.1.is_some());
         assert_eq!(
-            animation_frame(false, during, start, Some((start, true))),
+            animation_frame(false, during, start, Some(jump)),
             (1., None)
         );
         assert_eq!(
@@ -665,9 +670,9 @@ mod tests {
                 true,
                 start + std::time::Duration::from_secs(1),
                 start,
-                Some((start, true))
+                Some(jump)
             ),
-            (1., Some(1.))
+            (1., Some((jump, 1.)))
         );
     }
 }

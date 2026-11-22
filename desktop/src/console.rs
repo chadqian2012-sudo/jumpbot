@@ -1,5 +1,24 @@
 use serde_json::Value;
 use std::{collections::VecDeque, time::Instant};
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Jump {
+    pub started: Instant,
+    pub from: f32,
+    pub to: f32,
+}
+
+impl Jump {
+    pub const DURATION: std::time::Duration = std::time::Duration::from_millis(680);
+
+    pub fn position(self, now: Instant) -> f32 {
+        let t = (now.saturating_duration_since(self.started).as_secs_f32()
+            / Self::DURATION.as_secs_f32())
+        .min(1.);
+        let eased = t * t * (3. - 2. * t);
+        self.from * (1. - eased) + self.to * eased
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Idle,
@@ -17,7 +36,7 @@ pub struct Console {
     pub observed: Instant,
     pub logs: VecDeque<String>,
     pub log_sequence: u64,
-    pub landed: Option<(Instant, bool)>,
+    pub landed: Option<Jump>,
 }
 impl Console {
     pub fn new(error: Option<String>) -> Self {
@@ -71,12 +90,13 @@ impl Console {
         {
             self.notice = "暂停快捷键无法注册。请停止脚本，释放快捷键后再启动。".into();
         }
-        if self.mode == Mode::Live {
+        if matches!(self.mode, Mode::Live | Mode::Stopping) {
             let phase = s["state"].as_str().unwrap_or("starting");
-            if phase != self.phase || s["stop_reason"] != self.status["stop_reason"] {
+            if s["state"] != self.status["state"] || s["stop_reason"] != self.status["stop_reason"]
+            {
                 let reason = s["stop_reason"].as_str().unwrap_or("");
                 match phase {
-                    "waiting_window" | "capture_blocked" | "blocked_modal" | "stopped"
+                    "waiting_window" | "capture_blocked" | "blocked_modal"
                         if !reason.is_empty() =>
                     {
                         self.log(reason.to_owned())
@@ -112,10 +132,13 @@ impl Console {
                     s["last_hold_ms"].as_f64().unwrap_or_default()
                 ));
             }
-            if phase != self.phase {
+            if self.mode == Mode::Live && phase != self.phase {
                 if phase == "landing" {
-                    self.landed =
-                        Some((self.observed, !self.landed.is_some_and(|(_, right)| right)));
+                    self.landed = Some(Jump {
+                        started: self.observed,
+                        from: self.landed.map_or(0., |jump| jump.position(self.observed)),
+                        to: self.landed.map_or(1., |jump| 1. - jump.to),
+                    });
                 }
                 self.phase = phase.into();
             }
@@ -141,7 +164,7 @@ impl Console {
             }
         })
     }
-    pub fn exited(&mut self, test: bool, ok: bool, code: Option<i32>) {
+    pub fn exited(&mut self, test: bool, ok: bool, code: Option<i32>, stderr: Option<&str>) {
         self.mode = Mode::Idle;
         self.pending = None;
         if let Some(v) = self.elapsed(Instant::now()) {
@@ -158,11 +181,26 @@ impl Console {
                 "自检失败。请查看运行日志。"
             }
             .into();
-        } else if !ok {
-            self.notice = format!(
-                "脚本退出（代码 {}）。请查看运行日志。",
-                code.map(|n| n.to_string()).unwrap_or_else(|| "未知".into())
-            );
+        } else {
+            let reason = self.status["stop_reason"]
+                .as_str()
+                .filter(|s| self.status["state"] == "stopped" && !s.is_empty());
+            if let (true, Some(reason)) = (ok, reason) {
+                self.notice.clear();
+                self.log(reason.to_owned());
+            } else {
+                let code = code.map_or_else(|| "未知".into(), |n| n.to_string());
+                self.notice = match (reason, stderr) {
+                    (None, Some(line)) if !ok => {
+                        format!("脚本退出（代码 {code}），最后一条错误输出：{line}")
+                    }
+                    _ => format!(
+                        "脚本退出（代码 {code}）：{}",
+                        reason.unwrap_or("未收到停止原因。")
+                    ),
+                };
+                self.log(self.notice.clone());
+            }
         }
     }
     pub fn labels(&self) -> (&str, &str) {
@@ -184,6 +222,9 @@ impl Console {
             ),
             "blocked_modal" => ("窗口有弹窗", "请查看游戏窗口中的提示。"),
             "dead" => ("本局结束", "正在处理游戏结束画面。"),
+            "stopped" if self.mode == Mode::Idle && !self.notice.is_empty() => {
+                ("已停止", &self.notice)
+            }
             "stopped" => (
                 "已停止",
                 self.status["stop_reason"]
@@ -250,6 +291,57 @@ mod tests {
         assert!(!s.primary_enabled());
     }
     #[test]
+    fn stop_drains_the_last_jump_before_logging_the_reason_once() {
+        let mut s = Console::new(None);
+        s.started(false);
+        s.mode = Mode::Stopping;
+        s.phase = "stopping".into();
+        let mut packet = json!({"state":"playing","jump_uid":"round-3","last_index":3,
+            "last_result":"landed","last_hold_ms":505.2,"score":12});
+        s.update(packet.clone());
+        assert_eq!(s.phase, "stopping");
+        packet["state"] = "stopped".into();
+        packet["stop_reason"] = "控制端要求停止".into();
+        s.update(packet.clone());
+        s.update(packet);
+        s.exited(false, true, Some(0), None);
+        assert_eq!(
+            s.logs.into_iter().collect::<Vec<_>>(),
+            ["第 3 跳　已落地　分数 12　蓄力 505 ms", "控制端要求停止"]
+        );
+    }
+
+    #[test]
+    fn abnormal_exit_prefers_the_terminal_reason_then_stderr() {
+        for (state, reason, stderr, expected) in [
+            (
+                "stopped",
+                "截图失败",
+                Some("诊断信息"),
+                "脚本退出（代码 7）：截图失败",
+            ),
+            (
+                "capture_blocked",
+                "暂时遮挡",
+                Some("配置损坏"),
+                "脚本退出（代码 7），最后一条错误输出：配置损坏",
+            ),
+            (
+                "capture_blocked",
+                "暂时遮挡",
+                None,
+                "脚本退出（代码 7）：未收到停止原因。",
+            ),
+        ] {
+            let mut s = Console::new(None);
+            s.started(false);
+            s.update(json!({"state":state,"stop_reason":reason}));
+            s.exited(false, false, Some(7), stderr);
+            assert_eq!(s.logs.back().unwrap(), expected);
+            assert_eq!(s.labels(), ("已停止", expected));
+        }
+    }
+    #[test]
     fn elapsed_freezes_and_log_is_bounded() {
         let mut s = Console::new(None);
         s.started(false);
@@ -268,7 +360,7 @@ mod tests {
             s.log(i.to_string());
         }
         assert_eq!((s.logs.len(), s.log_sequence), (60, before + 75));
-        s.exited(false, true, Some(0));
+        s.exited(false, true, Some(0), None);
         assert!(s.primary_enabled());
         s.started(true);
         assert!(s.logs.is_empty());
