@@ -258,11 +258,16 @@ mod tests {
             s.elapsed(s.observed + std::time::Duration::from_secs(8)),
             Some(3.5)
         );
+        assert_eq!(
+            s.logs.back().map(String::as_str),
+            Some("已暂停，可以切换窗口。")
+        );
+        let before = s.log_sequence;
         for i in 0..75 {
             s.log(i.to_string());
             s.log(i.to_string());
         }
-        assert_eq!((s.logs.len(), s.log_sequence), (60, 75));
+        assert_eq!((s.logs.len(), s.log_sequence), (60, before + 75));
         s.exited(false, true, Some(0));
         assert!(s.primary_enabled());
         s.started(true);
