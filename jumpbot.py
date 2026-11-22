@@ -27,7 +27,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from run_control import (RunControl, WindowsHotkeyListener, ControlInterrupted,
-                         parse_hotkey, validate_timing)
+                         console_key_batches, parse_hotkey, validate_timing)
 from skin_vision import find_skin_piece, has_horizontal_character_mask
 
 import cv2
@@ -128,7 +128,30 @@ def spawn_dashboard() -> None:
             cmd = [sys.executable, "--panel", "--status", str(STATUS_PATH)]
         else:
             cmd = [sys.executable, str(script), "--status", str(STATUS_PATH)]
-        subprocess.Popen(cmd, creationflags=creation, close_fds=True)
+        if _CONTROL is None or _DESKTOP_PIPE:
+            subprocess.Popen(cmd, creationflags=creation)
+        else:
+            import msvcrt
+            control = _CONTROL
+            reader, writer = os.pipe()
+            try:
+                handle = msvcrt.get_osfhandle(writer)
+                os.set_handle_inheritable(handle, True)
+                info = subprocess.STARTUPINFO(lpAttributeList={"handle_list": [handle]})
+                subprocess.Popen([*cmd, "--control-handle", str(handle)], startupinfo=info,
+                                 creationflags=creation, close_fds=True)
+            except BaseException:
+                os.close(reader)
+                raise
+            finally:
+                os.close(writer)
+
+            def panel_commands():
+                with os.fdopen(reader, "rb", buffering=0) as pipe:
+                    while pipe.read(1) == b"p" and not control.stopped:
+                        control.toggle("panel P")
+
+            threading.Thread(target=panel_commands, name="panel-commands", daemon=True).start()
         log("已弹出实时状态面板窗口（PID/状态/分数/实时命中率）")
     except Exception as exc:
         log(f"启动状态面板失败（不影响运行）：{exc}")
@@ -1329,6 +1352,7 @@ class Vision:
         self._cl_candidates = []
         self._cl_runtime = None
         self._cl_buffers: dict = {}
+        self._backend_error = ""
         self._last_mask_backend = None
         self._auto_backend: str | None = None    # masks_backend="auto" 时的实测结果
 
@@ -1373,7 +1397,8 @@ class Vision:
         self._gpu_ms_buf = []
         detail = "、".join(f"{n} {ms:.2f}ms" for n, ms in cand) or "都不可用"
         log(f"掩码后端自动选择：{self._auto_backend}（实测 {detail}）")
-        status_write(mask_backend=self._auto_backend, mask_bench_ms=detail)
+        if _CONTROL is not None:
+            status_write(mask_bench_ms=detail)
         return self._auto_backend
 
     def _note_backend_timing(self, backend: str, ms: float) -> None:
@@ -1395,12 +1420,13 @@ class Vision:
                     f"可能被其他程序占用），切换回 SIMD")
                 self._auto_backend = "simd" if self.cfg.masks_simd else "cpu"
                 self._gpu_ms_buf = []
-                status_write(mask_backend=self._auto_backend,
-                             mask_bench_ms=f"{backend} 退化到 {med:.0f}ms，已切回 CPU")
+                if _CONTROL is not None:
+                    status_write(mask_bench_ms=f"{backend} 变慢，下帧切回 CPU")
 
     def _init_gpu(self) -> bool:
         """按需初始化 CuPy（含 CUDA 运行时路径自动发现）。失败返回 False 并永久回退。"""
         if not self.cfg.cuda_enabled or os.environ.get("JUMPBOT_DISABLE_CUDA") == "1":
+            self._backend_error = "配置或 JUMPBOT_DISABLE_CUDA 禁用了 CUDA"
             self._gpu_state = False
             return False
         if self._gpu_state is not None:
@@ -1455,6 +1481,7 @@ class Vision:
             log(f"GPU 掩码后端已启用（CuPy {cupy.__version__}，设备 "
                 f"{cupy.cuda.runtime.getDeviceProperties(0)['name'].decode()}）")
         except Exception as exc:
+            self._backend_error = str(exc)
             log(f"GPU 掩码后端不可用，回退 CPU：{exc}")
         return self._gpu_state
 
@@ -1560,6 +1587,7 @@ class Vision:
             masks = g_masks.get()                # 当前流阻塞下载；无需额外全局同步
             return masks[0], masks[1]
         except Exception as exc:
+            self._backend_error = str(exc)
             log(f"GPU 掩码计算出错，回退 CPU：{exc}")
             self._gpu_state = False
             self._gpu_buffers = None
@@ -1878,6 +1906,7 @@ class Vision:
         return mask
 
     def masks(self, frame: np.ndarray):
+        previous = self._last_mask_backend
         backend = self.cfg.masks_backend
         if backend == "auto":
             backend = self._pick_backend(frame)
@@ -1889,8 +1918,19 @@ class Vision:
             self._auto_calls = getattr(self, "_auto_calls", 0) + 1
             if self._auto_calls % 300 == 0:
                 self._auto_backend = None
-            return result
-        return self._masks_impl(backend, frame)
+        else:
+            result = self._masks_impl(backend, frame)
+        actual = self._last_mask_backend
+        if actual != previous:
+            requested = self.cfg.masks_backend
+            fallback = backend in ("gpu", "cuda", "opencl") and actual in ("cpu", "simd")
+            reason = (self._backend_error if backend in ("gpu", "cuda") else "") or "设备或运行时不可用"
+            note = f"{backend} 不可用，已回退 {actual}：{reason}" if fallback else ""
+            log(f"识别后端 requested={requested} actual={'cuda' if actual == 'gpu' else actual}"
+                + (f"；{note}；Python={sys.executable}" if note else ""))
+            if _CONTROL is not None:
+                status_write(mask_backend_requested=requested, mask_backend=actual, mask_backend_note=note)
+        return result
 
     def _masks_impl(self, backend: str, frame: np.ndarray):
         if backend in ("gpu", "cuda", "opencl"):
@@ -1901,8 +1941,6 @@ class Vision:
             if self.cfg.masks_backend == "auto":
                 self._auto_backend = "simd" if self.cfg.masks_simd else "cpu"
                 self._gpu_ms_buf = []
-            status_write(mask_backend="simd" if self.cfg.masks_simd else "cpu",
-                         mask_bench_ms=f"{backend} 不可用，已回退 CPU")
         if backend != "cpu" and self.cfg.masks_simd:
             self._last_mask_backend = "simd"
             return self._masks_simd(frame)
@@ -2690,6 +2728,17 @@ def selftest(args) -> int:
     cv2.rectangle(frame, (150, 600), (330, 760), (90, 120, 95), -1)     # 假方块
     cv2.rectangle(frame, (250, 430), (420, 560), (235, 235, 235), -1)   # 假白块
     cv2.circle(frame, (280, 520), 12, (60, 45, 40), -1)                  # 假棋子
+    if cfg.masks_backend != "auto":
+        v = Vision(cfg)
+        masks = v.masks(frame)
+        expected_backend = "gpu" if cfg.masks_backend == "cuda" else cfg.masks_backend
+        if v._last_mask_backend != expected_backend:
+            log(f"指定的 {cfg.masks_backend} 未执行，自检失败。Python={sys.executable}")
+            return 1
+        reference = v._masks_simd(frame)
+        ok = ok and all(np.array_equal(a, b) for a, b in zip(masks, reference))
+        log("指定后端自检：" + ("通过" if ok else "失败"))
+        return 0 if ok else 1
     bench, outputs, actual = {}, {}, {}
     for backend in ("cpu", "simd", "gpu", "opencl"):
         c = Config(**{**cfg.__dict__, "masks_backend": backend, "masks_simd": backend != "cpu"})
@@ -3025,42 +3074,22 @@ def f8_pressed() -> bool:
     return poll_stop_key()
 
 
-# 在跑脚本的那个命令行窗口里，按这些键即可停止（与 F8 等价）。
-CONSOLE_STOP_KEYS = ("q", "Q", "\x1b")     # q / Q / Esc
-
-
 def _console_key_watcher() -> None:
-    """后台读控制台按键：q / Q / Esc → 与 F8 走同一条停止路径。
-
-    为什么需要它：F8 是全局热键（GetAsyncKeyState），但脚本常常在后台/隐藏控制台里跑，
-    或者用户更习惯在命令行窗口里按键。这里用 msvcrt 读**本进程控制台**的按键，
-    不抢全局键盘事件；没有控制台（stdin 被重定向、打包后无窗口）时静默退出。
-    """
-    global _STOP_REQUESTED
+    """Console-local P toggles the same control as the hotkey; q/Esc stop."""
+    control = _CONTROL
     try:
-        import msvcrt
-    except ImportError:            # 非 Windows
-        return
-    try:
-        while not _STOP_REQUESTED:
-            if msvcrt.kbhit():
-                try:
-                    ch = msvcrt.getwch()
-                except Exception:
+        for keys in console_key_batches():
+            if control.stopped:
+                return
+            for key in keys:
+                if key == "p":
+                    control.toggle("console P")
+                else:
+                    control.stop("用户按控制台停止键")
                     return
-                if ch in CONSOLE_STOP_KEYS:
-                    _STOP_REQUESTED = True
-                    if _CONTROL is not None:
-                        _CONTROL.stop("用户按控制台停止键")
-                    key = {"\x1b": "Esc"}.get(ch, ch)
-                    log(f"收到控制台停止键 {key!r}，正在停止（松开鼠标后退出；等价于 F8）…")
-                    return
-                if ch in ("p", "P") and _CONTROL is not None:
-                    _CONTROL.toggle("console P")
             time.sleep(0.05)
-    except Exception:
-        # 没有真正的控制台时 kbhit() 会失败——这不是错误，静默退出即可
-        return
+    except OSError:
+        return  # Unattached workers can still use the global hotkey.
 
 
 def start_console_watcher() -> None:
@@ -3137,8 +3166,7 @@ def control_ready_window(cfg: Config, initial: bool = False,
         return resolve_window(cfg)
     control = _CONTROL
     timeout = cfg.startup_wait_s if timeout_s is None else timeout_s
-    wait_start = active_time()
-    deadline = wait_start + timeout if timeout > 0 else None
+    wait_start = time.monotonic()
     generation = control.generation
     countdown = None
     countdown_hwnd = None
@@ -3158,7 +3186,9 @@ def control_ready_window(cfg: Config, initial: bool = False,
                 next_report = time.monotonic() + 1.0
             if new_pause and control.paused_at is not None:
                 log(f"已暂停，鼠标已释放；可以做其他事情。{control.hotkey} / {pause_controls} 恢复，F8 停止")
+            parked = time.monotonic()
             control.changed.wait(0.05)
+            wait_start += time.monotonic() - parked
             control.changed.clear()
             countdown = None
             continue
@@ -3168,11 +3198,12 @@ def control_ready_window(cfg: Config, initial: bool = False,
         candidates = find_windows(cfg.window_title_pattern, cfg.window_exe_hint)
         if not candidates:
             countdown = None
-            if deadline is not None and active_time() >= deadline:
+            waited = time.monotonic() - wait_start
+            if timeout > 0 and waited >= timeout:
                 raise WindowGoneError("等待用户打开「跳一跳」超时")
             if time.monotonic() >= next_report:
                 status_write(state="waiting_window", alive=True, countdown_s=None,
-                             game_state=None, waited_s=int(active_time() - wait_start),
+                             game_state=None, waited_s=int(waited),
                              stop_reason="等待用户手动打开小游戏", startup_wait=initial)
                 next_report = time.monotonic() + 1.0
             time.sleep(0.05)
@@ -3917,6 +3948,7 @@ def play(args) -> int:
     foreground = not background
     status_write(
         pid=os.getpid(), state="starting", game_state=None,
+        mask_backend_requested=cfg.masks_backend, mask_backend=None, mask_backend_note="", mask_bench_ms=None,
         started=time.time(), max_jumps=cfg.max_jumps, jumps=0, landed=0,
         deaths=0, hits=0, misses=0, unknown=0, streak=0, best_streak=0,
         score=None, best_life_score=0, k=round(k, 4),
@@ -3973,7 +4005,7 @@ def play(args) -> int:
             "" if record.err_dot_px is None else f"{record.err_dot_px:.1f}",
             record.aim_dot,
             f"{record.bias_pct:g}",
-            vision._auto_backend if cfg.masks_backend == "auto" else cfg.masks_backend,
+            vision._last_mask_backend,
             _CONTROL.snapshot()["pause_total_s"] if _CONTROL is not None else 0,
             round(active_time() - started, 3),
             "" if record.error_px is None else int(abs(record.error_px) < cfg.center_hit_tolerance_px),

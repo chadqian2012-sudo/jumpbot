@@ -96,12 +96,12 @@ def main():
 
     def masks(self, frame):
         guard('vision')
+        previous = self._last_mask_backend
         result = original_masks(self, frame)
         actual = self._last_mask_backend or 'unknown'
         frames = counts['backend_frames']
         frames[actual] = frames.get(actual, 0) + 1
-        if J._STATUS.get('mask_backend') != actual:
-            status(mask_backend=actual)
+        if previous != actual:
             audit('actual_backend', backend=actual)
         return result
 

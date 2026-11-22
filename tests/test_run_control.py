@@ -186,6 +186,38 @@ class ApplicationTests(unittest.TestCase):
         with self.assertRaises(J.WindowGoneError):
             J.control_ready_window(self.cfg, timeout_s=.2)
 
+    def test_resume_without_window_still_times_out_on_unpaused_wait(self):
+        self.control.toggle()
+        self.fake_event(lambda: (self.clock.sleep(90), self.control.toggle()))
+        def no_window(*_):
+            self.assertLess(self.clock.value, 192, "等待窗口超时未生效")
+            return []
+        self.stack.enter_context(patch.object(self.j, 'find_windows', no_window))
+        with self.assertRaises(self.j.WindowGoneError):
+            self.j.control_ready_window(self.cfg, initial=True, timeout_s=1)
+        self.assertAlmostEqual(self.clock.value, 191, delta=.06)
+        self.assertEqual(self.control.active_time(), 100)
+
+    def test_manual_backend_status_tracks_executed_masks(self):
+        import numpy as np
+        from tools.dashboard import render
+        j = self.j
+        v = j.Vision(j.Config(masks_backend='cuda'))
+        frame = np.zeros((120, 120, 3), np.uint8)
+        masks = v._masks_simd(frame)
+        with (patch.object(v, '_masks_gpu', side_effect=[masks, None, None]),
+              patch.object(j, 'status_write', wraps=j.status_write) as writes):
+            v.masks(frame)
+            status = json.loads(j.STATUS_PATH.read_text(encoding='utf8'))
+            self.assertEqual((status['mask_backend_requested'], status['mask_backend']), ('cuda', 'gpu'))
+            self.assertIn('请求 cuda / 实际 cuda', render(status, None, None, False))
+            v.masks(frame)
+            v.masks(frame)
+            status = json.loads(j.STATUS_PATH.read_text(encoding='utf8'))
+            self.assertEqual(status['mask_backend'], 'simd')
+            self.assertIn('cuda 不可用', status['mask_backend_note'])
+            self.assertEqual(writes.call_count, 2)
+
     def test_pause_wait_has_no_window_scan_or_activation(self):
         J = self.j
         self.control.toggle()
@@ -350,7 +382,7 @@ class ApplicationTests(unittest.TestCase):
                        window_size_policy='off', start_delay_s=0,
                        masks_backend='simd', center_dot_max_offset_px=0)
         class FakeVision:
-            _auto_backend = 'simd'
+            _last_mask_backend = 'simd'
             def __init__(self, _):
                 pass
             def reset_prior(self):

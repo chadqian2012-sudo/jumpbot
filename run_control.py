@@ -158,6 +158,46 @@ class RunControl:
                         input_active=bool(self.inputs))
 
 
+def console_key_batches():
+    """Poll this console's input buffer without blocking window or process shutdown."""
+    import ctypes
+    import msvcrt
+    import struct
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pending = kernel.GetNumberOfConsoleInputEvents
+    pending.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    read = kernel.ReadConsoleInputW
+    read.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD)]
+    # INPUT_RECORD with its KEY_EVENT_RECORD union member (Windows SDK).
+    event = struct.Struct("<H2xiHHHHI")
+    buf = ctypes.create_string_buffer(32 * event.size)
+    count = wintypes.DWORD()
+    with open("CONIN$", "rb", buffering=0) as console:
+        handle = msvcrt.get_osfhandle(console.fileno())
+        p_down = False
+        while True:
+            if not pending(handle, ctypes.byref(count)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if count.value and not read(handle, buf, min(32, count.value), ctypes.byref(count)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            keys = []
+            for kind, down, _, vk, _, char, modifiers in event.iter_unpack(buf[:count.value * event.size]):
+                if kind == 16 and not down:  # FOCUS_EVENT: key-up can go to another console.
+                    p_down = False
+                if kind != 1:
+                    continue
+                if vk == ord("P"):
+                    if down and not p_down and not modifiers & 15:
+                        keys.append("p")
+                    p_down = bool(down)
+                elif down and char in (ord("q"), ord("Q"), 27):
+                    keys.append(chr(char))
+            yield keys
+
+
 class WindowsHotkeyListener:
     """Message pump owns registration/unregistration on the same thread."""
     def __init__(self, control: RunControl, poll_stop):
