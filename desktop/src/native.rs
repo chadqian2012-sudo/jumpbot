@@ -609,7 +609,7 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
         let instance = GetModuleHandleW(null());
         let class = w!("JumpBotConsole");
         // Icon group 1 also supplies the executable icon used by the Windows shell.
-        let icon = LoadIconW(instance, 1 as *const u16);
+        let icon = LoadIconW(instance, std::ptr::without_provenance(1));
         if icon.is_null() {
             return Err(io::Error::last_os_error().into());
         }
