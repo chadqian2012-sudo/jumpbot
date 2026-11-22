@@ -163,7 +163,7 @@ impl Frame {
         };
         sample().map_err(|e| e.to_string())
     }
-    pub fn modal(&self, cfg: &Config) -> bool {
+    pub fn has_dark_center(&self, cfg: &Config) -> bool {
         let mut dark = 0;
         let mut count = 0;
         let threshold = cfg.f("modal_dark_threshold") as i32;
@@ -411,9 +411,99 @@ struct ButtonSpectra {
     grid: Fourier,
     spectra: Vec<Vec<Complex32>>,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ScreenState {
+    Board,
+    Start([f64; 2]),
+    Restart([f64; 2]),
+    ResultPending,
+    SkinModal,
+    UnknownDark,
+}
+
+impl ScreenState {
+    pub(crate) fn is_result(&self) -> bool {
+        matches!(self, Self::Restart(_) | Self::ResultPending)
+    }
+
+    pub(crate) fn playable(
+        &self,
+        f: &Frame,
+        cfg: &Config,
+        screen: &Screen,
+        d: &crate::vision::Detection,
+    ) -> bool {
+        match self {
+            Self::Board => true,
+            Self::UnknownDark => {
+                screen.score(f, cfg).is_some() && crate::vision::clear_dark_board(f, d, cfg)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Text and search bounds are calibrated in the original 553 x 1050 client.
+struct ScreenText {
+    text: Mat,
+    area: Rect,
+}
+impl ScreenText {
+    fn new(png: &[u8], area: Rect) -> Result<Self> {
+        Ok(Self {
+            text: decode_mat(png, imgcodecs::IMREAD_COLOR).map_err(|e| e.to_string())?,
+            area,
+        })
+    }
+
+    fn center(&self, f: &Frame) -> opencv::Result<Option<[f64; 2]>> {
+        let image = crate::template::bgr(f)?;
+        let a = self.area;
+        let x = |n: i32| (n as f64 * f.width as f64 / 553.).round() as i32;
+        let y = |n: i32| (n as f64 * f.height as f64 / 1050.).round() as i32;
+        let bounds = Rect::new(
+            x(a.x),
+            y(a.y),
+            x(a.x + a.width) - x(a.x),
+            y(a.y + a.height) - y(a.y),
+        );
+        if bounds.empty() {
+            return Ok(None);
+        }
+        let roi = Mat::roi(&image, bounds)?;
+        let mut search = Mat::default();
+        imgproc::resize(&roi, &mut search, a.size(), 0., 0., imgproc::INTER_LINEAR)?;
+        let mut scores = Mat::default();
+        imgproc::match_template_def(&search, &self.text, &mut scores, imgproc::TM_CCOEFF_NORMED)?;
+        let mut peak = 0.;
+        let mut at = core::Point::default();
+        core::min_max_loc(
+            &scores,
+            None,
+            Some(&mut peak),
+            None,
+            Some(&mut at),
+            &core::no_array(),
+        )?;
+        Ok((peak >= 0.90).then(|| {
+            [
+                bounds.x as f64
+                    + (at.x as f64 + self.text.cols() as f64 / 2.) * bounds.width as f64
+                        / a.width as f64,
+                bounds.y as f64
+                    + (at.y as f64 + self.text.rows() as f64 / 2.) * bounds.height as f64
+                        / a.height as f64,
+            ]
+        }))
+    }
+}
+
 pub struct Screen {
     digits: Vec<Vec<f32>>,
     buttons: Vec<ButtonTemplate>,
+    skin_title: ScreenText,
+    play_again: ScreenText,
+    new_record: ScreenText,
     cache: RefCell<Option<ButtonSpectra>>,
 }
 impl Screen {
@@ -461,6 +551,18 @@ impl Screen {
         Ok(Self {
             digits,
             buttons,
+            skin_title: ScreenText::new(
+                include_bytes!("../ui/skin_title.png"),
+                Rect::new(190, 160, 173, 105),
+            )?,
+            play_again: ScreenText::new(
+                include_bytes!("../ui/play_again.png"),
+                Rect::new(175, 815, 203, 129),
+            )?,
+            new_record: ScreenText::new(
+                include_bytes!("../ui/new_record.png"),
+                Rect::new(195, 147, 163, 130),
+            )?,
             cache: RefCell::default(),
         })
     }
@@ -501,6 +603,38 @@ impl Screen {
             total.checked_mul(10)?.checked_add(best.0 as i32)
         })
     }
+    /// Input and returned click coordinates use the same recognition frame (after for_recognition).
+    pub(crate) fn state(&self, f: &Frame, cfg: &Config) -> Result<ScreenState> {
+        if !f.valid() {
+            return Err("图像缓冲区尺寸无效".into());
+        }
+        let center = |text: &ScreenText| text.center(f).map_err(|e| e.to_string());
+        if center(&self.skin_title)?.is_some() {
+            return Ok(ScreenState::SkinModal);
+        }
+        if let Some((restart, at)) = self.button(f)? {
+            return Ok(if restart {
+                ScreenState::Restart(at)
+            } else {
+                ScreenState::Start(at)
+            });
+        }
+        let dark = f.has_dark_center(cfg);
+        if dark {
+            if let Some(at) = center(&self.play_again)? {
+                return Ok(ScreenState::Restart(at));
+            }
+        }
+        if center(&self.new_record)?.is_some() {
+            return Ok(ScreenState::ResultPending);
+        }
+        Ok(if dark {
+            ScreenState::UnknownDark
+        } else {
+            ScreenState::Board
+        })
+    }
+
     pub fn button(&self, f: &Frame) -> Result<Option<(bool, [f64; 2])>> {
         if !f.valid() {
             return Err("图像缓冲区尺寸无效".into());
@@ -630,6 +764,71 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn new_restart_requires_a_dark_frame_and_skin_title_takes_priority() {
+        let cfg = Config::default();
+        let screen = Screen::new(&crate::asset_dir().join("templates"), &cfg).unwrap();
+        let mut f = Frame {
+            width: 553,
+            height: 1050,
+            bgr: vec![15; 553 * 1050 * 3],
+        };
+        fn paste(f: &mut Frame, data: &Mat, x: usize, y: usize) {
+            for (dy, row) in data
+                .data_bytes()
+                .unwrap()
+                .chunks_exact(data.cols() as usize * 3)
+                .enumerate()
+            {
+                let i = ((y + dy) * f.width + x) * 3;
+                f.bgr[i..i + row.len()].copy_from_slice(row);
+            }
+        }
+        let d = crate::vision::Detection {
+            piece: None,
+            target: None,
+            piece_mask: vec![],
+            block_mask: vec![],
+        };
+        let unknown = screen.state(&f, &cfg).unwrap();
+        assert_eq!(unknown, ScreenState::UnknownDark);
+        assert!(!unknown.playable(&f, &cfg, &screen, &d));
+        paste(&mut f, &screen.play_again.text, 217, 500);
+        assert_eq!(screen.state(&f, &cfg).unwrap(), ScreenState::UnknownDark);
+        paste(&mut f, &screen.new_record.text, 247, 191);
+        let pending = screen.state(&f, &cfg).unwrap();
+        assert_eq!(pending, ScreenState::ResultPending);
+        assert!(pending.is_result());
+        assert!(!pending.playable(&f, &cfg, &screen, &d));
+        paste(&mut f, &screen.play_again.text, 217, 856);
+        let restart = screen.state(&f, &cfg).unwrap();
+        assert_eq!(restart, ScreenState::Restart([277., 872.5]));
+        assert!(restart.is_result());
+        paste(&mut f, &screen.skin_title.text, 219, 204);
+        let skin = screen.state(&f, &cfg).unwrap();
+        assert_eq!(skin, ScreenState::SkinModal);
+        assert!(!skin.is_result());
+
+        f.bgr.fill(230);
+        paste(&mut f, &screen.play_again.text, 217, 856);
+        let board = screen.state(&f, &cfg).unwrap();
+        assert_eq!(board, ScreenState::Board);
+        assert!(board.playable(&f, &cfg, &screen, &d));
+
+        // Waiting on a confirmed title does not require a dark backdrop.
+        paste(&mut f, &screen.new_record.text, 247, 191);
+        assert_eq!(screen.state(&f, &cfg).unwrap(), ScreenState::ResultPending);
+        let bytes = fs::read(crate::asset_dir().join("templates/ui_restart.png")).unwrap();
+        let restart = decode_mat(&bytes, imgcodecs::IMREAD_COLOR).unwrap();
+        paste(&mut f, &restart, 200, 825);
+        assert!(matches!(
+            screen.state(&f, &cfg).unwrap(),
+            ScreenState::Restart(_)
+        ));
+        paste(&mut f, &screen.skin_title.text, 219, 204);
+        assert_eq!(screen.state(&f, &cfg).unwrap(), ScreenState::SkinModal);
+    }
+
     #[test]
     fn phase_reports_signed_motion_and_rejects_untextured_frames() {
         let (width, height) = (80, 60);

@@ -175,7 +175,7 @@ pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usiz
             (cfg.f("settle_timeout_s") * 1000. / cfg.f("settle_poll_ms").max(1.)).ceil() as i64;
         // The raw pair records the endpoints only. The first after sample is compared
         // with takeoff; every subsequent after sample repeats the same recorded frame.
-        if !screen.button(&b)?.is_some_and(|(dead, _)| dead) {
+        if !screen.state(&b, cfg)?.is_result() {
             for poll in 1..needed.saturating_add(4).min(budget) {
                 let diff = if poll == 1 { movement } else { 0. };
                 if diff >= cfg.f("settle_diff_threshold") {
@@ -205,9 +205,16 @@ pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usiz
         let t = Instant::now();
         let mut last = None;
         let mut acquired = false;
-        if !a.modal(cfg) && screen.button(&a)?.is_none() {
+        let state = screen.state(&a, cfg)?;
+        if matches!(
+            state,
+            crate::screen::ScreenState::Board | crate::screen::ScreenState::UnknownDark
+        ) {
             for _ in 0..cfg.i("detect_retry_limit").clamp(1, 3) {
                 let d = vision.detect(&a)?;
+                if !state.playable(&a, cfg, &screen, &d) {
+                    break;
+                }
                 let current = d
                     .piece
                     .zip(d.target)

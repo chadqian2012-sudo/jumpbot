@@ -66,6 +66,83 @@ pub fn axis_components(dx: f64, dy: f64, slope: f64) -> ((f64, f64), f64, f64) {
     ((ux, uy), dx * ux + dy * uy, (dx * -uy + dy * ux).abs())
 }
 
+/// Called only after an unknown dark frame has a readable HUD. Require evidence
+/// from this frame even when the piece and target match an earlier detection.
+pub(crate) fn clear_dark_board(f: &Frame, d: &Detection, cfg: &Config) -> bool {
+    let (Some(p), Some(t)) = (&d.piece, &d.target) else {
+        return false;
+    };
+    if !f.valid() || !crate::landing::foot(f, d) {
+        return false;
+    }
+    let (w, h) = (f.width as f64, f.height as f64);
+    let [px, py, pw, ph] = p.bbox.map(f64::from);
+    let [tx, ty, tw, th] = t.bbox.map(f64::from);
+    let trusted_piece = match p.source {
+        "legacy" => p.tpl_score >= cfg.f("piece_template_min_score").max(0.52),
+        "skin-shape" => p.shape_score >= 0.86,
+        _ => false,
+    };
+    let (_, along, cross) = axis_components(t.x - p.x, t.y - p.y, cfg.f("axis_slope"));
+    if !(trusted_piece
+        && (0.5 * h..=0.74 * h).contains(&p.y)
+        && (0.03 * w..=0.12 * w).contains(&pw)
+        && (1.4 * pw..=3.8 * pw).contains(&ph)
+        && (0.08 * w..=0.58 * w).contains(&tw)
+        && (0.25 * tw..=1.8 * tw).contains(&th)
+        && (0.40 * tw..=tw + 1.).contains(&t.top_width)
+        && (tx..tx + tw).contains(&t.x)
+        && (ty..ty + th).contains(&t.y)
+        && t.y < p.y - cfg.f("target_min_up_ratio") * h
+        && (cfg.f("min_jump_dist_ratio") * w..=cfg.f("max_jump_dist_ratio") * w).contains(&along)
+        && cross <= cfg.f("axis_max_cross_ratio").min(0.30) * along)
+    {
+        return false;
+    }
+
+    // A playfield exposes the same slowly changing colour on both margins and
+    // between the two platforms. A fixed panel can leave a real pawn visible
+    // underneath and its text can even pass score recognition.
+    let pixels = f.bgr.as_chunks::<3>().0;
+    let pixel = |x: usize, y: usize| pixels[y * f.width + x];
+    let difference = |a: [u8; 3], b: [u8; 3]| (0..3).map(|i| a[i].abs_diff(b[i])).max().unwrap();
+    let left = f.width * 3 / 100;
+    let right = f.width - 1 - left;
+    let gap = (p.x + t.x) * 0.5;
+    let mut previous = pixel(left, f.height / 4);
+    for y in (f.height / 4..(p.y as usize + 10).max(f.height * 65 / 100).min(f.height))
+        .step_by((f.height / 160).max(1))
+    {
+        let bg = pixel(left, y);
+        if difference(bg, pixel(right, y)) > 12 || difference(bg, previous) > 8 {
+            return false;
+        }
+        previous = bg;
+        for x in (left..=right).step_by((f.width / 160).max(1)) {
+            if difference(pixel(x, y), bg) <= 12 {
+                continue;
+            }
+            let (x, y) = (x as f64, y as f64);
+            // Allow the pawn's head above the legacy colour mask, its footing,
+            // and the target with its leftward shadow. Keep the gap exposed.
+            let pawn = (px - 3. ..=px + pw + 3.).contains(&x) && y >= py - 0.55 * ph && y <= p.y;
+            let footing = (x - p.x).abs() <= 0.22 * w && y >= p.y - 0.60 * ph;
+            let target = (tx - 0.40 * tw..=tx + tw + 3.).contains(&x)
+                && (ty - 3. ..=ty + th + 3.).contains(&y);
+            if (x - gap).abs() < 0.025 * w || !(pawn || footing || target) {
+                return false;
+            }
+        }
+    }
+    // Flat/black capture data cannot substantiate even a plausible detection.
+    [(p.x, p.y - ph * 0.25), (p.x, p.y + pw * 0.25), (t.x, t.y)]
+        .into_iter()
+        .all(|(x, y)| {
+            let (x, y) = (x as usize, y as usize);
+            x < f.width && y < f.height && difference(pixel(x, y), pixel(left, y)) >= 20
+        })
+}
+
 pub(crate) fn segments(row: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut offset = 0;
     std::iter::from_fn(move || {
@@ -691,5 +768,117 @@ impl Vision {
                 .total_cmp(&a.tpl_score)
                 .then(b.area.cmp(&a.area))
         }))
+    }
+}
+
+#[cfg(test)]
+mod dark_board_tests {
+    use super::*;
+    use crate::screen::{Screen, ScreenState};
+    use std::path::Path;
+
+    #[test]
+    fn dark_background_still_requires_an_exposed_supported_board() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let cfg = Config::default();
+        let screen = Screen::new(&root.join("templates"), &cfg).unwrap();
+        let mut vision = Vision::new(&cfg, "cpu").unwrap();
+        let source = Frame::read(&root.join("tests/fixtures/skin-gold-narrow-pylon.png")).unwrap();
+        for tint in [[104, 99, 95], [74, 83, 95]] {
+            let mut f = source.clone();
+            // The right margin is clear in this fixture. Preserve the HUD and
+            // foreground pixels, recolouring only the matching row background.
+            for (y, row) in f
+                .bgr
+                .chunks_exact_mut(f.width * 3)
+                .enumerate()
+                .skip(f.height * 6 / 100)
+            {
+                let pixels = row.as_chunks_mut::<3>().0;
+                let edge = pixels[f.width - 5];
+                let shade = (18 * y / f.height) as u8;
+                for (x, pixel) in pixels.iter_mut().enumerate() {
+                    let hud = (f.height * 13 / 100..f.height * 24 / 100).contains(&y)
+                        && (f.width * 8 / 100..f.width * 80 / 100).contains(&x);
+                    if !hud && (0..3).all(|i| pixel[i].abs_diff(edge[i]) <= 8) {
+                        *pixel = tint.map(|channel| channel - shade);
+                    }
+                }
+            }
+            assert_eq!(screen.state(&f, &cfg).unwrap(), ScreenState::UnknownDark);
+            assert_eq!(screen.score(&f, &cfg), Some(3458));
+            vision.reset_prior();
+            let mut d = vision.detect(&f).unwrap();
+            assert!(
+                clear_dark_board(&f, &d, &cfg),
+                "{tint:?}: {:?} {:?}",
+                d.piece,
+                d.target
+            );
+
+            // A stable overlay in the gap must veto even the previously good pair.
+            let mut covered = f.clone();
+            for row in covered
+                .bgr
+                .chunks_exact_mut(f.width * 3)
+                .skip(f.height / 2)
+                .take(f.height / 12)
+            {
+                row[f.width * 43 / 100 * 3..f.width * 57 / 100 * 3].fill(38);
+            }
+            assert!(!clear_dark_board(&covered, &d, &cfg));
+            // Preserve both detections, but erase the actual surface under the foot.
+            covered = f.clone();
+            let pawn = d.piece.as_ref().unwrap();
+            for row in covered
+                .bgr
+                .chunks_exact_mut(f.width * 3)
+                .skip(pawn.y as usize + 1)
+                .take(pawn.bbox[2] as usize)
+            {
+                let pixels = row.as_chunks_mut::<3>().0;
+                let bg = pixels[f.width * 3 / 100];
+                pixels[pawn.bbox[0] as usize..(pawn.bbox[0] + pawn.bbox[2]) as usize].fill(bg);
+            }
+            assert!(!clear_dark_board(&covered, &d, &cfg));
+            covered.bgr.fill(0);
+            assert!(!clear_dark_board(&covered, &d, &cfg));
+            let black = vision.detect(&covered).unwrap();
+            assert!(!clear_dark_board(&covered, &black, &cfg));
+            let mut target = d.target.take().unwrap();
+            assert!(!clear_dark_board(&f, &d, &cfg));
+            let width = target.bbox[2];
+            target.bbox[2] = f.width as i32;
+            d.target = Some(target);
+            assert!(!clear_dark_board(&f, &d, &cfg));
+            d.target.as_mut().unwrap().bbox[2] = width;
+            d.block_mask.fill(0);
+            assert!(!clear_dark_board(&f, &d, &cfg));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires original capture archive in JUMPBOT_CAPTURE_ARCHIVE"]
+    fn original_skin_dialog_and_score_cards_never_clear() {
+        let root = std::path::PathBuf::from(std::env::var_os("JUMPBOT_CAPTURE_ARCHIVE").unwrap());
+        let cfg = Config::default();
+        let mut vision = Vision::new(&cfg, "cpu").unwrap();
+        for name in [
+            "state_now6/probe.png",
+            "gameover/probe.png",
+            "run_20260930_194646/jump_003_raw.png",
+            "run_20261008_214654/jump_379_raw_after.png",
+        ] {
+            let f = Frame::read(&root.join(name)).unwrap();
+            vision.reset_prior();
+            let d = vision.detect(&f).unwrap();
+            if name == "state_now6/probe.png" {
+                assert!(
+                    d.piece.is_some() && d.target.is_some(),
+                    "dialog exposes both"
+                );
+            }
+            assert!(!clear_dark_board(&f, &d, &cfg), "{name}");
+        }
     }
 }

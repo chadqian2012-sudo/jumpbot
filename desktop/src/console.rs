@@ -96,7 +96,8 @@ impl Console {
             {
                 let reason = s["stop_reason"].as_str().unwrap_or("");
                 match phase {
-                    "waiting_window" | "capture_blocked" | "blocked_modal"
+                    "waiting_window" | "capture_blocked" | "blocked_modal" | "result_pending"
+                    | "unrecognized_dark"
                         if !reason.is_empty() =>
                     {
                         self.log(reason.to_owned())
@@ -220,7 +221,12 @@ impl Console {
                     .as_str()
                     .unwrap_or("请检查游戏窗口是否完整可见。"),
             ),
-            "blocked_modal" => ("窗口有弹窗", "请查看游戏窗口中的提示。"),
+            "blocked_modal" => ("皮肤提示", "请在游戏中关闭获得新皮肤提示。"),
+            "result_pending" => ("等待重玩按钮", "本局已结束，按钮出现后会继续。"),
+            "unrecognized_dark" => (
+                "正在核对暗色画面",
+                "尚未确认可跳跃的目标，正在重新读取画面。",
+            ),
             "dead" => ("本局结束", "正在处理游戏结束画面。"),
             "stopped" if self.mode == Mode::Idle && !self.notice.is_empty() => {
                 ("已停止", &self.notice)
