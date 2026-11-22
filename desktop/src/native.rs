@@ -345,6 +345,12 @@ impl View {
                 && self.text.contains_key(&id)
             {
                 self.reveals.insert(id, Instant::now());
+                // Restarting a reveal uncovers the background behind the old, wider text.
+                SCENE.with_borrow(|scene| {
+                    if let Some(scene) = scene {
+                        InvalidateRect(self.hwnd, &scene.layout.bounds(id), 0);
+                    }
+                });
             }
             SetWindowTextW(self.child(id), wide(s).as_ptr());
             self.text.insert(id, s.into());
@@ -376,6 +382,7 @@ impl View {
                 fonts: Fonts::new(layout),
                 motion: self.motion,
                 transition: self.transition,
+                frame_time: Instant::now(),
                 landing: s.as_ref().and_then(|s| s.landing),
                 notice,
             })
@@ -410,9 +417,21 @@ impl View {
         }
         let scene_moving = SCENE.with_borrow_mut(|v| {
             let scene = v.as_mut().unwrap();
-            scene.transition = self.transition;
+            let previous = scene.frame_time;
+            scene.frame_time = Instant::now();
+            let changed = scene.landing != s.landed;
             scene.landing = s.landed;
-            scene.moving()
+            let entry_end = scene.transition + painting::ENTRY_DURATION;
+            let end = scene
+                .landing
+                .map_or(entry_end, |j| entry_end.max(j.started + j.duration()));
+            // Include the first tick past the deadline so the resting frame is painted.
+            if scene.motion && previous < entry_end {
+                InvalidateRect(self.hwnd, null(), 0);
+            } else if changed || (scene.motion && previous < end) {
+                InvalidateRect(self.hwnd, &scene.layout.diagram_pixels(), 0);
+            }
+            scene.motion && scene.frame_time < end
         });
 
         let (phase, note) = s.labels();
@@ -540,7 +559,7 @@ impl View {
         self.reveals.retain(|id, t| {
             let h = GetDlgItem(self.hwnd, *id as i32);
             let p = t.elapsed().as_secs_f32() / 0.26;
-            if !self.motion || p >= 1. {
+            if !self.motion || p >= 1. || self.text[id].is_empty() {
                 SetWindowRgn(h, null_mut(), 1);
                 return false;
             }
@@ -554,11 +573,8 @@ impl View {
             true
         });
         let animate = scene_moving || !self.reveals.is_empty();
-        if animate || self.timer == 16 {
-            InvalidateRect(self.hwnd, null(), 0);
-        }
         let interval = if animate {
-            16
+            USER_TIMER_MINIMUM
         } else if s.mode != Mode::Idle {
             80
         } else {
@@ -568,8 +584,6 @@ impl View {
             KillTimer(self.hwnd, 1);
             if interval != 0 {
                 SetTimer(self.hwnd, 1, interval, None);
-            } else {
-                InvalidateRect(self.hwnd, null(), 0);
             }
             self.timer = interval;
         }
