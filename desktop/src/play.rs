@@ -6,7 +6,7 @@ use crate::{
     platform::{CaptureMode, PressOutcome, Window},
     records::Records,
     runtime::{annotated, detection},
-    screen::Screen,
+    screen::{Screen, ScreenState},
     vision::{axis_components, Detection, Vision},
     Config, Frame, Result,
 };
@@ -180,6 +180,24 @@ impl Game<'_> {
             eprintln!("{e}")
         }
     }
+    fn landing_readout(&mut self, f: &Frame) -> Result<(Option<&'static str>, Option<i32>)> {
+        let state = self.screen.state(f, self.c)?;
+        if state.is_result() {
+            return Ok((Some("dead"), None));
+        }
+        let board = match state {
+            ScreenState::Board => true,
+            ScreenState::UnknownDark => {
+                state.playable(f, self.c, self.screen, &self.vision.detect(f)?)
+            }
+            _ => false,
+        };
+        if board {
+            Ok((None, self.screen.score(f, self.c)))
+        } else {
+            Ok((Some("unknown"), None))
+        }
+    }
     fn settle(
         &mut self,
         w: &Window,
@@ -257,10 +275,11 @@ impl Game<'_> {
         }
         let t = Instant::now();
         if let Some(f) = &outcome.frame {
-            if self.screen.button(f)?.is_some_and(|(dead, _)| dead) {
-                outcome.result = "dead";
+            let (result, score) = self.landing_readout(f)?;
+            if let Some(result) = result {
+                outcome.result = result;
             }
-            outcome.score = self.screen.score(f, self.c);
+            outcome.score = score;
         }
         if outcome.result != "dead" && previous.is_some() {
             for delay in [self.c.f("score_reread_first_ms"), 250., 250.] {
@@ -277,14 +296,17 @@ impl Game<'_> {
                 let Some(f) = self.recognition_frame(w)? else {
                     return Ok(None);
                 };
-                if self.screen.button(&f)?.is_some_and(|(dead, _)| dead) {
-                    outcome.result = "dead";
-                    outcome.score = self.screen.score(&f, self.c);
+                let (result, score) = self.landing_readout(&f)?;
+                if let Some(result) = result {
+                    outcome.result = result;
+                    outcome.score = None;
                     outcome.frame = Some(f);
                     outcome.detect = None;
-                    break;
+                    if result == "dead" {
+                        break;
+                    }
                 }
-                if let Some(n) = self.screen.score(&f, self.c) {
+                if let Some(n) = score {
                     outcome.score = Some(n)
                 }
             }
@@ -379,8 +401,13 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
         let (x, y) = xy.split_once(',').ok_or("click-xy 需要两个比例")?;
         drop(game.ctl.guard(g, true)?);
         let frame = raw_frame(&w)?.for_recognition(cfg)?;
-        if frame.modal(cfg) {
-            return Err("弹窗遮挡，取消探测点击".into());
+        if frame.has_dark_center(cfg)
+            || matches!(
+                game.screen.state(&frame, cfg)?,
+                ScreenState::SkinModal | ScreenState::ResultPending
+            )
+        {
+            return Err("当前画面不适合探测点击".into());
         }
         if game.press(
             &w,
@@ -417,8 +444,10 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                 let first = d.target.as_ref().map(|t| (t.x, t.y));
                 if d.piece.is_none()
                     || first.is_none()
-                    || game.screen.button(&f)?.is_some()
-                    || f.modal(cfg)
+                    || !game
+                        .screen
+                        .state(&f, cfg)?
+                        .playable(&f, cfg, game.screen, &d)
                 {
                     return Err("画面未就绪，取消试跳".into());
                 }
@@ -427,8 +456,10 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                 drop(game.ctl.guard(g, true)?);
                 f = raw_frame(&w)?.for_recognition(cfg)?;
                 d = game.vision.detect(&f)?;
-                if game.screen.button(&f)?.is_some()
-                    || f.modal(cfg)
+                if !game
+                    .screen
+                    .state(&f, cfg)?
+                    .playable(&f, cfg, game.screen, &d)
                     || !d.target.as_ref().is_some_and(|t| {
                         confirmed(first, (t.x, t.y), cfg.f("target_consistency_px"))
                     })
@@ -623,8 +654,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             window = Some((w, g));
             continue;
         }
-        let classified = game.screen.button(&f)?;
-        if let Some((dead, p)) = classified {
+        let state = game.screen.state(&f, cfg)?;
+        if let ScreenState::Start(p) | ScreenState::Restart(p) = state {
+            let dead = state.is_result();
             game.report(
                 "acquiring",
                 json!({"game_state":if dead{"game_over"}else{"start_page"}}),
@@ -650,20 +682,38 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             window = Some((w, g));
             continue;
         }
-        if f.modal(cfg) {
-            game.report(
-                "blocked_modal",
-                json!({"game_state":"blocked_modal","stop_reason":"请关闭遮挡游戏的弹窗"}),
-            );
+        let detection = match state {
+            ScreenState::Board => Some(game.vision.detect(&f)?),
+            ScreenState::UnknownDark => {
+                let d = game.vision.detect(&f)?;
+                state.playable(&f, cfg, game.screen, &d).then_some(d)
+            }
+            _ => None,
+        };
+        let Some(d) = detection else {
+            let (phase, reason) = match state {
+                ScreenState::ResultPending => ("result_pending", "正在结算，等待重玩按钮出现。"),
+                ScreenState::SkinModal => ("blocked_modal", "请在游戏中关闭获得新皮肤提示。"),
+                _ => (
+                    "unrecognized_dark",
+                    "画面较暗，尚无法确认棋子与平台，等待重新识别。",
+                ),
+            };
+            if state == ScreenState::UnknownDark && game.status["state"] != phase {
+                game.debug("last_unrecognized_dark.png", &f);
+            }
+            game.report(phase, json!({"game_state":phase,"stop_reason":reason}));
+            pressed_button = None;
+            blind = None;
+            attempts = 0;
             previous_center = None;
             baseline = true;
             game.vision.reset_prior();
             game.ctl.sleep(g, ms(300.));
             window = Some((w, g));
             continue;
-        }
+        };
         pressed_button = None;
-        let d = game.vision.detect(&f)?;
         if baseline {
             records.resync(game.screen.score(&f, cfg));
             baseline = false
