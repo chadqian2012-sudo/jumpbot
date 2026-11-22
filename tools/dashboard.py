@@ -446,26 +446,25 @@ def main() -> int:
     status_reader = StatusReader(status_path)
     interval = max(args.interval, 0.2)
     lower_priority()
+    channel = None
     if args.control_handle is not None:
         import msvcrt
-        import threading
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from run_control import console_keys
-
-        def send_keys():
-            with os.fdopen(msvcrt.open_osfhandle(args.control_handle, os.O_WRONLY),
-                           "wb", buffering=0) as channel:
-                try:
-                    for key in console_keys():
-                        if key == "p":
-                            channel.write(b"p")
-                except OSError:
-                    return  # The owning worker stopped or the console closed.
-
-        threading.Thread(target=send_keys, name="panel-P", daemon=True).start()
+        from run_control import console_key_batches
+        keys = console_key_batches()
+        channel = os.fdopen(msvcrt.open_osfhandle(args.control_handle, os.O_WRONLY),
+                            "wb", buffering=0)
     try:
         while True:
             frame_start = time.monotonic()
+            if channel is not None:
+                try:
+                    for key in next(keys):
+                        if key == "p":
+                            channel.write(b"p")
+                except OSError:
+                    channel.close()
+                    channel = None
             status = status_reader.read()
             csv_stats = None
             if status is None:
@@ -483,7 +482,7 @@ def main() -> int:
             else:
                 pid, _cmd = bot_process()
             text = render(status, csv_stats, pid, ansi)
-            if args.control_handle is not None:
+            if channel is not None:
                 text += "\n本面板按 P 可暂停 / 恢复"
             if args.once:
                 print(text.replace("\x1b[2J\x1b[H", ""))
@@ -514,6 +513,9 @@ def main() -> int:
     except BaseException as exc:                      # noqa: BLE001
         log_exit(f"异常退出：{type(exc).__name__}: {exc}")
         raise
+    finally:
+        if channel is not None:
+            channel.close()
 
 
 if __name__ == "__main__":

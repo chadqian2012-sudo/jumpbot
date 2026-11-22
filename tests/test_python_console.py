@@ -46,23 +46,18 @@ def worker(folder):
     j.DEBUG_DIR = j.LOG_DIR = folder
     j.STATUS_PATH = folder / 'status.json'
     real_popen = subprocess.Popen
-    panels = []
 
     def hidden_panel(args, **kwargs):
         si = kwargs.setdefault('startupinfo', subprocess.STARTUPINFO())
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
         child = real_popen(args, **kwargs)
-        panels.append(child)
         (folder / 'panel.pid').write_text(str(child.pid))
         return child
 
     with patch.object(j, 'find_windows', return_value=[]), patch.object(subprocess, 'Popen', hidden_panel):
-        result = j.main(['--config', str(folder / 'config.json'), '--startup-wait-s', '30',
+        return j.main(['--config', str(folder / 'config.json'), '--startup-wait-s', '30',
                          '--pause-hotkey', 'Ctrl+Shift+9'])
-        for panel in panels:
-            panel.wait(timeout=10)
-        return result
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows console input buffers')
@@ -97,6 +92,9 @@ class ConsoleTests(unittest.TestCase):
                 try:
                     state('waiting_window')
                     panel = int((folder / 'panel.pid').read_text())
+                    import _winapi
+                    panel_handle = _winapi.OpenProcess(0x00100000, False, panel)
+                    self.addCleanup(_winapi.CloseHandle, panel_handle)
                     key(child.pid, 'p')
                     state('paused', 1)
                     key(child.pid, 'P')
@@ -106,7 +104,10 @@ class ConsoleTests(unittest.TestCase):
                     key(panel, 'P')
                     state('waiting_window', 4)
                     key(child.pid, 'q')
-                    self.assertEqual(child.wait(timeout=18), 0)
+                    rc = child.wait(timeout=18)
+                    self.assertEqual(rc, 0, (folder / 'worker.log').read_text(encoding='utf8'))
+                    self.assertEqual(_winapi.WaitForSingleObject(panel_handle, 25000), 0,
+                                     'dashboard did not exit after its owner stopped')
                     self.assertEqual(json.loads((folder / 'status.json').read_text(
                         encoding='utf8'))['jumps'], 0)
                 finally:
@@ -119,6 +120,13 @@ if __name__ == '__main__':
     if sys.argv[1:2] == ['key']:
         write_console_key(*sys.argv[2:])
     elif sys.argv[1:2] == ['worker']:
-        raise SystemExit(worker(sys.argv[2]))
+        import traceback
+        with (Path(sys.argv[2]) / 'worker.log').open('w', encoding='utf8') as output:
+            sys.stderr = output
+            try:
+                raise SystemExit(worker(sys.argv[2]))
+            except Exception:
+                traceback.print_exc()
+                raise
     else:
         unittest.main()

@@ -27,7 +27,7 @@ from pathlib import Path
 from contextlib import nullcontext
 
 from run_control import (RunControl, WindowsHotkeyListener, ControlInterrupted,
-                         console_keys, parse_hotkey, validate_timing)
+                         console_key_batches, parse_hotkey, validate_timing)
 from skin_vision import find_skin_piece, has_horizontal_character_mask
 
 import cv2
@@ -3078,14 +3078,16 @@ def _console_key_watcher() -> None:
     """Console-local P toggles the same control as the hotkey; q/Esc stop."""
     control = _CONTROL
     try:
-        for key in console_keys():
+        for keys in console_key_batches():
             if control.stopped:
                 return
-            if key == "p":
-                control.toggle("console P")
-            else:
-                control.stop("用户按控制台停止键")
-                return
+            for key in keys:
+                if key == "p":
+                    control.toggle("console P")
+                else:
+                    control.stop("用户按控制台停止键")
+                    return
+            time.sleep(0.05)
     except OSError:
         return  # Unattached workers can still use the global hotkey.
 
