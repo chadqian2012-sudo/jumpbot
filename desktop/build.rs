@@ -29,6 +29,28 @@ fn main() {
         vc.join("lib").join(&lib).display()
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-changed=ui/JumpBot-Interval.ico");
+    let sdk = find_msvc_tools::find_windows_sdk(env::consts::ARCH)
+        .expect("Windows SDK required to compile the Jump Bot icon");
+    let rc = sdk
+        .path()
+        .map(|dir| dir.join("rc.exe"))
+        .find(|p| p.is_file())
+        .expect("Windows SDK resource compiler rc.exe");
+    let script = out.join("icon.rc");
+    let resource = out.join("icon.res");
+    fs::write(&script, "1 ICON \"JumpBot-Interval.ico\"\n").unwrap();
+    let status = std::process::Command::new(rc)
+        .current_dir("ui")
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&resource)
+        .arg(&script)
+        .status()
+        .expect("run the Windows resource compiler");
+    assert!(status.success(), "compiling Jump Bot icon failed: {status}");
+    println!("cargo:rustc-link-arg-bins={}", resource.display());
+
     let profile = out
         .ancestors()
         .find(|p| p.file_name().is_some_and(|n| n == "build"))

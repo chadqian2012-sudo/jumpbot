@@ -548,6 +548,7 @@ dependencies = [
  "crc32fast",
  "csv",
  "ctrlc",
+ "find-msvc-tools",
  "glob",
  "image",
  "jumpbot-vision",

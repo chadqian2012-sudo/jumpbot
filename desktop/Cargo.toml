@@ -14,6 +14,9 @@ default = ["cuda", "opencl"]
 cuda = []
 opencl = []
 
+[build-dependencies]
+find-msvc-tools = "0.1.15"
+
 [dependencies]
 jumpbot-vision = {path = "vision"}
 opencv = {version = "0.102", default-features = false, features = ["imgproc", "imgcodecs", "clang-runtime"]}

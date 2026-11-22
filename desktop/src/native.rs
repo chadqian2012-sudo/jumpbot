@@ -608,14 +608,21 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
         let _com = Com;
         let instance = GetModuleHandleW(null());
         let class = w!("JumpBotConsole");
-        let wc = WNDCLASSW {
+        // Icon group 1 also supplies the executable icon used by the Windows shell.
+        let icon = LoadIconW(instance, 1 as *const u16);
+        if icon.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            hIcon: icon,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             lpszClassName: class,
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 {
+        if RegisterClassExW(&wc) == 0 {
             return Err(io::Error::last_os_error().into());
         }
         let dpi = GetDpiForSystem() as i32;
