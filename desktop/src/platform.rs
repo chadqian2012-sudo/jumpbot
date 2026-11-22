@@ -268,19 +268,28 @@ impl Window {
                 return Err("游戏窗口部分位于屏幕外".into());
             }
         }
-        if !self.unobscured() {
-            return Err("游戏客户区被其他窗口遮挡或已关闭".into());
-        }
-        Ok(())
+        self.check_occlusion()
     }
 
-    fn unobscured(&self) -> bool {
+    fn check_occlusion(&self) -> Result<()> {
         let mut cover = Cover {
             target: self,
-            reached: false,
+            stopped_at: null_mut(),
         };
         unsafe { EnumWindows(Some(check_cover), &mut cover as *mut _ as LPARAM) };
-        cover.reached
+        if cover.stopped_at == self.handle() {
+            return Ok(());
+        }
+        if cover.stopped_at.is_null() {
+            return Err("无法在桌面窗口列表中确认游戏窗口".into());
+        }
+        let id = pid(cover.stopped_at);
+        let path = executable(id);
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("未知程序");
+        Err(format!("游戏客户区被其他窗口遮挡（{name}，PID {id}）"))
     }
 
     /// Screen reads visible desktop pixels. PrintWindow requests client pixels
@@ -438,13 +447,13 @@ pub enum PressOutcome {
 
 struct Cover<'a> {
     target: &'a Window,
-    reached: bool,
+    stopped_at: HWND,
 }
 
 unsafe extern "system" fn check_cover(hwnd: HWND, data: LPARAM) -> i32 {
     let cover = &mut *(data as *mut Cover<'_>);
     if hwnd == cover.target.handle() {
-        cover.reached = true;
+        cover.stopped_at = hwnd;
         return 0;
     }
     let mut rect = RECT::default();
@@ -485,7 +494,46 @@ unsafe extern "system" fn check_cover(hwnd: HWND, data: LPARAM) -> i32 {
     {
         visible = bounds;
     }
-    i32::from(visible.right <= l || visible.left >= r || visible.bottom <= t || visible.top >= b)
+    let (l, t, r, b) = (
+        l.max(visible.left),
+        t.max(visible.top),
+        r.min(visible.right),
+        b.min(visible.bottom),
+    );
+    if l >= r || t >= b {
+        return 1;
+    }
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_LAYERED != 0 {
+        let (mut alpha, mut flags) = (0, 0);
+        if GetLayeredWindowAttributes(hwnd, null_mut(), &mut alpha, &mut flags) != 0
+            && flags & LWA_ALPHA != 0
+            && alpha == 0
+        {
+            return 1;
+        }
+    }
+    let region = CreateRectRgn(0, 0, 0, 0);
+    if !region.is_null() {
+        let kind = GetWindowRgn(hwnd, region);
+        let overlap = RECT {
+            left: l - rect.left,
+            top: t - rect.top,
+            right: r - rect.left,
+            bottom: b - rect.top,
+        };
+        // Unknown regions and mirrored layouts retain the rectangular check.
+        let outside = kind == NULLREGION
+            || (matches!(kind, SIMPLEREGION | COMPLEXREGION)
+                && ex_style & WS_EX_LAYOUTRTL == 0
+                && RectInRegion(region, &overlap) == 0);
+        DeleteObject(region);
+        if outside {
+            return 1;
+        }
+    }
+    cover.stopped_at = hwnd;
+    0
 }
 
 /// Draw into a top-down 24-bit DIB and return tightly packed BGR pixels.
@@ -882,19 +930,29 @@ mod tests {
                 ),
                 0
             );
-            assert!(window.unobscured());
+            window.check_occlusion().unwrap();
             let overlay = make_window(
                 "Click-through overlay",
-                WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+                WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
                 110,
                 75,
             );
-            assert!(
-                !window.unobscured(),
-                "even a partial overlay can corrupt screen pixels"
-            );
+            for alpha in [0, 1, 255] {
+                assert_ne!(SetLayeredWindowAttributes(overlay, 0, alpha, LWA_ALPHA), 0);
+                assert_eq!(window.check_occlusion().is_ok(), alpha == 0);
+            }
+            // The two bars leave a hole at the only corner overlapping the target.
+            // Extending one bar by a single pixel must block capture again.
+            for edge in [10, 9] {
+                let bottom = CreateRectRgn(0, 15, 90, 60);
+                let right = CreateRectRgn(edge, 0, 90, 15);
+                assert_eq!(CombineRgn(bottom, bottom, right, RGN_OR), COMPLEXREGION);
+                DeleteObject(right);
+                assert_ne!(SetWindowRgn(overlay, bottom, 0), 0);
+                assert_eq!(window.check_occlusion().is_ok(), edge == 10);
+            }
             assert_ne!(DestroyWindow(overlay), 0);
-            assert!(window.unobscured());
+            window.check_occlusion().unwrap();
             assert!(window
                 .capture(CaptureMode::Screen)
                 .err()

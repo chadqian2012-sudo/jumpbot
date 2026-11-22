@@ -251,7 +251,7 @@ impl Masks {
             simd,
             ratios: [cfg.f("top_bar_ratio"), 1. - cfg.f("bottom_bar_ratio")],
             table: tables(cfg),
-            last: if simd { "simd" } else { "cpu" },
+            last: "pending",
             #[cfg(any(feature = "cuda", feature = "opencl"))]
             gpu: GpuSelection {
                 cuda: cfg!(feature = "cuda") && enabled("cuda_enabled", "JUMPBOT_DISABLE_CUDA"),
@@ -397,6 +397,14 @@ impl Masks {
                     self.gpu.chosen = None;
                 }
             }
+        }
+        if matches!(self.mode, Mode::Cuda | Mode::Opencl) && !matches!(self.last, "cpu" | "simd") {
+            let requested = if self.mode == Mode::Cuda {
+                "CUDA"
+            } else {
+                "OpenCL"
+            };
+            eprintln!("{requested} 未能执行本帧，已回退到 CPU。");
         }
         self.last = if self.simd { "simd" } else { "cpu" };
         Ok(cpu(f, &bg, &self.table, rows, self.simd))

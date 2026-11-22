@@ -17,7 +17,7 @@ pub struct Console {
     pub observed: Instant,
     pub logs: VecDeque<String>,
     pub log_sequence: u64,
-    pub landed: Option<Instant>,
+    pub landed: Option<(Instant, bool)>,
 }
 impl Console {
     pub fn new(error: Option<String>) -> Self {
@@ -73,9 +73,49 @@ impl Console {
         }
         if self.mode == Mode::Live {
             let phase = s["state"].as_str().unwrap_or("starting");
+            if phase != self.phase || s["stop_reason"] != self.status["stop_reason"] {
+                let reason = s["stop_reason"].as_str().unwrap_or("");
+                match phase {
+                    "waiting_window" | "capture_blocked" | "blocked_modal" | "stopped"
+                        if !reason.is_empty() =>
+                    {
+                        self.log(reason.to_owned())
+                    }
+                    "paused" => self.log("已暂停，可以切换窗口。".into()),
+                    "resuming" => self.log("正在重新获取游戏窗口。".into()),
+                    "countdown" => self.log(format!(
+                        "已找到游戏窗口，准备开始。进程 {}",
+                        s["window"]["pid"]
+                    )),
+                    _ => {}
+                }
+            }
+            if s["mask_backend"] != self.status["mask_backend"] {
+                if let Some(backend) = s["mask_backend"].as_str().filter(|b| *b != "pending") {
+                    self.log(format!("本轮实际识别后端：{backend}"));
+                }
+            }
+            if s["jump_uid"].is_string() && s["jump_uid"] != self.status["jump_uid"] {
+                let score = s["score"]
+                    .as_i64()
+                    .map_or_else(|| "待判定".to_owned(), |v| v.to_string());
+                let result = match s["last_result"].as_str() {
+                    Some("landed") => "已落地",
+                    Some("dead") => "本局结束",
+                    _ => "落点待判定",
+                };
+                self.log(format!(
+                    "第 {} 跳　{}　分数 {}　蓄力 {:.0} ms",
+                    s["last_index"],
+                    result,
+                    score,
+                    s["last_hold_ms"].as_f64().unwrap_or_default()
+                ));
+            }
             if phase != self.phase {
                 if phase == "landing" {
-                    self.landed = Some(self.observed);
+                    self.landed =
+                        Some((self.observed, !self.landed.is_some_and(|(_, right)| right)));
                 }
                 self.phase = phase.into();
             }
@@ -136,6 +176,12 @@ impl Console {
             "playing" => ("运行中", "正在识别棋子与目标。"),
             "acquiring" => ("正在识别", "正在寻找可用的游戏画面。"),
             "landing" => ("正在核对落点", "本次按压已释放，正在读取落点。"),
+            "capture_blocked" => (
+                "无法读取画面",
+                self.status["stop_reason"]
+                    .as_str()
+                    .unwrap_or("请检查游戏窗口是否完整可见。"),
+            ),
             "blocked_modal" => ("窗口有弹窗", "请查看游戏窗口中的提示。"),
             "dead" => ("本局结束", "正在处理游戏结束画面。"),
             "stopped" => (

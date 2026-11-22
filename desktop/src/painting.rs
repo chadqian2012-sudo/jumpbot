@@ -238,7 +238,7 @@ pub struct Scene {
     pub fonts: Fonts,
     pub motion: bool,
     pub transition: Instant,
-    pub landing: Option<Instant>,
+    pub landing: Option<(Instant, bool)>,
     pub notice: bool,
 }
 thread_local! {pub static SCENE:RefCell<Option<Scene>>=const{RefCell::new(None)};}
@@ -246,22 +246,32 @@ fn animation_frame(
     motion: bool,
     now: Instant,
     transition: Instant,
-    landing: Option<Instant>,
+    landing: Option<(Instant, bool)>,
 ) -> (f32, Option<f32>) {
     if !motion {
         return (1., None);
     }
     let entry = (now.saturating_duration_since(transition).as_secs_f32() / 0.4).min(1.);
-    let jump = landing
-        .map(|t| now.saturating_duration_since(t).as_secs_f32() / 0.52)
-        .filter(|t| *t < 1.);
+    let jump = landing.map(|(start, right)| {
+        let t = (now.saturating_duration_since(start).as_secs_f32() / 0.68).min(1.);
+        let eased = t * t * (3. - 2. * t);
+        if right {
+            eased
+        } else {
+            1. - eased
+        }
+    });
     (entry, jump)
 }
 impl Scene {
     pub fn moving(&self) -> bool {
-        let (entry, jump) =
+        let (entry, _) =
             animation_frame(self.motion, Instant::now(), self.transition, self.landing);
-        entry < 1. || jump.is_some()
+        entry < 1.
+            || (self.motion
+                && self
+                    .landing
+                    .is_some_and(|(t, _)| t.elapsed().as_secs_f32() < 0.68))
     }
     pub fn bg(&self, id: Option<Id>) -> u32 {
         match id {
@@ -404,8 +414,8 @@ impl Scene {
         let l = self.layout;
         let c = self.colors;
         let pt = |a: f32, b: f32| POINT {
-            x: l.px(x + (w as f32 * a) as i32),
-            y: l.px(y + (h as f32 * b) as i32),
+            x: ((x as f32 + w as f32 * a) * l.scale).round() as i32,
+            y: ((y as f32 + h as f32 * b) * l.scale).round() as i32,
         };
         let line = |a: POINT, b: POINT, color| {
             SetDCPenColor(dc, color);
@@ -457,8 +467,14 @@ impl Scene {
             line(pt(cx, cy + 0.115), pt(cx, cy + 0.185), c.ink);
             diamond(cx, cy, 0.155, 0.115, c.ink, c.paper);
         }
-        diamond(0.76, 0.51, 0.027, 0.021, c.ink, c.panel);
-        let arc = |t: f32| pt(0.24 + 0.52 * t, 0.70 - 0.19 * t - 1.61 * t * (1. - t));
+        let offset = (1. - entry) * 0.14;
+        diamond(0.76, 0.51 + offset, 0.027, 0.021, c.ink, c.panel);
+        let arc = |t: f32| {
+            pt(
+                0.24 + 0.52 * t,
+                0.70 + offset - 0.19 * t - 1.61 * t * (1. - t),
+            )
+        };
         for i in 0..40 {
             if i % 2 == 0 || jump.is_some_and(|v| i as f32 / 40. < v) {
                 line(
@@ -468,8 +484,7 @@ impl Scene {
                 );
             }
         }
-        let mut p = arc(jump.unwrap_or(0.));
-        p.y += l.px(((1. - entry) * 0.14 * h as f32) as i32);
+        let p = arc(jump.unwrap_or(0.));
         let k = l.px((h / 11).clamp(5, 15));
         SetDCBrushColor(dc, c.ink);
         SetDCPenColor(dc, c.ink);
@@ -491,9 +506,6 @@ impl Scene {
             POINT { x: p.x - k, y: p.y },
         ];
         Polygon(dc, body.as_ptr(), 5);
-        if jump.is_some_and(|t| t > 0.76) {
-            diamond(0.76, 0.51, 0.054, 0.038, c.ink, AMBER);
-        }
     }
 }
 pub unsafe fn fill(dc: HDC, r: RECT, color: u32) {
@@ -642,10 +654,10 @@ mod tests {
     fn reduced_motion_is_static_and_normal_motion_finishes() {
         let start = Instant::now();
         let during = start + std::time::Duration::from_millis(100);
-        let frame = animation_frame(true, during, start, Some(start));
+        let frame = animation_frame(true, during, start, Some((start, true)));
         assert!(frame.0 > 0. && frame.0 < 1. && frame.1.is_some());
         assert_eq!(
-            animation_frame(false, during, start, Some(start)),
+            animation_frame(false, during, start, Some((start, true))),
             (1., None)
         );
         assert_eq!(
@@ -653,9 +665,9 @@ mod tests {
                 true,
                 start + std::time::Duration::from_secs(1),
                 start,
-                Some(start)
+                Some((start, true))
             ),
-            (1., None)
+            (1., Some(1.))
         );
     }
 }

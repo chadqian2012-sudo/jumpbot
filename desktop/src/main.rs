@@ -144,6 +144,13 @@ impl Host {
             Ok(child) => {
                 self.session = Some(Session::new(child, selftest));
                 self.ui.started(selftest);
+                if !selftest {
+                    self.ui.log(format!(
+                        "已启动。请求后端：{}；窗口重开后{}。",
+                        BACKENDS[index].0,
+                        if daemon { "继续" } else { "结束本轮" }
+                    ));
+                }
             }
             Err(e) => self.ui.notice = e.to_string(),
         }

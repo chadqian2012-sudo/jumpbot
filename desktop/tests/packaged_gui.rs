@@ -298,6 +298,11 @@ fn packaged_gui() -> Result<()> {
         let repeat = ui
             .find("daemon")?
             .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)?;
+        assert_eq!(repeat.CurrentToggleState()?, ToggleState_On);
+        repeat.Toggle()?;
+        until("daemon checkbox unchecked", || {
+            (repeat.CurrentToggleState().ok()? != ToggleState_On).then_some(())
+        })?;
         repeat.Toggle()?;
         until("daemon checkbox checked", || {
             (repeat.CurrentToggleState().ok()? == ToggleState_On).then_some(())
@@ -310,7 +315,7 @@ fn packaged_gui() -> Result<()> {
         for close in [false, true] {
             ui.invoke("primary", "启动脚本")?;
             ui.named("phase", "等待游戏窗口")?;
-            ui.named("actual-backend", "CPU SIMD")?;
+            ui.named("actual-backend", "等待首帧")?;
             assert!(!combo.CurrentIsEnabled()?.as_bool());
             let (worker_pid, child) = worker(pid, &app.join("jumpbot.exe"))?;
             assert_ne!(previous, Some(worker_pid));
