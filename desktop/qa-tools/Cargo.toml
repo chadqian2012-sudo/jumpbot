@@ -1,0 +1,17 @@
+[package]
+name = "jumpbot-qa"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libm = "0.2"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+ctrlc = "3"
+regex = "1"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+walkdir = "2"
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading","Win32_System_Threading","Win32_System_Diagnostics_ToolHelp","Win32_UI_Input_KeyboardAndMouse"] }

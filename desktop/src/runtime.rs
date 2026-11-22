@@ -14,14 +14,26 @@ use std::{
     time::Instant,
 };
 
+/// Every executable that can open an OpenCL device must recognize its own disposable child.
+pub(crate) fn opencl_preflight_command() -> Option<Result<()>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--_opencl-check") {
+        return None;
+    }
+    let selector = args.next()?;
+    if args.next().is_some() {
+        return Some(Err("OpenCL 设备检查参数无效".into()));
+    }
+    Some(if crate::masks::opencl_probe(&selector) {
+        Ok(())
+    } else {
+        Err("OpenCL 设备检查失败".into())
+    })
+}
+
 pub fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 && args[1] == "--_opencl-check" {
-        return if crate::masks::opencl_probe(&args[2]) {
-            Ok(())
-        } else {
-            Err("OpenCL 设备检查失败".into())
-        };
+    if let Some(result) = opencl_preflight_command() {
+        return result;
     }
     let o = Options::parse();
     let root = asset_dir();

@@ -1,24 +1,9 @@
 //! Infer HUD digit templates from score crops and the sequence of jump increments.
 use crate::{Frame, Result};
-use std::ffi::c_void;
+
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
-use std::slice;
-
-const FEATURE_SIZE: usize = 24 * 32;
-
-extern "C" {
-    /// Calls emit once per glyph, from left to right, while its buffers are live.
-    fn jb_harvest_glyphs(
-        bgr: *const u8,
-        width: i32,
-        height: i32,
-        context: *mut c_void,
-        emit: extern "C" fn(*mut c_void, *const f32, *const u8, usize),
-    ) -> i32;
-}
-
 struct Glyph {
     feature: Vec<f32>,
     norm: f32,
@@ -38,29 +23,19 @@ impl Glyph {
 }
 
 fn glyphs(frame: &Frame) -> Result<Vec<Glyph>> {
-    extern "C" fn copy(context: *mut c_void, feature: *const f32, png: *const u8, len: usize) {
-        // Native storage is borrowed only for the duration of this callback.
-        unsafe {
-            let feature = slice::from_raw_parts(feature, FEATURE_SIZE).to_vec();
+    crate::screen::segment_glyphs(frame, [0, 0, frame.width, frame.height])
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|raw| {
+            let feature = crate::screen::glyph_feature(&raw).map_err(|e| e.to_string())?;
             let norm = feature.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let png = slice::from_raw_parts(png, len).to_vec();
-            (*context.cast::<Vec<Glyph>>()).push(Glyph { feature, norm, png });
-        }
-    }
-    let mut out = Vec::<Glyph>::new();
-    let success = unsafe {
-        jb_harvest_glyphs(
-            frame.bgr.as_ptr(),
-            frame.width as i32,
-            frame.height as i32,
-            (&mut out as *mut Vec<Glyph>).cast(),
-            copy,
-        )
-    };
-    if success != 1 {
-        return Err("无法切分分数图像".into());
-    }
-    Ok(out)
+            Ok(Glyph {
+                feature,
+                norm,
+                png: crate::screen::glyph_png(&raw)?,
+            })
+        })
+        .collect()
 }
 
 struct Sample {

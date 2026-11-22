@@ -1,15 +1,19 @@
 mod calibration;
 mod control;
+pub mod diagnostics;
 mod harvest;
 mod landing;
 mod masks;
 mod options;
 mod platform;
 mod play;
+pub mod profile;
 mod records;
+mod regions;
 pub mod runtime;
 mod screen;
 mod skin;
+mod template;
 mod vision;
 
 use serde_json::Value;

@@ -1,4 +1,4 @@
-﻿#ifndef PayloadDir
+#ifndef PayloadDir
   #define PayloadDir "..\..\dist\jumpbot"
 #endif
 #ifndef OutputDir
@@ -43,9 +43,11 @@ OutputBaseFilename=jumpbot-setup-{#AppVersion}-{#AppFlavor}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+WizardSmallImageFile=..\..\desktop\ui\JumpBot-Interval.bmp
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppTitle}
+SetupIconFile=..\..\desktop\ui\JumpBot-Interval.ico
 UninstallDisplayIcon={app}\jumpbot-desktop.exe
 SetupLogging=yes
 AllowNoIcons=yes
@@ -57,8 +59,10 @@ Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce
 
 [Files]
+; A v1.3 uninstall log can remove config.json. Restore saved user bytes first.
+Source: "{app}\config.jumpbot-preserved.json"; DestDir: "{app}"; DestName: "config.json"; Flags: external skipifsourcedoesntexist onlyifdoesntexist uninsneveruninstall
 ; At install time, preserve digit templates harvested with v1.3.
-Source: "{app}\_internal\templates\*.png"; DestDir: "{app}\templates"; Flags: external skipifsourcedoesntexist onlyifdoesntexist uninsneveruninstall
+Source: "{app}\_internal\templates\*.png"; DestDir: "{app}\templates"; Flags: external recursesubdirs skipifsourcedoesntexist onlyifdoesntexist uninsneveruninstall
 #include PayloadFiles
 
 [Icons]
@@ -72,8 +76,12 @@ Name: "{group}\卸载 跳一跳自动脚本"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 0 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+Filename: "{app}\run.exe"; Parameters: "--finish-config-restore"; Flags: runhidden
 Filename: "{app}\jumpbot.exe"; Parameters: "--selftest"; Description: "运行自检（推荐，验证依赖与 GPU 后端）"; Flags: postinstall nowait skipifsilent
 Filename: "{app}\jumpbot-desktop.exe"; Description: "打开桌面控制台"; Flags: postinstall nowait skipifsilent unchecked
+
+[UninstallRun]
+Filename: "{app}\run.exe"; Parameters: "--preserve-uninstall-config"; Flags: runhidden; RunOnceId: "PreserveJumpBotConfig"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
