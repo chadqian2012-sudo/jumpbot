@@ -10,6 +10,7 @@ use std::{
     os::windows::io::{FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
     rc::Rc,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -107,6 +108,19 @@ fn pid(hwnd: HWND) -> u32 {
     id
 }
 
+fn compiled_regex(pattern: &str) -> Result<Regex> {
+    static PATTERN_CACHE: Mutex<Option<(String, Regex)>> = Mutex::new(None);
+    let mut guard = PATTERN_CACHE.lock().map_err(|e| e.to_string())?;
+    if let Some((cached, re)) = guard.as_ref() {
+        if cached == pattern {
+            return Ok(re.clone());
+        }
+    }
+    let re = Regex::new(pattern).map_err(|e| format!("窗口标题正则无效: {e}"))?;
+    *guard = Some((pattern.to_owned(), re.clone()));
+    Ok(re)
+}
+
 fn executable(id: u32) -> String {
     unsafe {
         let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id);
@@ -114,8 +128,17 @@ fn executable(id: u32) -> String {
             return String::new();
         }
         let _handle = OwnedHandle::from_raw_handle(raw);
+        let mut stack = [0u16; 512];
+        let mut len = stack.len() as u32;
+        if QueryFullProcessImageNameW(raw, 0, stack.as_mut_ptr(), &mut len) != 0 {
+            return String::from_utf16_lossy(&stack[..len as usize]);
+        }
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        if GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+            return String::new();
+        }
         let mut buf = vec![0; 32768];
-        let mut len = buf.len() as u32;
+        len = buf.len() as u32;
         if QueryFullProcessImageNameW(raw, 0, buf.as_mut_ptr(), &mut len) == 0 {
             return String::new();
         }
@@ -201,8 +224,7 @@ impl Window {
     /// client size. None means "wait for window"; malformed regex is an error.
     pub fn find(cfg: &Config, min_size: (usize, usize)) -> Result<Option<Self>> {
         let _dpi = PhysicalPixels::enter()?;
-        let pattern = Regex::new(cfg.s("window_title_pattern"))
-            .map_err(|e| format!("窗口标题正则无效: {e}"))?;
+        let pattern = compiled_regex(cfg.s("window_title_pattern"))?;
         let mut search = Search {
             pattern: &pattern,
             exe_hint: cfg.s("window_exe_hint").to_lowercase(),
@@ -295,6 +317,15 @@ impl Window {
     /// Screen reads visible desktop pixels. PrintWindow requests client pixels
     /// from the target itself and can be used when the desktop is occluded.
     pub fn capture(&self, mode: CaptureMode) -> Result<Option<Frame>> {
+        self.capture_with(mode, |w, h, clear, draw| {
+            ReusableSurface::new(w, h)?.capture(clear, draw)
+        })
+    }
+
+    fn capture_with<F>(&self, mode: CaptureMode, mut render: F) -> Result<Option<Frame>>
+    where
+        F: FnMut(i32, i32, bool, &mut dyn FnMut(HDC) -> Result<()>) -> Result<Frame>,
+    {
         let _dpi = PhysicalPixels::enter()?;
         if !self.still_current()? {
             return Ok(None);
@@ -305,34 +336,36 @@ impl Window {
         let width = self.width() as i32;
         let height = self.height() as i32;
         let frame = match mode {
-            CaptureMode::Screen => capture_bgr(width, height, |dc| unsafe {
-                let screen = GetDC(null_mut());
-                if screen.is_null() {
-                    return Err(os_error("GetDC"));
-                }
-                let ok = BitBlt(
-                    dc,
-                    0,
-                    0,
-                    width,
-                    height,
-                    screen,
-                    self.client_rect[0],
-                    self.client_rect[1],
-                    SRCCOPY | CAPTUREBLT,
-                );
-                let result = if ok != 0 {
-                    Ok(())
-                } else {
-                    Err(os_error("BitBlt"))
-                };
-                ReleaseDC(null_mut(), screen);
-                result
-            }),
+            CaptureMode::Screen => {
+                render(width, height, false, &mut |dc| unsafe {
+                    let screen = GetDC(null_mut());
+                    if screen.is_null() {
+                        return Err(os_error("GetDC"));
+                    }
+                    let ok = BitBlt(
+                        dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        screen,
+                        self.client_rect[0],
+                        self.client_rect[1],
+                        SRCCOPY | CAPTUREBLT,
+                    );
+                    let result = if ok != 0 {
+                        Ok(())
+                    } else {
+                        Err(os_error("BitBlt"))
+                    };
+                    ReleaseDC(null_mut(), screen);
+                    result
+                })
+            }
             CaptureMode::PrintWindow => {
                 const PW_RENDERFULLCONTENT: u32 = 2;
-                let print = |flags| {
-                    capture_bgr(width, height, |dc| {
+                let mut print = |flags| {
+                    render(width, height, true, &mut |dc| {
                         if unsafe { PrintWindow(self.handle(), dc, flags) } != 0 {
                             Ok(())
                         } else {
@@ -542,72 +575,105 @@ pub(crate) fn capture_bgr(
     height: i32,
     draw: impl FnOnce(HDC) -> Result<()>,
 ) -> Result<Frame> {
-    let (w, h) = (
-        usize::try_from(width).map_err(|_| "截图宽度无效")?,
-        usize::try_from(height).map_err(|_| "截图高度无效")?,
-    );
-    let row = w.checked_mul(3).ok_or("截图宽度过大")?;
-    let stride = row.checked_add(3).ok_or("截图宽度过大")? & !3;
-    let bytes = stride
-        .checked_mul(h)
-        .filter(|n| *n > 0 && *n <= isize::MAX as usize)
-        .ok_or("截图尺寸无效")?;
-    unsafe {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 24,
-                biCompression: BI_RGB,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let dc = CreateCompatibleDC(null_mut());
-        if dc.is_null() {
-            return Err(os_error("CreateCompatibleDC"));
-        }
-        let mut bits: *mut c_void = null_mut();
-        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        let mut surface = Surface {
-            dc,
-            bitmap,
-            old: null_mut(),
-        };
-        if bitmap.is_null() || bits.is_null() {
-            return Err(os_error("CreateDIBSection"));
-        }
-        surface.old = SelectObject(dc, bitmap);
-        if surface.old.is_null() || surface.old as isize == -1 {
-            return Err(os_error("SelectObject"));
-        }
-        let pixels = bits.cast::<u8>();
-        std::ptr::write_bytes(pixels, 0, bytes);
-        draw(dc)?;
-        if GdiFlush() == 0 {
-            return Err(os_error("GdiFlush"));
-        }
-        let mut bgr = Vec::with_capacity(row * h);
-        for line in std::slice::from_raw_parts(pixels, bytes).chunks_exact(stride) {
-            bgr.extend_from_slice(&line[..row]);
-        }
-        Ok(Frame {
-            width: w,
-            height: h,
-            bgr,
-        })
-    }
+    ReusableSurface::new(width, height)?.capture(true, draw)
 }
 
-struct Surface {
+struct ReusableSurface {
     dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+    row: usize,
+    stride: usize,
+    bytes: usize,
 }
 
-impl Drop for Surface {
+impl ReusableSurface {
+    fn new(width: i32, height: i32) -> Result<Self> {
+        let (w, h) = (
+            usize::try_from(width).map_err(|_| "截图宽度无效")?,
+            usize::try_from(height).map_err(|_| "截图高度无效")?,
+        );
+        let row = w.checked_mul(3).ok_or("截图宽度过大")?;
+        let stride = row.checked_add(3).ok_or("截图宽度过大")? & !3;
+        let bytes = stride
+            .checked_mul(h)
+            .filter(|n| *n > 0 && *n <= isize::MAX as usize)
+            .ok_or("截图尺寸无效")?;
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 24,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let dc = CreateCompatibleDC(null_mut());
+            if dc.is_null() {
+                return Err(os_error("CreateCompatibleDC"));
+            }
+            let mut bits: *mut c_void = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            let mut surface = Self {
+                dc,
+                bitmap,
+                old: null_mut(),
+                bits: bits.cast::<u8>(),
+                width,
+                height,
+                row,
+                stride,
+                bytes,
+            };
+            if bitmap.is_null() || bits.is_null() {
+                return Err(os_error("CreateDIBSection"));
+            }
+            surface.old = SelectObject(dc, bitmap);
+            if surface.old.is_null() || surface.old as isize == -1 {
+                return Err(os_error("SelectObject"));
+            }
+            Ok(surface)
+        }
+    }
+
+    fn capture(&self, clear: bool, draw: impl FnOnce(HDC) -> Result<()>) -> Result<Frame> {
+        unsafe {
+            if clear {
+                std::ptr::write_bytes(self.bits, 0, self.bytes);
+            }
+            draw(self.dc)?;
+            if GdiFlush() == 0 {
+                return Err(os_error("GdiFlush"));
+            }
+            let w = self.width as usize;
+            let h = self.height as usize;
+            let raw = std::slice::from_raw_parts(self.bits, self.bytes);
+            let bgr = if self.stride == self.row {
+                raw.to_vec()
+            } else {
+                let mut bgr = Vec::with_capacity(self.row * h);
+                for line in raw.chunks_exact(self.stride) {
+                    bgr.extend_from_slice(&line[..self.row]);
+                }
+                bgr
+            };
+            Ok(Frame {
+                width: w,
+                height: h,
+                bgr,
+            })
+        }
+    }
+}
+
+impl Drop for ReusableSurface {
     fn drop(&mut self) {
         unsafe {
             if !self.old.is_null() && self.old as isize != -1 {
@@ -618,6 +684,35 @@ impl Drop for Surface {
                 DeleteObject(self.bitmap);
             }
         }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Capturer {
+    surface: Option<ReusableSurface>,
+}
+
+impl Capturer {
+    fn draw(
+        &mut self,
+        width: i32,
+        height: i32,
+        clear: bool,
+        draw: impl FnOnce(HDC) -> Result<()>,
+    ) -> Result<Frame> {
+        let reuse = self
+            .surface
+            .as_ref()
+            .is_some_and(|s| s.width == width && s.height == height);
+        if !reuse {
+            self.surface = None;
+            self.surface = Some(ReusableSurface::new(width, height)?);
+        }
+        self.surface.as_ref().unwrap().capture(clear, draw)
+    }
+
+    pub(crate) fn capture(&mut self, window: &Window, mode: CaptureMode) -> Result<Option<Frame>> {
+        window.capture_with(mode, |w, h, clear, draw| self.draw(w, h, clear, draw))
     }
 }
 
@@ -817,7 +912,6 @@ mod tests {
     use std::{
         cell::Cell,
         panic::{catch_unwind, AssertUnwindSafe},
-        sync::Mutex,
     };
 
     #[test]
@@ -1112,5 +1206,39 @@ mod tests {
             frame.bgr,
             [0, 0, 0, 0, 0, 0, 0x33, 0x22, 0x11, 0x66, 0x55, 0x44, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn capturer_reuses_surface_and_handles_resize_and_clear() {
+        let mut cap = Capturer::default();
+        let f1 = cap
+            .draw(3, 2, true, |dc| {
+                if unsafe { SetPixelV(dc, 2, 0, 0x00112233) } == 0 {
+                    return Err(os_error("SetPixelV"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let ptr1 = cap.surface.as_ref().unwrap().bits;
+        assert_eq!((f1.width, f1.height), (3, 2));
+        assert_eq!(&f1.bgr[6..9], &[0x11, 0x22, 0x33]);
+
+        // Second same-size capture without clear reuses the exact same DIB allocation.
+        let f2 = cap
+            .draw(3, 2, false, |dc| {
+                if unsafe { SetPixelV(dc, 0, 1, 0x00445566) } == 0 {
+                    return Err(os_error("SetPixelV"));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let ptr2 = cap.surface.as_ref().unwrap().bits;
+        assert_eq!(ptr1, ptr2);
+        assert_eq!(&f2.bgr[6..12], &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+
+        // Size change allocates a fresh matching DIB and zero-fills when clear=true.
+        let f3 = cap.draw(4, 2, true, |_| Ok(())).unwrap();
+        assert_eq!((f3.width, f3.height), (4, 2));
+        assert!(f3.bgr.iter().all(|&b| b == 0));
     }
 }

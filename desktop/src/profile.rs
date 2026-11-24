@@ -70,6 +70,8 @@ pub fn run() -> Result<()> {
             let mut mask_ms = Vec::new();
             let mut detect_ms = Vec::new();
             let mut hud_ms = Vec::new();
+            let mut button_ms = Vec::new();
+            let mut state_ms = Vec::new();
             let mut motion_ms = Vec::new();
             let mut landing_ms = Vec::new();
             for i in 0..=opt.repeat {
@@ -94,12 +96,18 @@ pub fn run() -> Result<()> {
                 let (detected, detect) = timed(|| vision.detect(&f));
                 let d = detected?;
                 let (_, score) = timed(|| screen.score(&f, &cfg));
+                let (btn, button) = timed(|| screen.button(&f));
+                btn?;
+                let (st, state) = timed(|| screen.state(&f, &cfg));
+                st?;
                 let (sample, motion) = timed(|| f.motion_sample(&cfg));
                 sample?;
                 let (_, foot) = timed(|| landing::foot(&f, &d));
                 if i > 0 {
                     detect_ms.push(detect);
                     hud_ms.push(score);
+                    button_ms.push(button);
+                    state_ms.push(state);
                     motion_ms.push(motion);
                     landing_ms.push(foot);
                 }
@@ -108,6 +116,8 @@ pub fn run() -> Result<()> {
             if !opt.masks_only {
                 row["detect_ms"] = median(&mut detect_ms).into();
                 row["hud_ms"] = median(&mut hud_ms).into();
+                row["button_ms"] = median(&mut button_ms).into();
+                row["state_ms"] = median(&mut state_ms).into();
                 row["motion_sample_ms"] = median(&mut motion_ms).into();
                 row["foot_check_ms"] = median(&mut landing_ms).into();
             }

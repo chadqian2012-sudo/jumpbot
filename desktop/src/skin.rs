@@ -89,27 +89,28 @@ fn upright(selection: &Selection, h: Rect, b: Rect, solidity: f64) -> bool {
         && (1.5..=4.8).contains(&aspect)
 }
 
-fn median(values: &[i32]) -> f64 {
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    f64::from(sorted[sorted.len() / 2] + sorted[(sorted.len() - 1) / 2]) * 0.5
+fn median_with(values: &[i32], scratch: &mut Vec<i32>) -> f64 {
+    scratch.clear();
+    scratch.extend_from_slice(values);
+    scratch.sort_unstable();
+    f64::from(scratch[scratch.len() / 2] + scratch[(scratch.len() - 1) / 2]) * 0.5
 }
 
-fn has_waist(rows: &[i32]) -> bool {
+fn has_waist(rows: &[i32], scratch: &mut Vec<i32>) -> bool {
     // A body aligned to a qualifying head has at least six rows.
     let h = rows.len();
-    let neck = median(&rows[1.max(h / 8)..2.max(h / 3)]);
-    let base = median(&rows[h / 2..(h / 2 + 1).max(h * 7 / 8)]);
+    let neck = median_with(&rows[1.max(h / 8)..2.max(h / 3)], scratch);
+    let base = median_with(&rows[h / 2..(h / 2 + 1).max(h * 7 / 8)], scratch);
     if neck >= 3.0 && base >= neck * 1.15 {
         return true;
     }
     let band = 3.max(h / 10);
-    let collar = median(&rows[1.max(h / 12)..2.max(h / 6)]);
+    let collar = median_with(&rows[1.max(h / 12)..2.max(h / 6)], scratch);
     let waist = (h / 4..=(h / 2).min(h - band))
-        .map(|y| median(&rows[y..y + band]))
+        .map(|y| median_with(&rows[y..y + band], scratch))
         .fold(f64::INFINITY, f64::min);
     let lower = (h / 2..=(h / 2).max(h * 7 / 8 - band))
-        .map(|y| median(&rows[y..y + band]))
+        .map(|y| median_with(&rows[y..y + band], scratch))
         .fold(0.0, f64::max);
     (neck >= 3.0 && lower >= neck * 1.15)
         || (waist >= 3.0 && waist < collar && lower >= waist * 1.15)
@@ -163,13 +164,75 @@ fn consider(selection: &mut Selection, new: (Rect, SkinMatch)) {
     selection.matches.push(new);
 }
 
+#[derive(Default)]
+pub(crate) struct SkinScratch {
+    lab: Mat,
+    gray: Mat,
+    edges: Mat,
+    edge: Mat,
+    channels: Vector<Mat>,
+    widths: Vec<i32>,
+    median_buf: Vec<i32>,
+}
+
+fn count_nonzero_bytes(bytes: &[u8]) -> usize {
+    let mut offset = 0usize;
+    let mut active = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        use std::arch::x86_64::*;
+        // AVX2 support is verified above and each 32-byte chunk stays inside `bytes`.
+        unsafe {
+            let zero = _mm256_setzero_si256();
+            for chunk in bytes.as_chunks::<32>().0 {
+                let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+                let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)) as u32;
+                active += eq.count_zeros() as usize;
+                offset += 32;
+            }
+        }
+    }
+    active + bytes[offset..].iter().filter(|&&b| b != 0).count()
+}
+
+fn or_assign_bytes(dst: &mut [u8], src: &[u8]) {
+    let n = dst.len().min(src.len());
+    let (dst_words, dst_tail) = dst[..n].as_chunks_mut::<8>();
+    let (src_words, src_tail) = src[..n].as_chunks::<8>();
+    for (d, s) in dst_words.iter_mut().zip(src_words) {
+        let a = u64::from_ne_bytes(*d);
+        let b = u64::from_ne_bytes(*s);
+        *d = (a | b).to_ne_bytes();
+    }
+    for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
+        *d |= s;
+    }
+}
+
 /// An absent support mask requests shape-only recognition. With a mask,
 /// even a geometrically valid person must have evidence of a platform.
+#[cfg(test)]
 pub fn detect_skin(
     frame: &Frame,
     support: Option<&[u8]>,
     min_foot_ratio: f64,
     allow_backdrop: bool,
+) -> Option<SkinMatch> {
+    detect_skin_with(
+        frame,
+        support,
+        min_foot_ratio,
+        allow_backdrop,
+        &mut SkinScratch::default(),
+    )
+}
+
+pub(crate) fn detect_skin_with(
+    frame: &Frame,
+    support: Option<&[u8]>,
+    min_foot_ratio: f64,
+    allow_backdrop: bool,
+    scratch: &mut SkinScratch,
 ) -> Option<SkinMatch> {
     let width = i32::try_from(frame.width).ok()?;
     let height = i32::try_from(frame.height).ok()?;
@@ -187,7 +250,7 @@ pub fn detect_skin(
         min_foot_ratio,
         ..Selection::default()
     };
-    visit(frame, support, allow_backdrop, &mut selection).ok()?;
+    visit(frame, support, allow_backdrop, &mut selection, scratch).ok()?;
     if selection.matches.len() != 1 {
         return None;
     }
@@ -235,7 +298,7 @@ fn erode(mask: &Mat) -> CvResult<Mat> {
 }
 
 struct Scene<'a> {
-    lab: Mat,
+    lab: &'a Mat,
     platforms: Vec<Platform>,
     support: Option<&'a [u8]>,
     width: i32,
@@ -313,6 +376,8 @@ impl Scene<'_> {
         head: &Head,
         sample: &material::Material,
         body: &Shape,
+        widths: &mut Vec<i32>,
+        median_buf: &mut Vec<i32>,
     ) -> CvResult<bool> {
         let origin = Point::new(0, self.top);
         let b = body.bounds;
@@ -321,25 +386,36 @@ impl Scene<'_> {
             return Ok(false);
         }
         let mask = filled(&body.contour, b)?;
-        let widths: Vec<_> = mask
-            .data_bytes()?
-            .chunks_exact(b.width as usize)
-            .map(|row| row.iter().filter(|&&p| p != 0).count() as i32)
-            .collect();
-        if !has_waist(&widths) {
+        widths.clear();
+        widths.extend(
+            mask.data_bytes()?
+                .chunks_exact(b.width as usize)
+                .map(|row| row.iter().filter(|&&p| p != 0).count() as i32),
+        );
+        if !has_waist(widths, median_buf) {
             return Ok(false);
         }
         let core = erode(&mask)?;
-        let patch = self.lab.roi(b)?.try_clone()?;
-        let Some(colour) = material::median_colour(&patch, &core)? else {
+        let Some(colour) = material::median_colour_roi(
+            self.lab,
+            b,
+            &core,
+            Rect::new(0, 0, b.width, b.height),
+        )?
+        else {
             return Ok(false);
         };
         if material::distance(colour, sample.colour) > 35. {
             return Ok(false);
         }
         let rows = (round(diameter(h) * 0.25).max(3)).min(b.height);
-        let band = Rect::new(0, b.height - rows, b.width, rows);
-        let Some(base) = material::median_colour(&patch.roi(band)?, &core.roi(band)?)? else {
+        let Some(base) = material::median_colour_roi(
+            self.lab,
+            Rect::new(b.x, b.y + b.height - rows, b.width, rows),
+            &core,
+            Rect::new(0, b.height - rows, b.width, rows),
+        )?
+        else {
             return Ok(false);
         };
         if material::distance(base, sample.colour) > 35.
@@ -394,10 +470,11 @@ fn visit(
     support: Option<&[u8]>,
     allow_backdrop: bool,
     selection: &mut Selection,
+    scratch: &mut SkinScratch,
 ) -> CvResult<()> {
     let (width, height) = (frame.width as i32, frame.height as i32);
     if let Some(m) = support {
-        let active = m.iter().filter(|&&v| v != 0).count();
+        let active = count_nonzero_bytes(m);
         if active == 0 || active as f64 / m.len() as f64 > 0.90 {
             return Ok(());
         }
@@ -405,24 +482,29 @@ fn visit(
     let top = (f64::from(height) * 0.35) as i32;
     let borrowed = crate::template::bgr(frame)?;
     let crop = borrowed.roi(Rect::new(0, top, width, height - top))?;
-    let (mut lab, mut gray, mut edges) = (Mat::default(), Mat::default(), Mat::default());
-    imgproc::cvt_color_def(&crop, &mut lab, imgproc::COLOR_BGR2Lab)?;
-    imgproc::cvt_color_def(&crop, &mut gray, imgproc::COLOR_BGR2GRAY)?;
-    imgproc::canny_def(&gray, &mut edges, 25., 70.)?;
-    let mut channels = Vector::<Mat>::new();
-    core::split(&lab, &mut channels)?;
-    let mut edge = Mat::default();
-    let combined = edges.data_bytes_mut()?;
-    for channel in channels {
-        imgproc::canny_def(&channel, &mut edge, 20., 60.)?;
-        for (dst, &src) in combined.iter_mut().zip(edge.data_bytes()?) {
-            *dst |= src;
+    imgproc::cvt_color_def(&crop, &mut scratch.lab, imgproc::COLOR_BGR2Lab)?;
+    imgproc::cvt_color_def(&crop, &mut scratch.gray, imgproc::COLOR_BGR2GRAY)?;
+    imgproc::canny_def(&scratch.gray, &mut scratch.edges, 25., 70.)?;
+    core::split(&scratch.lab, &mut scratch.channels)?;
+    let channel_count = scratch.channels.len();
+    {
+        let combined = scratch.edges.data_bytes_mut()?;
+        for i in 0..channel_count {
+            let channel = scratch.channels.get(i)?;
+            imgproc::canny_def(&channel, &mut scratch.edge, 20., 60.)?;
+            or_assign_bytes(combined, scratch.edge.data_bytes()?);
         }
     }
     let (mut heads, mut shapes, mut platforms) = (Vec::new(), Vec::new(), Vec::new());
-    for c in contours(&edges, imgproc::RETR_LIST, Point::default())? {
+    let head_range = 8f64.max(f64::from(width) * 0.018)..=f64::from(width) * 0.10;
+    for c in contours(&scratch.edges, imgproc::RETR_LIST, Point::default())? {
         let b = imgproc::bounding_rect(&c)?;
-        if b.x <= 1 || b.br().x >= width - 1 || b.width < 5 || b.height < 5 {
+        if b.x <= 1
+            || b.br().x >= width - 1
+            || b.width < 5
+            || b.height < 5
+            || b.width * b.height < 20
+        {
             continue;
         }
         let (h, area) = hull(&c)?;
@@ -444,6 +526,9 @@ fn visit(
                 area,
             });
         }
+        if solidity < 0.72 || !head_range.contains(&f64::from(b.width)) {
+            continue;
+        }
         let roundness = circularity(&h, area)?;
         match head_kind(width, b, roundness, solidity) {
             1 => heads.push(Head {
@@ -452,7 +537,7 @@ fn visit(
                 roundness,
             }),
             2 => {
-                for recovered in material::recover_heads(&lab, &h, b)? {
+                for recovered in material::recover_heads(&scratch.lab, &h, b)? {
                     let (h, area) = hull(&recovered)?;
                     if area < 20. {
                         continue;
@@ -477,6 +562,12 @@ fn visit(
             _ => {}
         }
     }
+    let SkinScratch {
+        lab,
+        widths,
+        median_buf,
+        ..
+    } = scratch;
     let scene = Scene {
         lab,
         platforms,
@@ -485,28 +576,31 @@ fn visit(
         height,
         top,
     };
+    let mut sampled = Vec::with_capacity(heads.len());
+    for h in &heads {
+        if let Some(sample) = material::sample_head(scene.lab, &h.hull, h.bounds)? {
+            sampled.push((h, sample));
+        }
+    }
     for backdrop in [false, true] {
         // Never retry an ambiguous first pass with the backdrop peeled away.
         if backdrop && (!allow_backdrop || !selection.matches.is_empty()) {
             break;
         }
-        for h in &heads {
-            let Some(sample) = material::sample_head(&scene.lab, &h.hull, h.bounds)? else {
-                continue;
-            };
+        for (h, sample) in &sampled {
             let mut original_found = false;
             if !backdrop {
                 for body in &shapes {
-                    original_found |= scene.measure(selection, h, &sample, body)?;
+                    original_found |= scene.measure(selection, h, sample, body, widths, median_buf)?;
                 }
             }
             material::visit_bodies(
-                &scene.lab,
+                scene.lab,
                 h.bounds,
-                &sample,
+                sample,
                 backdrop,
                 original_found,
-                |body| scene.measure(selection, h, &sample, body),
+                |body| scene.measure(selection, h, sample, body, widths, median_buf),
             )?;
         }
     }
@@ -720,6 +814,28 @@ mod tests {
                     .is_none(),
                 "{falling}"
             );
+        }
+    }
+
+    #[test]
+    fn count_nonzero_bytes_matches_scalar_across_tail_lengths() {
+        for len in [0usize, 1, 15, 31, 32, 33, 63, 64, 65, 100] {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| if i % 3 == 0 { 255 } else { 0 })
+                .collect();
+            let expected = bytes.iter().filter(|&&b| b != 0).count();
+            assert_eq!(count_nonzero_bytes(&bytes), expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn or_assign_bytes_matches_scalar_across_tail_lengths() {
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 65] {
+            let mut dst: Vec<u8> = (0..len).map(|i| ((i * 19) % 256) as u8).collect();
+            let src: Vec<u8> = (0..len).map(|i| ((i * 41 + 7) % 256) as u8).collect();
+            let expected: Vec<u8> = dst.iter().zip(&src).map(|(&a, &b)| a | b).collect();
+            or_assign_bytes(&mut dst, &src);
+            assert_eq!(dst, expected, "len={len}");
         }
     }
 }

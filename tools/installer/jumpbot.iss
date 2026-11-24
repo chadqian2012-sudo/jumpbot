@@ -73,7 +73,7 @@ Name: "{group}\纯 CPU 模式"; Filename: "{app}\jumpbot.exe"; Parameters: "--ba
 Name: "{group}\只识别不发输入（安全演示）"; Filename: "{app}\jumpbot.exe"; Parameters: "--dry-run --samples 3"; WorkingDir: "{app}"
 Name: "{group}\配置文件夹"; Filename: "{app}"
 Name: "{group}\卸载 跳一跳自动脚本"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot.exe"; Parameters: "--max-jumps 0 --daemon"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot-desktop.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\run.exe"; Parameters: "--finish-config-restore"; Flags: runhidden

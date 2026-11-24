@@ -56,6 +56,7 @@ struct Game<'a> {
     ctl: Controls,
     screen: &'a Screen,
     vision: &'a mut Vision,
+    capturer: crate::platform::Capturer,
     mode: CaptureMode,
     frame_period: Duration,
     round_start: Option<Duration>,
@@ -142,8 +143,9 @@ impl Game<'_> {
             self.ctl.sleep(g, poll);
         }
     }
-    fn recognition_frame(&self, w: &Window) -> Result<Option<Frame>> {
-        w.capture(self.mode)?
+    fn recognition_frame(&mut self, w: &Window) -> Result<Option<Frame>> {
+        self.capturer
+            .capture(w, self.mode)?
             .map(|raw| raw.for_recognition(self.c))
             .transpose()
     }
@@ -577,20 +579,20 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             .as_ref()
             .map_or_else(|| game.ctl.generation(), |(_, g)| *g);
         let interrupted = game.ctl.guard(g, true).is_err();
-        let fresh = if interrupted {
-            None
+        let valid_current = if interrupted {
+            false
         } else {
-            Window::find(cfg, (1, 1))?
+            match window.as_ref() {
+                Some((w, _)) => w.still_current()? && (o.background || w.is_foreground()),
+                None => false,
+            }
         };
-        if interrupted
-            || window
-                .as_ref()
-                .zip(fresh.as_ref())
-                .is_none_or(|((w, _), f)| {
-                    !same_window(f, w) || (!o.background && !f.is_foreground())
-                })
-        {
-            let missing = !interrupted && fresh.is_none();
+        if interrupted || !valid_current {
+            let missing = if interrupted {
+                false
+            } else {
+                Window::find(cfg, (1, 1))?.is_none()
+            };
             baseline = true;
             records.resync(None);
             previous_center = None;
@@ -1059,6 +1061,7 @@ pub(crate) fn run(
         ctl,
         screen,
         vision,
+        capturer: Default::default(),
         mode,
         frame_period: refresh_period(),
         round_start: None,

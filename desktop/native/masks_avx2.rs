@@ -26,13 +26,24 @@ pub(super) unsafe fn row(
     let gt = |a, b| _mm256_cmpgt_epi32(a, b);
     let and = |a, b| _mm256_and_si256(a, b);
     let or = |a, b| _mm256_or_si256(a, b);
-    let invert = |a| _mm256_xor_si256(a, splat(-1));
     let abs = |a| _mm256_abs_epi32(a);
     let [bh, bs, bv] = base.map(splat);
+    let [bg0, bg1, bg2] = [
+        splat(bg[0].into()),
+        splat(bg[1].into()),
+        splat(bg[2].into()),
+    ];
     let threshold = &table[512..];
-    let t = |i: usize| splat(threshold[i]);
+    let t: [__m256i; 13] = std::array::from_fn(|i| splat(threshold[i]));
+    let has_bright = threshold[13] != 0;
     let zero = splat(0);
     let byte = splat(255);
+    let c25 = splat(25);
+    let c110 = splat(110);
+    let c180 = splat(180);
+    let c2048 = splat(2048);
+    let all_ones = splat(-1);
+    let invert = |a| _mm256_xor_si256(a, all_ones);
     // Each pair of overlapping 16-byte loads stays inside the 24-byte group.
     // Shuffle four packed BGR pixels into four little-endian 32-bit lanes per half.
     let lo = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
@@ -57,32 +68,26 @@ pub(super) unsafe fn row(
         raw = _mm256_blendv_epi8(raw, sub(green, blue), _mm256_cmpeq_epi32(v, red));
         let scale = |a, idx, offset| {
             let div = _mm256_i32gather_epi32::<4>(table.as_ptr().add(offset), idx);
-            _mm256_srai_epi32::<12>(add(_mm256_mullo_epi32(a, div), splat(2048)))
+            _mm256_srai_epi32::<12>(add(_mm256_mullo_epi32(a, div), c2048))
         };
         let s = scale(delta, v, 0);
         let h = scale(raw, delta, 256);
-        let h = add(h, and(gt(zero, h), splat(180)));
+        let h = add(h, and(gt(zero, h), c180));
         let piece_bits = and(
-            or(
-                and(gt(s, t(9)), gt(t(10), v)),
-                and(gt(s, splat(25)), gt(splat(110), v)),
-            ),
-            invert(or(gt(t(11), h), gt(h, t(12)))),
+            or(and(gt(s, t[9]), gt(t[10], v)), and(gt(s, c25), gt(c110, v))),
+            invert(or(gt(t[11], h), gt(h, t[12]))),
         );
         let diff = add(
-            abs(sub(blue, splat(bg[0].into()))),
-            add(
-                abs(sub(green, splat(bg[1].into()))),
-                abs(sub(red, splat(bg[2].into()))),
-            ),
+            abs(sub(blue, bg0)),
+            add(abs(sub(green, bg1)), abs(sub(red, bg2))),
         );
-        let dark = gt(sub(bv, v), t(1));
-        let hue = and(gt(abs(sub(h, bh)), t(2)), gt(s, t(3)));
-        let chroma = or(gt(sub(s, bs), t(4)), gt(sub(bs, s), t(5)));
-        let white = and(gt(t(6), s), gt(v, t(7)));
-        let mut block_bits = or(or(dark, hue), or(chroma, or(white, gt(diff, t(0)))));
-        if threshold[13] != 0 {
-            block_bits = or(block_bits, and(gt(sub(v, bv), t(8)), invert(gt(s, bs))));
+        let dark = gt(sub(bv, v), t[1]);
+        let hue = and(gt(abs(sub(h, bh)), t[2]), gt(s, t[3]));
+        let chroma = or(gt(sub(s, bs), t[4]), gt(sub(bs, s), t[5]));
+        let white = and(gt(t[6], s), gt(v, t[7]));
+        let mut block_bits = or(or(dark, hue), or(chroma, or(white, gt(diff, t[0]))));
+        if has_bright {
+            block_bits = or(block_bits, and(gt(sub(v, bv), t[8]), invert(gt(s, bs))));
         }
         store_mask(piece_bits, piece.as_mut_ptr().add(x));
         store_mask(block_bits, block.as_mut_ptr().add(x));

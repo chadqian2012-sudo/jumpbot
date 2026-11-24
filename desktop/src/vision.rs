@@ -1,4 +1,4 @@
-use crate::regions::{Mask, Regions};
+use crate::regions::{Mask, RegionScratch, Regions};
 use crate::{Config, Frame};
 use serde::Serialize;
 
@@ -29,26 +29,6 @@ pub struct Detection {
     pub target: Option<Block>,
     pub piece_mask: Vec<u8>,
     pub block_mask: Vec<u8>,
-}
-
-impl Regions {
-    fn foreground_in(&self, bounds: [i32; 4], silhouette: Option<&[u8]>) -> usize {
-        let [x, y, w, h] = bounds.map(|n| n as usize);
-        let mut count = 0;
-        for row in 0..h {
-            let start = (y + row) * self.width + x;
-            let labels = &self.labels[start..start + w];
-            count += match silhouette {
-                Some(mask) => labels
-                    .iter()
-                    .zip(&mask[row * w..][..w])
-                    .filter(|(label, occupied)| **label != 0 && **occupied != 0)
-                    .count(),
-                None => labels.iter().filter(|label| **label != 0).count(),
-            };
-        }
-        count
-    }
 }
 
 fn check_frame(frame: &Frame) -> Result<(), String> {
@@ -155,26 +135,22 @@ pub(crate) fn segments(row: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ 
     })
 }
 
-pub(crate) fn face_center(
-    parts: &Regions,
-    id: usize,
-    stats: [i32; 5],
+static SAT_DIV: std::sync::LazyLock<[i32; 256]> = std::sync::LazyLock::new(|| {
+    let mut table = [0; 256];
+    for (v, slot) in table.iter_mut().enumerate().skip(1) {
+        *slot = ((255 << 12) as f64 / v as f64).round_ties_even() as i32;
+    }
+    table
+});
+
+fn face_center_on_mask(
+    mask: &[u8],
+    w: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
     slope: f64,
 ) -> Option<(f64, f64, f64)> {
-    let [bx, by, bw, bh, _] = stats.map(|v| v as usize);
-    let w = parts.width;
-    // Keep screen x coordinates for the clipped-edge rules, and rebase rows at
-    // the component top. Other components must not affect the fitted edges.
-    let mut mask = vec![0u8; w * bh];
-    for (row, band) in mask.chunks_exact_mut(w).enumerate() {
-        let start = (by + row) * w + bx;
-        for (dst, &label) in band[bx..bx + bw]
-            .iter_mut()
-            .zip(&parts.labels[start..start + bw])
-        {
-            *dst = u8::from(label == id as i32);
-        }
-    }
     let band = |row: usize| &mask[row * w..][..w];
     let fallback = |corner: f64| {
         let row = ((by as f64 + 0.2887 * bw as f64).round_ties_even() as usize) - by;
@@ -217,7 +193,7 @@ pub(crate) fn face_center(
             return fallback(corner);
         }
         // The row range is inclusive and fits in the initialized mask.
-        let row = jumpbot_vision::fit_vertex(&mask, w, 0, limit, corner, dx_per_dy, tolerance);
+        let row = jumpbot_vision::fit_vertex(mask, w, 0, limit, corner, dx_per_dy, tolerance);
         let width = 2.0 * row as f64 * dx_per_dy;
         if row >= 0 && width >= 0.30 * bw as f64 && best_fit.is_none_or(|(_, _, best)| width > best)
         {
@@ -258,6 +234,48 @@ pub(crate) fn face_center(
     Some((first, (by + best_row) as f64, width))
 }
 
+fn face_center_with_scratch(
+    w: usize,
+    labels: &[i32],
+    id: usize,
+    stats: [i32; 5],
+    slope: f64,
+    mask: &mut Vec<u8>,
+) -> Option<(f64, f64, f64)> {
+    let [bx, by, bw, bh, _] = stats.map(|v| v as usize);
+    let needed = w * bh;
+    if mask.len() < needed {
+        mask.resize(needed, 0);
+    }
+    // Keep screen x coordinates for the clipped-edge rules, and rebase rows at
+    // the component top. Other components must not affect the fitted edges.
+    // Invariant: mask is all zeros on entry and cleared back to all zeros on exit.
+    for (row, band) in mask[..needed].chunks_exact_mut(w).enumerate() {
+        let start = (by + row) * w + bx;
+        for (dst, &label) in band[bx..bx + bw]
+            .iter_mut()
+            .zip(&labels[start..start + bw])
+        {
+            *dst = u8::from(label == id as i32);
+        }
+    }
+    let result = face_center_on_mask(&mask[..needed], w, by, bw, bh, slope);
+    for band in mask[..needed].chunks_exact_mut(w) {
+        band[bx..bx + bw].fill(0);
+    }
+    result
+}
+
+pub(crate) fn face_center(
+    parts: &Regions,
+    id: usize,
+    stats: [i32; 5],
+    slope: f64,
+) -> Option<(f64, f64, f64)> {
+    let mut mask = Vec::new();
+    face_center_with_scratch(parts.width, &parts.labels, id, stats, slope, &mut mask)
+}
+
 fn find_dot_if(
     frame: &Frame,
     cx: f64,
@@ -278,17 +296,13 @@ fn find_dot_if(
     let min_value = cfg.f("center_dot_val_min").ceil() as i32;
     let max_sat = cfg.f("center_dot_sat_max").floor() as i32;
     let mut mask = Vec::with_capacity(w * h);
+    let sat_div = &*SAT_DIV;
     for row in y0..y1 {
         let start = (row as usize * frame.width + x0 as usize) * 3;
         for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
             let v = i32::from(*pixel.iter().max().unwrap());
             let d = v - i32::from(*pixel.iter().min().unwrap());
-            let divisor = if v == 0 {
-                0
-            } else {
-                ((255 << 12) as f64 / v as f64).round_ties_even() as i32
-            };
-            let saturation = (d * divisor + 2048) >> 12;
+            let saturation = (d * sat_div[v as usize] + 2048) >> 12;
             mask.push(u8::from(v >= min_value && saturation <= max_sat));
         }
     }
@@ -309,18 +323,20 @@ fn find_dot_if(
         // this label. Ring samples are clipped to the ROI just like cv::dilate.
         for yy in (y - 2).max(0)..(y + bh + 2).min(bounds[3]) {
             for xx in (x - 2).max(0)..(x + bw + 2).min(bounds[2]) {
-                let idx = ((yy + y0) as usize * frame.width + (xx + x0) as usize) * 3;
-                let val = *frame.bgr[idx..idx + 3].iter().max().unwrap();
+                let pixel_val = || {
+                    let idx = ((yy + y0) as usize * frame.width + (xx + x0) as usize) * 3;
+                    *frame.bgr[idx..idx + 3].iter().max().unwrap()
+                };
                 if labels[yy as usize * w + xx as usize] == id as i32 {
                     sx += xx as i64;
                     sy += yy as i64;
-                    brightness += val as i64;
+                    brightness += pixel_val() as i64;
                 } else if ((yy - 2).max(0)..=(yy + 2).min(bounds[3] - 1)).any(|ry| {
                     let row = &labels[ry as usize * w..][..w];
                     row[(xx - 2).max(0) as usize..=(xx + 2).min(bounds[2] - 1) as usize]
                         .contains(&(id as i32))
                 }) {
-                    ring.push(val);
+                    ring.push(pixel_val());
                 }
             }
         }
@@ -367,13 +383,14 @@ fn find_target(
     piece: &Piece,
     piece_mask: &[u8],
     cfg: &Config,
+    region_scratch: &mut RegionScratch,
+    face_mask: &mut Vec<u8>,
 ) -> Result<Option<Block>, String> {
     let (w, h) = (frame.width as f64, frame.height as f64);
-    let parts = Mask::from_pixels(block_mask, frame.width, frame.height).blocks(Mask::from_pixels(
-        piece_mask,
-        frame.width,
-        frame.height,
-    ));
+    let parts = Mask::from_pixels(block_mask, frame.width, frame.height).blocks_with(
+        Mask::from_pixels(piece_mask, frame.width, frame.height),
+        region_scratch,
+    );
     let slope = cfg.f("axis_slope");
     let min_area = cfg.f("block_min_area_ratio") * (w * h);
     let max_area = cfg.f("block_max_area_ratio") * (w * h);
@@ -394,7 +411,9 @@ fn find_target(
         if !(strict || small) {
             continue;
         }
-        let Some((x, mut y, top_width)) = face_center(&parts, id, stats, slope) else {
+        let Some((x, mut y, top_width)) =
+            face_center_with_scratch(parts.width, parts.labels, id, stats, slope, face_mask)
+        else {
             continue;
         };
         let top_y = by as f64;
@@ -514,7 +533,7 @@ fn find_target(
     Ok(Some(chosen))
 }
 
-fn piece_templates() -> Result<Vec<Frame>, String> {
+fn piece_templates() -> Result<Vec<crate::template::PieceTemplate>, String> {
     use std::{ffi::OsStr, fs, io::ErrorKind};
     let dir = crate::asset_dir().join("templates");
     let entries = match fs::read_dir(&dir) {
@@ -544,13 +563,19 @@ fn piece_templates() -> Result<Vec<Frame>, String> {
         // The source loader skips unreadable PNGs and keeps the other templates.
         if let Ok(template) = Frame::read(&path) {
             check_frame(&template)?;
-            templates.push(template);
+            templates.push(
+                crate::template::PieceTemplate::new(template).map_err(|e| e.to_string())?,
+            );
         }
     }
     Ok(templates)
 }
 
-fn template_score(frame: &Frame, bbox: [i32; 4], templates: &[Frame]) -> Result<f64, String> {
+fn template_score(
+    frame: &Frame,
+    bbox: [i32; 4],
+    templates: &[crate::template::PieceTemplate],
+) -> Result<f64, String> {
     if bbox[2].min(bbox[3]) < 6 {
         return Ok(0.0);
     }
@@ -610,8 +635,11 @@ fn accept_skin(m: crate::skin::SkinMatch, stride: usize, pm: &mut [u8], bm: &mut
 pub struct Vision {
     cfg: Config,
     pub masks: crate::masks::Masks,
-    templates: Vec<Frame>,
+    templates: Vec<crate::template::PieceTemplate>,
     prior: Option<Piece>,
+    region_scratch: RegionScratch,
+    face_mask: Vec<u8>,
+    skin_scratch: crate::skin::SkinScratch,
 }
 
 impl Vision {
@@ -621,6 +649,9 @@ impl Vision {
             masks: crate::masks::Masks::new(cfg, backend),
             templates: piece_templates()?,
             prior: None,
+            region_scratch: RegionScratch::default(),
+            face_mask: Vec::new(),
+            skin_scratch: crate::skin::SkinScratch::default(),
         })
     }
 
@@ -651,7 +682,15 @@ impl Vision {
         let mut target = None;
         if let Some(p) = &piece {
             if want_target {
-                target = find_target(frame, &block_mask, p, &piece_mask, &self.cfg)?;
+                target = find_target(
+                    frame,
+                    &block_mask,
+                    p,
+                    &piece_mask,
+                    &self.cfg,
+                    &mut self.region_scratch,
+                    &mut self.face_mask,
+                )?;
             }
             self.prior = Some(p.clone());
         }
@@ -664,7 +703,7 @@ impl Vision {
     }
 
     fn find_piece(
-        &self,
+        &mut self,
         frame: &Frame,
         pm: &mut [u8],
         bm: &mut [u8],
@@ -708,7 +747,13 @@ impl Vision {
         if auto_skin {
             candidates.retain(|p| p.tpl_score >= score_min);
             if candidates.is_empty() {
-                skin = crate::skin::detect_skin(frame, Some(bm), foot_ratio, !horizontal);
+                skin = crate::skin::detect_skin_with(
+                    frame,
+                    Some(bm),
+                    foot_ratio,
+                    !horizontal,
+                    &mut self.skin_scratch,
+                );
                 if let Some(m) = &skin {
                     let (x, y, bw, bh) = m.bbox;
                     let covered = parts
@@ -723,8 +768,22 @@ impl Vision {
             }
         }
         if candidates.is_empty() || !cfg.b("piece_scan_only_when_needed") {
+            let top = (0.30 * frame.height as f64) as usize;
+            let fg_below_top: usize = if auto_skin {
+                parts.stats[1..]
+                    .iter()
+                    .filter(|s| (s[1] + s[3]) as usize > top)
+                    .map(|s| s[4] as usize)
+                    .sum()
+            } else {
+                0
+            };
             for tpl in &self.templates {
-                let Some(hit) = template_scan(frame, tpl, cfg)? else {
+                let tpl_area = tpl.frame.width * tpl.frame.height;
+                if auto_skin && (fg_below_top as f64) < 0.4 * tpl_area as f64 {
+                    continue;
+                }
+                let Some(hit) = template_scan(frame, &tpl.frame, cfg)? else {
                     continue;
                 };
                 if auto_skin && (parts.foreground_in(hit.bbox, None) as f64) < 0.4 * hit.area as f64
@@ -879,6 +938,52 @@ mod dark_board_tests {
                 );
             }
             assert!(!clear_dark_board(&f, &d, &cfg), "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sat_div_table_matches_f64_formula_for_all_bytes() {
+        for (v, &actual) in SAT_DIV.iter().enumerate() {
+            let expected = if v == 0 {
+                0
+            } else {
+                ((255 << 12) as f64 / v as f64).round_ties_even() as i32
+            };
+            assert_eq!(actual, expected, "v={v}");
+        }
+    }
+
+    #[test]
+    fn face_center_with_scratch_matches_standalone_and_resets_buffer() {
+        let (w, h) = (160, 120);
+        let mut pixels = vec![0u8; w * h];
+        // Draw two diamonds in different components.
+        for &(cx, cy, half_h) in &[(40isize, 20isize, 22isize), (110isize, 10isize, 35isize)] {
+            for dy in 0..=2 * half_h {
+                let span = if dy <= half_h { dy } else { 2 * half_h - dy };
+                let dx_max = (span as f64 / 0.5774).round() as isize;
+                let y = (cy + dy) as usize;
+                for x in (cx - dx_max)..=(cx + dx_max) {
+                    pixels[y * w + x as usize] = 255;
+                }
+            }
+        }
+        let regions = Mask::from_pixels(&pixels, w, h).regions();
+        let mut scratch = Vec::new();
+        for (id, &stats) in regions.stats.iter().enumerate().skip(1) {
+            let expected = face_center(&regions, id, stats, 0.5774);
+            let actual =
+                face_center_with_scratch(regions.width, &regions.labels, id, stats, 0.5774, &mut scratch);
+            assert_eq!(actual, expected, "component {id}");
+            assert!(
+                scratch.iter().all(|&b| b == 0),
+                "scratch not cleared after component {id}"
+            );
         }
     }
 }

@@ -496,3 +496,23 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn desktop_shortcut_launches_gui_console() {
+        let iss = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/installer/jumpbot.iss"),
+        )
+        .unwrap();
+        let line = iss
+            .lines()
+            .find(|l| l.contains(r"{autodesktop}\{#AppTitle}"))
+            .expect("desktop shortcut line");
+        assert!(
+            line.contains(r#"Filename: "{app}\jumpbot-desktop.exe""#),
+            "{line}"
+        );
+        assert!(!line.contains("--daemon"), "{line}");
+    }
+}

@@ -11,8 +11,8 @@ default-run = "jumpbot-desktop"
 
 [features]
 default = ["cuda", "opencl"]
-cuda = []
-opencl = []
+cuda = ["dep:libloading"]
+opencl = ["dep:libloading"]
 
 [build-dependencies]
 find-msvc-tools = "0.1.15"
@@ -30,7 +30,7 @@ serde_json = "1"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_System_Ole", "Win32_System_Variant"] }
 regex = "1"
 crc32fast = "1"
-libloading = "0.8"
+libloading = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
