@@ -959,11 +959,11 @@ mod tests {
     }
 
     #[test]
-    fn face_center_with_scratch_matches_standalone_and_resets_buffer() {
-        let (w, h) = (160, 120);
+    fn face_center_with_scratch_preserves_both_centers_and_resets_buffer() {
+        let (w, h) = (224, 120);
         let mut pixels = vec![0u8; w * h];
         // Draw two diamonds in different components.
-        for &(cx, cy, half_h) in &[(40isize, 20isize, 22isize), (110isize, 10isize, 35isize)] {
+        for &(cx, cy, half_h) in &[(40isize, 20isize, 22isize), (145isize, 10isize, 35isize)] {
             for dy in 0..=2 * half_h {
                 let span = if dy <= half_h { dy } else { 2 * half_h - dy };
                 let dx_max = (span as f64 / 0.5774).round() as isize;
@@ -974,12 +974,16 @@ mod tests {
             }
         }
         let regions = Mask::from_pixels(&pixels, w, h).regions();
+        let diamonds = [(145., 45., 35.), (40., 42., 22.)];
+        assert_eq!(regions.stats.len() - 1, diamonds.len());
         let mut scratch = Vec::new();
-        for (id, &stats) in regions.stats.iter().enumerate().skip(1) {
-            let expected = face_center(&regions, id, stats, 0.5774);
-            let actual =
-                face_center_with_scratch(regions.width, &regions.labels, id, stats, 0.5774, &mut scratch);
-            assert_eq!(actual, expected, "component {id}");
+        for (i, (x, y, half_height)) in diamonds.into_iter().enumerate() {
+            let id = i + 1;
+            let actual = face_center_with_scratch(
+                regions.width, &regions.labels, id, regions.stats[id], 0.5774, &mut scratch,
+            );
+            let width = 2. * half_height * (1. / 0.5774);
+            assert_eq!(actual, Some((x, y, width)), "component {id}");
             assert!(
                 scratch.iter().all(|&b| b == 0),
                 "scratch not cleared after component {id}"

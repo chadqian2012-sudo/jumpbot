@@ -644,7 +644,7 @@ mod tests {
             let mut pixels = vec![0u8; w * h];
             for y in 4..36 {
                 for x in 3..w - 3 {
-                    pixels[y * w + x] = u8::from((x * 3 + y * 5) % 7 != 0);
+                    pixels[y * w + x] = u8::from((x / 13 + y / 9) % 3 != 0);
                 }
             }
             let piece_regions = Mask::from_pixels(&pixels, w, h).piece();
@@ -654,6 +654,7 @@ mod tests {
             m.grow_with(4, &mut s);
             m.erode_with(2, &mut s);
             let labeled = m.regions();
+            assert!(labeled.stats.len() > 1, "fixture lost all foreground at w={w}");
             assert_eq!(piece_regions.stats, labeled.stats, "stats w={w}");
             for &(bx, by, bw, bh) in &[
                 (0i32, 0i32, w as i32, h as i32),

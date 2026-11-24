@@ -146,7 +146,7 @@ fn executable(id: u32) -> String {
     }
 }
 
-fn client_rect(hwnd: HWND) -> Result<[i32; 4]> {
+fn client_rect(hwnd: HWND) -> Result<Option<[i32; 4]>> {
     let mut rect = RECT::default();
     let mut origin = POINT::default();
     unsafe {
@@ -155,9 +155,9 @@ fn client_rect(hwnd: HWND) -> Result<[i32; 4]> {
         }
     }
     if rect.right <= 0 || rect.bottom <= 0 {
-        return Err("窗口没有可截图的客户区".into());
+        return Ok(None);
     }
-    Ok([
+    Ok(Some([
         origin.x,
         origin.y,
         origin
@@ -168,7 +168,7 @@ fn client_rect(hwnd: HWND) -> Result<[i32; 4]> {
             .y
             .checked_add(rect.bottom)
             .ok_or("窗口纵坐标超出范围")?,
-    ])
+    ]))
 }
 
 fn point_is_target(hwnd: HWND, point: POINT) -> bool {
@@ -191,7 +191,7 @@ unsafe extern "system" fn candidate(hwnd: HWND, data: LPARAM) -> i32 {
     if name.is_empty() || !search.pattern.is_match(&name) {
         return 1;
     }
-    let Ok(rect) = client_rect(hwnd) else {
+    let Ok(Some(rect)) = client_rect(hwnd) else {
         return 1;
     };
     let (width, height) = ((rect[2] - rect[0]) as usize, (rect[3] - rect[1]) as usize);
@@ -257,7 +257,7 @@ impl Window {
         {
             return Ok(false);
         }
-        Ok(client_rect(hwnd)? == self.client_rect)
+        Ok(client_rect(hwnd)? == Some(self.client_rect))
     }
 
     pub fn is_foreground(&self) -> bool {
@@ -994,9 +994,16 @@ mod tests {
                 pid: pid(hwnd),
                 title: title(hwnd),
                 exe: executable(pid(hwnd)),
-                client_rect: client_rect(hwnd).unwrap(),
+                client_rect: client_rect(hwnd).unwrap().expect("fixture has a client area"),
             };
             assert_eq!(window.title, caption);
+            // A visible HWND may temporarily have no drawable client area during a resize.
+            assert_ne!(
+                SetWindowPos(hwnd, null_mut(), 30, 30, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER),
+                0
+            );
+            assert_eq!(window.still_current(), Ok(false));
+            assert!(window.capture(CaptureMode::PrintWindow).unwrap().is_none());
             // Only this private fixture window moves. Its old capture must be discarded
             // even when the HWND and PID are unchanged.
             assert_ne!(
@@ -1024,6 +1031,7 @@ mod tests {
                 ),
                 0
             );
+            assert_eq!(window.still_current(), Ok(true));
             window.check_occlusion().unwrap();
             let overlay = make_window(
                 "Click-through overlay",

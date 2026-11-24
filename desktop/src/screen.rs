@@ -520,7 +520,7 @@ impl WorkPool {
         let mut workers = Vec::with_capacity(n_workers);
         for worker_idx in 0..n_workers {
             let shared = Arc::clone(&shared);
-            workers.push(thread::spawn(move || {
+            let worker = thread::Builder::new().spawn(move || {
                 let (lock, cvar_work, cvar_done) = &*shared;
                 let mut seen_gen = 0u64;
                 loop {
@@ -553,7 +553,11 @@ impl WorkPool {
                         }
                     }
                 }
-            }));
+            });
+            match worker {
+                Ok(handle) => workers.push(handle),
+                Err(_) => break,
+            }
         }
         Self { shared, workers }
     }
