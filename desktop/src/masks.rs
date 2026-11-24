@@ -48,7 +48,7 @@ fn tables(cfg: &Config) -> Tables {
     table
 }
 
-fn background(frame: &Frame) -> Vec<u8> {
+fn background_into(frame: &Frame, left: &mut Vec<f32>, right: &mut Vec<f32>, bg: &mut Vec<u8>) {
     let (w, h) = (frame.width, frame.height);
     let band = (0.03 * w as f64).round_ties_even().max(3.) as usize;
     // NumPy's right slice starts at w-band; for w<band a negative start wraps.
@@ -57,16 +57,9 @@ fn background(frame: &Frame) -> Vec<u8> {
     } else {
         (2 * w).saturating_sub(band)
     };
-    let mut left = vec![0f32; 3 * h];
-    let mut right = vec![0f32; 3 * h];
-    jumpbot_vision::edge_medians(
-        &frame.bgr,
-        w,
-        band.min(w),
-        right_start,
-        &mut left,
-        &mut right,
-    );
+    left.resize(3 * h, 0.);
+    right.resize(3 * h, 0.);
+    jumpbot_vision::edge_medians(&frame.bgr, w, band.min(w), right_start, left, right);
     let mut count = 0.;
     let (mut sy, mut syy) = (0., 0.);
     let (mut sums, mut products) = ([0.; 3], [0.; 3]);
@@ -111,12 +104,18 @@ fn background(frame: &Frame) -> Vec<u8> {
             } as f64;
         }
     }
-    let mut bg = vec![0; h * 3];
+    bg.resize(h * 3, 0);
     for (y, row) in bg.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         for c in 0..3 {
             row[c] = (intercept[c] + slope[c] * y as f64) as f32 as u8;
         }
     }
+}
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+fn background(frame: &Frame) -> Vec<u8> {
+    let (mut left, mut right, mut bg) = (Vec::new(), Vec::new(), Vec::new());
+    background_into(frame, &mut left, &mut right, &mut bg);
     bg
 }
 
@@ -207,6 +206,9 @@ pub struct Masks {
     ratios: [f64; 2],
     table: Tables,
     last: &'static str,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    bg: Vec<u8>,
     #[cfg(any(feature = "cuda", feature = "opencl"))]
     gpu: GpuSelection,
 }
@@ -252,6 +254,9 @@ impl Masks {
             ratios: [cfg.f("top_bar_ratio"), 1. - cfg.f("bottom_bar_ratio")],
             table: tables(cfg),
             last: "pending",
+            left: Vec::new(),
+            right: Vec::new(),
+            bg: Vec::new(),
             #[cfg(any(feature = "cuda", feature = "opencl"))]
             gpu: GpuSelection {
                 cuda: cfg!(feature = "cuda") && enabled("cuda_enabled", "JUMPBOT_DISABLE_CUDA"),
@@ -367,12 +372,12 @@ impl Masks {
             self.gpu.calls = self.gpu.calls.wrapping_add(1);
             Instant::now()
         };
-        let bg = background(f);
+        background_into(f, &mut self.left, &mut self.right, &mut self.bg);
         #[cfg(any(feature = "cuda", feature = "opencl"))]
         if let Some(i) = self.gpu.chosen {
             let devices = self.gpu.devices.as_mut().unwrap();
             let d = &mut devices[i];
-            match d.compute(f, &bg, rows) {
+            match d.compute(f, &self.bg, rows) {
                 Ok(pair) => {
                     self.last = d.kind();
                     if self.mode == Mode::Auto {
@@ -407,7 +412,7 @@ impl Masks {
             eprintln!("{requested} 未能执行本帧，已回退到 CPU。");
         }
         self.last = if self.simd { "simd" } else { "cpu" };
-        Ok(cpu(f, &bg, &self.table, rows, self.simd))
+        Ok(cpu(f, &self.bg, &self.table, rows, self.simd))
     }
 }
 

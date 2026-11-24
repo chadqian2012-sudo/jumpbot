@@ -1,3 +1,14 @@
+fn slice_median(values: &mut [u8]) -> f32 {
+    let mid = values.len() / 2;
+    let even = values.len().is_multiple_of(2);
+    let (lower, upper, _) = values.select_nth_unstable(mid);
+    if even {
+        (f32::from(*lower.iter().max().unwrap()) + f32::from(*upper)) * 0.5
+    } else {
+        f32::from(*upper)
+    }
+}
+
 /// Compute the BGR median on each side of every row.
 pub fn edge_medians(
     frame: &[u8],
@@ -7,23 +18,37 @@ pub fn edge_medians(
     left: &mut [f32],
     right: &mut [f32],
 ) {
-    let mut channel = Vec::with_capacity(left_width.max(width - right_start));
+    let mut fallback: [Vec<u8>; 3] = Default::default();
     for (y, row) in frame.chunks_exact(width * 3).enumerate() {
         for (band, output) in [
             (&row[..left_width * 3], &mut left[y * 3..][..3]),
             (&row[right_start * 3..], &mut right[y * 3..][..3]),
         ] {
-            for (c, median) in output.iter_mut().enumerate() {
-                channel.clear();
-                channel.extend(band[c..].iter().step_by(3).copied());
-                let mid = channel.len() / 2;
-                let even = channel.len() % 2 == 0;
-                let (lower, upper, _) = channel.select_nth_unstable(mid);
-                *median = if even {
-                    (f32::from(*lower.iter().max().unwrap()) + f32::from(*upper)) * 0.5
-                } else {
-                    f32::from(*upper)
-                };
+            let pixels = band.as_chunks::<3>().0;
+            let n = pixels.len();
+            if n <= 32 {
+                let mut buf = [[0u8; 32]; 3];
+                for (i, p) in pixels.iter().enumerate() {
+                    buf[0][i] = p[0];
+                    buf[1][i] = p[1];
+                    buf[2][i] = p[2];
+                }
+                for (c, median) in output.iter_mut().enumerate() {
+                    *median = slice_median(&mut buf[c][..n]);
+                }
+            } else {
+                for buf in &mut fallback {
+                    buf.clear();
+                    buf.reserve(n);
+                }
+                for p in pixels {
+                    fallback[0].push(p[0]);
+                    fallback[1].push(p[1]);
+                    fallback[2].push(p[2]);
+                }
+                for (c, median) in output.iter_mut().enumerate() {
+                    *median = slice_median(&mut fallback[c]);
+                }
             }
         }
     }
@@ -85,5 +110,66 @@ pub fn fit_vertex(
     match last_edge {
         Some(y) if y - top >= 6 => last_growth.unwrap_or(y) as isize,
         _ => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_edge_medians(
+        frame: &[u8],
+        width: usize,
+        left_width: usize,
+        right_start: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let height = frame.len() / (width * 3);
+        let mut left = vec![0.0f32; height * 3];
+        let mut right = vec![0.0f32; height * 3];
+        let mut channel = Vec::with_capacity(left_width.max(width - right_start));
+        for (y, row) in frame.chunks_exact(width * 3).enumerate() {
+            for (band, output) in [
+                (&row[..left_width * 3], &mut left[y * 3..][..3]),
+                (&row[right_start * 3..], &mut right[y * 3..][..3]),
+            ] {
+                for (c, median) in output.iter_mut().enumerate() {
+                    channel.clear();
+                    channel.extend(band[c..].iter().step_by(3).copied());
+                    let mid = channel.len() / 2;
+                    let even = channel.len() % 2 == 0;
+                    let (lower, upper, _) = channel.select_nth_unstable(mid);
+                    *median = if even {
+                        (f32::from(*lower.iter().max().unwrap()) + f32::from(*upper)) * 0.5
+                    } else {
+                        f32::from(*upper)
+                    };
+                }
+            }
+        }
+        (left, right)
+    }
+
+    #[test]
+    fn edge_medians_matches_scalar_reference_for_small_and_large_bands() {
+        for (width, band) in [(17, 3), (40, 4), (553, 17), (1066, 32), (1200, 36)] {
+            let height = 9;
+            let frame: Vec<u8> = (0..width * height * 3)
+                .map(|i| ((i * 73 + i / 11 + 19) % 256) as u8)
+                .collect();
+            let (exp_left, exp_right) = reference_edge_medians(&frame, width, band, width - band);
+            let mut left = vec![0.0f32; height * 3];
+            let mut right = vec![0.0f32; height * 3];
+            edge_medians(&frame, width, band, width - band, &mut left, &mut right);
+            assert_eq!(
+                left.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_left.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "left mismatch w={width} band={band}"
+            );
+            assert_eq!(
+                right.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                exp_right.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "right mismatch w={width} band={band}"
+            );
+        }
     }
 }
