@@ -773,6 +773,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             (Some(dist), axis, hold, bias)
         } else {
             previous_aim = None;
+            if d.unresolved_target_shadow {
+                blind = None;
+            }
             game.vision.reset_prior();
             attempts += 1;
             if attempts < cfg.i("detect_retry_limit") {

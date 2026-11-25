@@ -1827,6 +1827,7 @@ mod tests {
         let d = crate::vision::Detection {
             piece: None,
             target: None,
+            unresolved_target_shadow: false,
             piece_mask: vec![],
             block_mask: vec![],
         };
