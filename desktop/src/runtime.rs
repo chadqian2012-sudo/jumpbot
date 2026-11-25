@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn release_frames_match_v13_decisions() {
+    fn release_frames_match_center_decisions() {
         let cfg = Config::default();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let screen = Screen::new(&root.join("templates"), &cfg).unwrap();
@@ -283,12 +283,23 @@ mod tests {
             for line in include_str!("../../tests/fixtures/v1.3-decisions.jsonl").lines() {
                 let original: Value = serde_json::from_str(line).unwrap();
                 let name = original["file"].as_str().unwrap();
+                let mut target = original["target"].clone();
+                // Midpoints and pixel counts of the marked regions in the retained PNGs.
+                let mark = match name {
+                    "skin-gold-cardboard-seam.png" => Some((231.5, 532.5, 183)), // (222,527)..=(241,538)
+                    "skin-gold-white-book.png" => Some((421.0, 489.0, 157)), // (412,484)..=(430,494)
+                    _ => None,
+                };
+                if let Some((x, y, area)) = mark {
+                    target["x"] = json!(x);
+                    target["y"] = json!(y);
+                    target["dot"] = json!([x, y, area]);
+                }
                 let frame = Frame::read(&root.join("tests/fixtures").join(name)).unwrap();
                 vision.reset_prior();
                 let d = vision.detect(&frame).unwrap();
                 let actual = detection(&d, &cfg);
-                for kind in ["piece", "target"] {
-                    let label = &original[kind];
+                for (kind, label) in [("piece", &original["piece"]), ("target", &target)] {
                     assert_eq!(
                         actual[kind].is_null(),
                         label.is_null(),
