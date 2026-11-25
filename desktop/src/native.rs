@@ -1,6 +1,6 @@
 use crate::{
     console::{Console, Mode},
-    painting::{self, Colors, Fonts, Layout, Scene, SCENE},
+    painting::{self, Colors, Divider, Fonts, Layout, Scene, SCENE},
     Host, BACKENDS,
 };
 use std::{
@@ -22,7 +22,9 @@ use windows_sys::{
         UI::{
             Controls::{BST_CHECKED, DRAWITEMSTRUCT},
             HiDpi::*,
-            Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled},
+            Input::KeyboardAndMouse::{
+                EnableWindow, GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -89,8 +91,113 @@ const ACTION: u32 = WM_APP + 1;
 const RESIZE: u32 = WM_APP + 2;
 const CLOSE: u32 = WM_APP + 3;
 const SETTINGS: u32 = WM_APP + 4;
+unsafe fn divider_cursor(d: Divider) {
+    let shape = if d == Divider::Columns {
+        IDC_SIZEWE
+    } else {
+        IDC_SIZENS
+    };
+    SetCursor(LoadCursorW(null_mut(), shape));
+}
+
+unsafe fn end_drag(hwnd: HWND) {
+    let dragging = SCENE.with_borrow_mut(|s| s.as_mut().and_then(|s| s.drag.take()).is_some());
+    // ReleaseCapture synchronously sends WM_CAPTURECHANGED back into this procedure.
+    if dragging && GetCapture() == hwnd {
+        ReleaseCapture();
+    }
+}
+
+unsafe fn place_controls(
+    hwnd: HWND,
+    layout: Layout,
+    previous: Option<Layout>,
+    fonts_changed: bool,
+) {
+    for &(id, _) in IDS {
+        let child = GetDlgItem(hwnd, id as i32);
+        if fonts_changed {
+            let font = SCENE.with_borrow(|s| s.as_ref().unwrap().fonts.control(id));
+            SendMessageW(child, WM_SETFONT, font as usize, 0);
+        }
+        let r = layout.bounds(id);
+        if previous.is_none_or(|old| EqualRect(&old.bounds(id), &r) == 0) {
+            MoveWindow(child, r.left, r.top, r.right - r.left, r.bottom - r.top, 0);
+        }
+    }
+    RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        WM_SETCURSOR if wp == h as usize && lp as u16 == HTCLIENT as u16 => {
+            let mut pt = POINT::default();
+            let in_client = GetCursorPos(&mut pt) != 0 && ScreenToClient(h, &mut pt) != 0;
+            let d = SCENE.with_borrow(|s| {
+                let s = s.as_ref()?;
+                s.drag.map(|(d, _)| d).or_else(|| {
+                    if in_client {
+                        s.layout.hit(pt.x, pt.y)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(d) = d {
+                divider_cursor(d);
+                1
+            } else {
+                DefWindowProcW(h, msg, wp, lp)
+            }
+        }
+        WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP => {
+            let x = lp as i16 as i32;
+            let y = (lp >> 16) as i16 as i32;
+            if msg == WM_LBUTTONDOWN {
+                let hit = SCENE.with_borrow(|s| {
+                    let l = s.as_ref()?.layout;
+                    let d = l.hit(x, y)?;
+                    Some((d, l.logical_axis(d, x, y) - l.position(d)))
+                });
+                if let Some((d, offset)) = hit {
+                    SetCapture(h);
+                    if GetCapture() == h {
+                        SCENE.with_borrow_mut(|s| s.as_mut().unwrap().drag = Some((d, offset)));
+                        divider_cursor(d);
+                    }
+                    return 0;
+                }
+            } else if GetCapture() == h {
+                let changed = SCENE.with_borrow_mut(|s| {
+                    let s = s.as_mut()?;
+                    let (d, offset) = s.drag?;
+                    let old = s.layout;
+                    s.layout
+                        .move_to(d, old.logical_axis(d, x, y) - offset)
+                        .then_some((old, s.layout))
+                });
+                if let Some((old, layout)) = changed {
+                    place_controls(h, layout, Some(old), false);
+                }
+                if msg == WM_LBUTTONUP {
+                    end_drag(h);
+                }
+                return 0;
+            }
+            DefWindowProcW(h, msg, wp, lp)
+        }
+        WM_CANCELMODE => {
+            end_drag(h);
+            DefWindowProcW(h, msg, wp, lp)
+        }
+        WM_CAPTURECHANGED => {
+            SCENE.with_borrow_mut(|s| {
+                if let Some(s) = s {
+                    s.drag = None;
+                }
+            });
+            0
+        }
         WM_PAINT => {
             painting::paint(h);
             0
@@ -138,6 +245,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: usize, lp: isize) -> is
             0
         }
         WM_SIZE => {
+            end_drag(h);
             if wp != SIZE_MINIMIZED as usize {
                 PostMessageW(h, RESIZE, 0, 0);
             }
@@ -374,41 +482,48 @@ impl View {
         if r.right <= 0 || r.bottom <= 0 {
             return;
         }
-        let layout = Layout::new(r.right, r.bottom, GetDpiForWindow(self.hwnd), notice);
-        let old = SCENE.with_borrow_mut(|s| {
-            s.replace(Scene {
-                layout,
-                colors: Colors::new(self.dark),
-                fonts: Fonts::new(layout),
-                motion: self.motion,
-                transition: self.transition,
-                frame_time: Instant::now(),
-                landing: s.as_ref().and_then(|s| s.landing),
-                notice,
-            })
+        let dpi = GetDpiForWindow(self.hwnd);
+        let (layout, previous, old_fonts) = SCENE.with_borrow_mut(|slot| {
+            let previous = slot.as_ref().map(|s| s.layout);
+            let ratios = previous.map_or([0.58, 0.66, 0.66], |l| l.ratios);
+            let layout = Layout::new(r.right, r.bottom, dpi, notice, ratios);
+            let colors = Colors::new(self.dark);
+            let old_fonts = if let Some(s) = slot {
+                let changed = s.layout.scale != layout.scale;
+                s.layout = layout;
+                s.colors = colors;
+                s.notice = notice;
+                s.motion = self.motion;
+                s.transition = self.transition;
+                changed.then(|| std::mem::replace(&mut s.fonts, Fonts::new(layout)))
+            } else {
+                *slot = Some(Scene {
+                    layout,
+                    colors,
+                    fonts: Fonts::new(layout),
+                    motion: self.motion,
+                    transition: self.transition,
+                    frame_time: Instant::now(),
+                    landing: None,
+                    notice,
+                    drag: None,
+                });
+                None
+            };
+            (layout, previous, old_fonts)
         });
-        for &(id, _) in IDS {
-            let r = layout.bounds(id);
-            let font = SCENE.with_borrow(|s| s.as_ref().unwrap().fonts.control(id));
-            self.send(id, WM_SETFONT, font as usize, 0);
-            MoveWindow(
-                self.child(id),
-                r.left,
-                r.top,
-                r.right - r.left,
-                r.bottom - r.top,
-                0,
-            );
-        }
-        drop(old);
+        place_controls(
+            self.hwnd,
+            layout,
+            previous,
+            previous.is_none() || old_fonts.is_some(),
+        );
+        // Child windows may select the previous fonts until WM_SETFONT returns.
+        drop(old_fonts);
+    }
+    unsafe fn title_theme(&self) {
         let dark = self.dark as i32;
         DwmSetWindowAttribute(self.hwnd, 20, (&dark as *const i32).cast(), 4);
-        RedrawWindow(
-            self.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN,
-        );
     }
     unsafe fn sync(&mut self, s: &Console) {
         let notice = !s.notice.is_empty();
@@ -660,6 +775,7 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
             return Err(io::Error::last_os_error().into());
         }
         let mut v = View::new(hwnd)?;
+        v.title_theme();
         v.sync(&host.ui);
         ShowWindow(hwnd, SW_SHOWNORMAL);
         let mut msg = MSG::default();
@@ -670,6 +786,11 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
             }
             if got == 0 {
                 break;
+            }
+            if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize && GetCapture() == hwnd
+            {
+                end_drag(hwnd);
+                continue;
             }
             match (msg.hwnd == hwnd, msg.message) {
                 (true, ACTION) if !host.closing => {
@@ -693,6 +814,7 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                         Check => host.start(2, false, true),
                         Theme => {
                             v.dark = !v.dark;
+                            v.title_theme();
                             v.manual = true;
                             v.transition = Instant::now();
                             v.layout(!host.ui.notice.is_empty());
@@ -707,7 +829,11 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                 (true, RESIZE) => v.layout(!host.ui.notice.is_empty()),
                 (true, SETTINGS) => {
                     if !v.manual {
-                        v.dark = system_dark();
+                        let dark = system_dark();
+                        if dark != v.dark {
+                            v.dark = dark;
+                            v.title_theme();
+                        }
                     }
                     v.motion = system_motion();
                     v.layout(!host.ui.notice.is_empty());

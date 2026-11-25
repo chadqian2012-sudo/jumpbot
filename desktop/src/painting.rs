@@ -55,44 +55,109 @@ impl Colors {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Divider {
+    Columns,
+    LeftRow,
+    RightRow,
+}
+
+impl Divider {
+    const ALL: [Self; 3] = [Self::Columns, Self::LeftRow, Self::RightRow];
+
+    pub fn axis(self, x: i32, y: i32) -> i32 {
+        if self == Self::Columns {
+            x
+        } else {
+            y
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Layout {
     pub scale: f32,
     pub w: i32,
     pub h: i32,
-    pub left: i32,
-    pub right: i32,
     pub top: i32,
-    pub split: i32,
+    pub ratios: [f32; 3],
 }
+
 impl Layout {
-    pub fn new(width: i32, height: i32, dpi: u32, notice: bool) -> Self {
+    pub fn new(width: i32, height: i32, dpi: u32, notice: bool, ratios: [f32; 3]) -> Self {
+        // Keep a full logical canvas even on a small display or with the notice visible.
         let scale = (dpi as f32 / 96.)
             .min(width as f32 / 860.)
-            .min(height as f32 / 605.)
-            .max(0.45);
-        let w = (width as f32 / scale).round() as i32;
-        let h = (height as f32 / scale).round() as i32;
-        let left = ((w - 72) as f32 * 0.58) as i32;
-        let top = if notice { 178 } else { 144 };
-        let split = (h - 204).max(top + 251);
+            .min(height as f32 / 640.);
         Self {
             scale,
-            w,
-            h,
-            left,
-            right: 40 + left,
-            top,
-            split,
+            w: (width as f32 / scale).round() as i32,
+            h: (height as f32 / scale).round() as i32,
+            top: if notice { 178 } else { 144 },
+            ratios,
         }
+    }
+    // Origin, usable span, minimum and maximum divider center in logical pixels.
+    fn track(self, d: Divider) -> (i32, i32, i32, i32) {
+        match d {
+            Divider::Columns => (32, self.w - 64, 32 + 380, self.w - 32 - 304),
+            Divider::LeftRow => (
+                self.top,
+                self.h - 24 - self.top,
+                self.top + 210,
+                self.h - 194,
+            ),
+            Divider::RightRow => (
+                self.top,
+                self.h - 24 - self.top,
+                self.top + 272,
+                self.h - 154,
+            ),
+        }
+    }
+    pub fn position(self, d: Divider) -> i32 {
+        let (start, span, lo, hi) = self.track(d);
+        (start + (span as f32 * self.ratios[d as usize]).round() as i32).clamp(lo, hi)
+    }
+    pub fn move_to(&mut self, d: Divider, pos: i32) -> bool {
+        let (start, span, lo, hi) = self.track(d);
+        let pos = pos.clamp(lo, hi);
+        if pos == self.position(d) {
+            return false;
+        }
+        self.ratios[d as usize] = (pos - start) as f32 / span as f32;
+        true
+    }
+    fn left(self) -> i32 {
+        self.position(Divider::Columns) - 32
+    }
+    fn right(self) -> i32 {
+        self.position(Divider::Columns) + 8
+    }
+    fn band(self, d: Divider) -> RECT {
+        let pos = self.position(d);
+        match d {
+            Divider::Columns => rect(pos - 8, self.top, 16, self.h - 24 - self.top),
+            Divider::LeftRow => rect(24, pos - 8, self.left(), 16),
+            Divider::RightRow => rect(self.right(), pos - 8, self.w - 24 - self.right(), 16),
+        }
+    }
+    pub fn hit(self, x: i32, y: i32) -> Option<Divider> {
+        Divider::ALL.into_iter().find(|&d| {
+            let r = self.pixels(self.band(d));
+            x >= r.left && x < r.right && y >= r.top && y < r.bottom
+        })
+    }
+    pub fn logical_axis(self, d: Divider, x: i32, y: i32) -> i32 {
+        (d.axis(x, y) as f32 / self.scale).round() as i32
     }
     pub fn px(self, v: i32) -> i32 {
         (v as f32 * self.scale).round() as i32
     }
     fn diagram(self) -> RECT {
         let top = self.top + 86;
-        let bottom = self.split - 49 - 8; // Leave a gap above the footer rule.
-        rect(42, top, self.left - 36, bottom - top)
+        let bottom = self.position(Divider::LeftRow) - 49 - 8; // Leave a gap above the footer rule.
+        rect(42, top, self.left() - 36, bottom - top)
     }
     pub fn diagram_pixels(self) -> RECT {
         self.pixels(self.diagram())
@@ -107,20 +172,16 @@ impl Layout {
     }
     pub fn bounds(self, id: Id) -> RECT {
         use Id::*;
-        let Self {
-            w,
-            h,
-            left,
-            right,
-            top,
-            split,
-            ..
-        } = self;
+        let Self { w, h, top, .. } = self;
+        let left = self.left();
+        let right = self.right();
+        let split = self.position(Divider::RightRow);
+        let left_split = self.position(Divider::LeftRow);
         let right_width = w - right - 24;
-        let m = top + ((split - top) * 39 / 100).max(126);
+        let m = top + ((split - top) * 39 / 100).max(138);
         let step = ((split - 48 - m) / 4).max(20);
-        let footer = split - 45;
-        let body = split + 12;
+        let footer = left_split - 45;
+        let body = left_split + 12;
         let b = match id {
             Theme => rect(w - 140, 9, 116, 34),
             Shortcuts => rect(w - 310, 82, 282, 33),
@@ -174,12 +235,7 @@ impl Layout {
                 };
                 rect(x, body + 113, width, 43)
             }
-            Ledger | Empty => rect(
-                right + 16,
-                body + 60,
-                right_width - 32,
-                (h - body - 85).max(56),
-            ),
+            Ledger | Empty => rect(right + 16, split + 72, right_width - 32, h - split - 97),
         };
         self.pixels(b)
     }
@@ -259,6 +315,7 @@ pub struct Scene {
     pub frame_time: Instant,
     pub landing: Option<Jump>,
     pub notice: bool,
+    pub drag: Option<(Divider, i32)>,
 }
 thread_local! {pub static SCENE:RefCell<Option<Scene>>=const{RefCell::new(None)};}
 pub const ENTRY_DURATION: Duration = Duration::from_millis(400);
@@ -334,36 +391,50 @@ impl Scene {
         text(24, 60, 310, 24, f.latin, c.muted, "//  JUMP CONSOLE");
         text(22, 82, 430, 48, f.title, c.ink, "跳一跳控制台");
         box_at(24, 132, l.w - 48, 1, c.ink);
+        for d in Divider::ALL {
+            let mut line = l.pixels(l.band(d));
+            let center = l.px(l.position(d));
+            if d == Divider::Columns {
+                line.left = center;
+                line.right = center + 1;
+            } else {
+                line.top = center;
+                line.bottom = center + 1;
+            }
+            fill(dc, line, c.muted);
+        }
+        let left_split = l.position(Divider::LeftRow);
+        let right_split = l.position(Divider::RightRow);
         for (x, y, w, h, en, cn) in [
             (
                 24,
                 l.top,
-                l.left,
-                l.split - l.top - 10,
+                l.left(),
+                left_split - l.top - 10,
                 "//  RUN STATUS",
                 "当前状态",
             ),
             (
-                l.right,
+                l.right(),
                 l.top,
-                l.w - l.right - 24,
-                l.split - l.top - 10,
+                l.w - l.right() - 24,
+                right_split - l.top - 10,
                 "//  LIVE METRICS",
                 "本轮读数",
             ),
             (
                 24,
-                l.split + 12,
-                l.left,
-                l.h - l.split - 36,
+                left_split + 12,
+                l.left(),
+                l.h - left_split - 36,
                 "//  CONTROLS",
                 "运行设置",
             ),
             (
-                l.right,
-                l.split + 12,
-                l.w - l.right - 24,
-                l.h - l.split - 36,
+                l.right(),
+                right_split + 12,
+                l.w - l.right() - 24,
+                l.h - right_split - 36,
                 "//  ACTIVITY",
                 "运行日志",
             ),
@@ -374,9 +445,9 @@ impl Scene {
             text(x + 17, y + 8, w - 34, 19, f.latin, c.muted, en);
             text(x + 16, y + 26, w - 34, 30, f.section, c.ink, cn);
         }
-        let right_width = l.w - l.right - 24;
+        let right_width = l.w - l.right() - 24;
         text(
-            l.right + 18,
+            l.right() + 18,
             l.top + 59,
             right_width - 30,
             18,
@@ -392,14 +463,14 @@ impl Scene {
         ] {
             let mut r = l.bounds(id);
             let y = r.top - 1;
-            r.left = l.px(l.right + 18);
-            r.right = l.px(l.right + right_width / 2);
+            r.left = l.px(l.right() + 18);
+            r.right = l.px(l.right() + right_width / 2);
             fill(dc, rect(r.left, y, l.px(right_width - 36), 1), c.rule);
             label(dc, r, f.small, c.muted, s, DT_LEFT);
         }
         text(
-            l.right + 15,
-            l.split - 44,
+            l.right() + 15,
+            right_split - 44,
             64,
             23,
             f.small,
@@ -407,17 +478,17 @@ impl Scene {
             "识别后端",
         );
         text(
-            l.right + right_width / 2 + 12,
-            l.split - 44,
+            l.right() + right_width / 2 + 12,
+            right_split - 44,
             60,
             23,
             f.small,
             c.muted,
             "背景取样",
         );
-        text(42, l.split + 64, 130, 20, f.small, c.muted, "识别后端");
-        let foot = l.split - 49;
-        box_at(42, foot, l.left - 36, 1, c.rule);
+        text(42, left_split + 64, 130, 20, f.small, c.muted, "识别后端");
+        let foot = left_split - 49;
+        box_at(42, foot, l.left() - 36, 1, c.rule);
     }
     unsafe fn diagram(&self, dc: HDC, bounds: RECT, entry: f32, pose: Pose, now: Instant) {
         let w = (bounds.right - bounds.left) as f32;
