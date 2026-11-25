@@ -597,8 +597,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             } else {
                 Some(sec(cfg.f("window_wait_s")))
             };
-            // Reacquisition starts from a fresh board, including after a pause.
-            blind = None;
             window = game.gate(false, timeout)?;
             if window.is_none() && !game.ctl.state().stopped {
                 if o.daemon && missing {
@@ -632,7 +630,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                     json!({"game_state":"capture_blocked","stop_reason":reason}),
                 );
                 previous_aim = None;
-                blind = None;
                 baseline = true;
                 attempts = 0;
                 game.vision.reset_prior();
@@ -667,7 +664,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 return Err("开始/重玩按钮持续未消失".into());
             }
             previous_aim = None;
-            blind = None;
             baseline = true;
             game.vision.reset_prior();
             game.ctl.sleep(g, ms(1400.));
@@ -696,7 +692,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
             game.report(phase, json!({"game_state":phase,"stop_reason":reason}));
             pressed_button = None;
-            blind = None;
             attempts = 0;
             previous_aim = None;
             baseline = true;
@@ -707,6 +702,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         };
         pressed_button = None;
         if baseline {
+            blind = None;
             records.resync(game.screen.score(&f, cfg));
             baseline = false
         }
