@@ -311,6 +311,7 @@ fn find_dot_if(
     cy: f64,
     radius: f64,
     cfg: &Config,
+    painted: bool,
     accept: impl Fn(f64, f64) -> bool,
 ) -> Result<Option<(f64, f64, i32)>, String> {
     let x0 = (cx - radius).round_ties_even().max(0.0) as i32;
@@ -329,6 +330,13 @@ fn find_dot_if(
     for row in y0..y1 {
         let start = (row as usize * frame.width + x0 as usize) * 3;
         for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
+            if painted {
+                // The unblended game marker has the same ink on bright and dark faces.
+                mask.push(u8::from(
+                    *pixel == [245; 3] && min_value <= 245 && max_sat >= 0,
+                ));
+                continue;
+            }
             let v = i32::from(*pixel.iter().max().unwrap());
             let d = v - i32::from(*pixel.iter().min().unwrap());
             let saturation = (d * sat_div[v as usize] + 2048) >> 12;
@@ -342,8 +350,39 @@ fn find_dot_if(
     for (id, &[x, y, bw, bh, area]) in regions.stats.iter().enumerate().skip(1) {
         if (area as f64) < cfg.f("center_dot_min_area")
             || area as f64 > cfg.f("center_dot_max_area")
-            || bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64
+            || (!painted && bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64)
         {
+            continue;
+        }
+        if painted {
+            let (rx, ry) = (f64::from(bw) / 2., f64::from(bh) / 2.);
+            let (mx, my) = (f64::from(x) + rx - 0.5, f64::from(y) + ry - 0.5);
+            let (dx, dy) = (mx + f64::from(x0), my + f64::from(y0));
+            // A projected disc must be complete, near the face estimate, and filled
+            // like an ellipse. Allow one raster pixel at the antialiased boundary.
+            if x == 0
+                || y == 0
+                || x + bw == bounds[2]
+                || y + bh == bounds[3]
+                || (ry - rx * cfg.f("axis_slope")).abs() > 1.
+                || (dx - cx).hypot(dy - cy) > radius.min(f64::from(bw))
+                || !accept(dx, dy)
+            {
+                continue;
+            }
+            let ellipse = (y..y + bh).all(|yy| {
+                (x..x + bw).all(|xx| {
+                    let radial = ((f64::from(xx) - mx) / rx).hypot((f64::from(yy) - my) / ry);
+                    let filled = labels[yy as usize * w + xx as usize] == id as i32;
+                    filled == (radial <= 1.) || (radial - 1.).abs() * ry <= 1.
+                })
+            });
+            if ellipse {
+                if nearest.is_some() {
+                    return Ok(None);
+                }
+                nearest = Some((dx, dy, area));
+            }
             continue;
         }
         let mut ring = Vec::new();
@@ -394,7 +433,7 @@ pub fn find_dot_near(
     cfg: &Config,
 ) -> Result<Option<(f64, f64, i32)>, String> {
     check_frame(frame)?;
-    find_dot_if(frame, x, y, radius, cfg, |_, _| true)
+    find_dot_if(frame, x, y, radius, cfg, false, |_, _| true)
 }
 
 struct TargetCandidate {
@@ -551,7 +590,12 @@ fn find_target(
             let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
             (lower..=max_dist).contains(&along) && cross / along.abs().max(1.0) <= ratio
         };
-        if let Some(dot) = find_dot_if(frame, chosen.x, chosen.y, radius, cfg, valid)? {
+        let painted = find_dot_if(frame, chosen.x, chosen.y, radius, cfg, true, valid)?;
+        let dot = match painted {
+            Some(mark) => Some(mark),
+            None => find_dot_if(frame, chosen.x, chosen.y, radius, cfg, false, valid)?,
+        };
+        if let Some(dot) = dot {
             if (dot.0 - chosen.x).abs() > 3.0 || (dot.1 - chosen.y).abs() > 3.0 {
                 chosen.x = dot.0;
                 chosen.y = dot.1;
