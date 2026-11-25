@@ -27,8 +27,38 @@ pub struct Block {
 pub struct Detection {
     pub piece: Option<Piece>,
     pub target: Option<Block>,
+    pub unresolved_target_shadow: bool,
     pub piece_mask: Vec<u8>,
     pub block_mask: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Aim {
+    pub piece: (f64, f64),
+    pub target: (f64, f64),
+}
+
+impl Detection {
+    pub(crate) fn aim(&self) -> Option<Aim> {
+        let (piece, target) = self.piece.as_ref().zip(self.target.as_ref())?;
+        Some(Aim {
+            piece: (piece.x, piece.y),
+            target: (target.x, target.y),
+        })
+    }
+}
+
+pub(crate) fn points_close((x, y): (f64, f64), (u, v): (f64, f64), tolerance: f64) -> bool {
+    (x - u).abs() <= tolerance && (y - v).abs() <= tolerance
+}
+
+impl Aim {
+    pub(crate) fn confirmed(self, previous: Option<Self>, cfg: &Config) -> bool {
+        previous.is_some_and(|old| {
+            points_close(old.piece, self.piece, cfg.f("settle_anchor_tol_px"))
+                && points_close(old.target, self.target, cfg.f("target_consistency_px"))
+        })
+    }
 }
 
 fn check_frame(frame: &Frame) -> Result<(), String> {
@@ -282,6 +312,7 @@ fn find_dot_if(
     cy: f64,
     radius: f64,
     cfg: &Config,
+    painted: bool,
     accept: impl Fn(f64, f64) -> bool,
 ) -> Result<Option<(f64, f64, i32)>, String> {
     let x0 = (cx - radius).round_ties_even().max(0.0) as i32;
@@ -300,6 +331,13 @@ fn find_dot_if(
     for row in y0..y1 {
         let start = (row as usize * frame.width + x0 as usize) * 3;
         for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
+            if painted {
+                // The unblended game marker has the same ink on bright and dark faces.
+                mask.push(u8::from(
+                    *pixel == [245; 3] && min_value <= 245 && max_sat >= 0,
+                ));
+                continue;
+            }
             let v = i32::from(*pixel.iter().max().unwrap());
             let d = v - i32::from(*pixel.iter().min().unwrap());
             let saturation = (d * sat_div[v as usize] + 2048) >> 12;
@@ -313,8 +351,39 @@ fn find_dot_if(
     for (id, &[x, y, bw, bh, area]) in regions.stats.iter().enumerate().skip(1) {
         if (area as f64) < cfg.f("center_dot_min_area")
             || area as f64 > cfg.f("center_dot_max_area")
-            || bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64
+            || (!painted && bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64)
         {
+            continue;
+        }
+        if painted {
+            let (rx, ry) = (f64::from(bw) / 2., f64::from(bh) / 2.);
+            let (mx, my) = (f64::from(x) + rx - 0.5, f64::from(y) + ry - 0.5);
+            let (dx, dy) = (mx + f64::from(x0), my + f64::from(y0));
+            // A projected disc must be complete, near the face estimate, and filled
+            // like an ellipse. Allow one raster pixel at the antialiased boundary.
+            if x == 0
+                || y == 0
+                || x + bw == bounds[2]
+                || y + bh == bounds[3]
+                || (ry - rx * cfg.f("axis_slope")).abs() > 1.
+                || (dx - cx).hypot(dy - cy) > radius.min(f64::from(bw))
+                || !accept(dx, dy)
+            {
+                continue;
+            }
+            let ellipse = (y..y + bh).all(|yy| {
+                (x..x + bw).all(|xx| {
+                    let radial = ((f64::from(xx) - mx) / rx).hypot((f64::from(yy) - my) / ry);
+                    let filled = labels[yy as usize * w + xx as usize] == id as i32;
+                    filled == (radial <= 1.) || (radial - 1.).abs() * ry <= 1.
+                })
+            });
+            if ellipse {
+                if nearest.is_some() {
+                    return Ok(None);
+                }
+                nearest = Some((dx, dy, area));
+            }
             continue;
         }
         let mut ring = Vec::new();
@@ -365,7 +434,7 @@ pub fn find_dot_near(
     cfg: &Config,
 ) -> Result<Option<(f64, f64, i32)>, String> {
     check_frame(frame)?;
-    find_dot_if(frame, x, y, radius, cfg, |_, _| true)
+    find_dot_if(frame, x, y, radius, cfg, false, |_, _| true)
 }
 
 struct TargetCandidate {
@@ -377,6 +446,12 @@ struct TargetCandidate {
     cross_ratio: f64,
 }
 
+enum TargetSelection {
+    Found(Block),
+    Missing,
+    UnresolvedShadow,
+}
+
 fn find_target(
     frame: &Frame,
     block_mask: &[u8],
@@ -385,7 +460,7 @@ fn find_target(
     cfg: &Config,
     region_scratch: &mut RegionScratch,
     face_mask: &mut Vec<u8>,
-) -> Result<Option<Block>, String> {
+) -> Result<TargetSelection, String> {
     let (w, h) = (frame.width as f64, frame.height as f64);
     let parts = Mask::from_pixels(block_mask, frame.width, frame.height).blocks_with(
         Mask::from_pixels(piece_mask, frame.width, frame.height),
@@ -479,10 +554,95 @@ fn find_target(
             choose(2, lower, ratio)
         });
     let Some(selected) = selected else {
-        return Ok(None);
+        return Ok(TargetSelection::Missing);
     };
     let mut chosen = selected.block.clone();
     let width = chosen.bbox[2] as f64;
+    // A small asymmetric component can be just the detached shadow on the left
+    // of a bottle. Compare the shade against the exposed background on two sides.
+    let [bx, by, bw, bh] = chosen.bbox.map(|v| v as usize);
+    if !selected.strict && chosen.top_width < low_gate * width && bx >= 3 && by >= 3 {
+        let pixel = |x, y| frame.bgr.as_chunks::<3>().0[y * frame.width + x];
+        let x = bx + bw / 2;
+        let above: [u8; 3] = pixel(x, by - 3);
+        let shadow = (1..=3).all(|quarter| {
+            let y = by + bh * quarter / 4;
+            let bg: [u8; 3] = pixel(bx - 3, y);
+            let shade: [u8; 3] = pixel(x, y);
+            let base = i32::from(*bg.iter().max().unwrap());
+            let value = i32::from(*shade.iter().max().unwrap());
+            // The blue side of the prop is excluded by the pawn-color mask.
+            // It separates this cast shadow from an ordinary dark surface.
+            let right = bx + bw;
+            piece_mask[y * frame.width + right..y * frame.width + (right + bw / 2).min(frame.width)]
+                .iter()
+                .any(|&v| v != 0)
+                && 2 * value > base
+                && f64::from(base - value) > cfg.f("block_dark_delta")
+                && (0..3).all(|i| {
+                    bg[i].abs_diff(above[i]) <= 8
+                        && (i32::from(shade[i]) * base - i32::from(bg[i]) * value).abs() <= 6 * base
+                })
+        });
+        if shadow {
+            // Only the adjoining upright component can own the cap. A complete
+            // painted disc on its estimated face supplies the measured center.
+            let edge = (bx + bw) as f64;
+            let mut caps = candidates.iter().filter(|c| {
+                let b = &c.block;
+                let [left, top, w, h] = b.bbox.map(f64::from);
+                !c.degenerate
+                    && h > w
+                    && left > 0.
+                    && left + w < frame.width as f64
+                    && b.top_width >= low_gate * w
+                    && (left - edge).abs() <= 0.25 * width
+                    && (top + h - (by + bh) as f64).abs() <= 0.5 * bh as f64
+                    && b.y < chosen.top_y.min(max_y)
+                    && (lower..=max_dist).contains(&c.along)
+                    && c.cross_ratio <= ratio
+            });
+            if let Some(cap) = caps.next().filter(|_| caps.next().is_none()) {
+                let b = &cap.block;
+                let radius = (b.top_width * 0.5).min(cfg.f("center_dot_max_offset_px"));
+                // When dot correction is off, use only the symmetric bright top
+                // identified by the existing face fit, never the dot reader.
+                let cap_y = b.top_y + 0.5 * b.top_width * slope;
+                let white = [-0.3, 0.3].into_iter().all(|side| {
+                    let x = (b.x + side * b.top_width).round() as usize;
+                    let y = cap_y.round() as usize;
+                    if x >= frame.width || y >= frame.height {
+                        return false;
+                    }
+                    let rgb: [u8; 3] = pixel(x, y);
+                    let value = f64::from(*rgb.iter().max().unwrap());
+                    let spread = value - f64::from(*rgb.iter().min().unwrap());
+                    value >= cfg.f("block_white_val_min")
+                        && 255.0 * spread <= cfg.f("block_white_sat_max") * value
+                });
+                if !white {
+                    return Ok(TargetSelection::UnresolvedShadow);
+                }
+                if radius <= 0.0 {
+                    return Ok(TargetSelection::Found(b.clone()));
+                }
+                if let Some(dot) = find_dot_if(frame, b.x, b.y, radius, cfg, true, |x, y| {
+                    let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
+                    (b.top_y..=b.top_y + b.top_width * slope).contains(&y)
+                        && y < max_y
+                        && (lower..=max_dist).contains(&along)
+                        && cross <= ratio * along
+                })? {
+                    let mut cap = b.clone();
+                    cap.x = dot.0;
+                    cap.y = dot.1;
+                    cap.dot = Some(dot);
+                    return Ok(TargetSelection::Found(cap));
+                }
+            }
+            return Ok(TargetSelection::UnresolvedShadow);
+        }
+    }
     let aspect = cfg.f("item_rescue_min_aspect");
     if aspect > 0.0 && chosen.bbox[3] as f64 > aspect * width {
         let min_alt_area = (3.0 * chosen.area as f64).max(min_area);
@@ -497,7 +657,7 @@ fn find_target(
             })
             .min_by(|a, b| a.along.total_cmp(&b.along).then(b.strict.cmp(&a.strict)));
         if let Some(alt) = alt {
-            return Ok(Some(alt.block.clone()));
+            return Ok(TargetSelection::Found(alt.block.clone()));
         }
     }
     let mut radius = cfg.f("center_dot_max_offset_px");
@@ -522,7 +682,12 @@ fn find_target(
             let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
             (lower..=max_dist).contains(&along) && cross / along.abs().max(1.0) <= ratio
         };
-        if let Some(dot) = find_dot_if(frame, chosen.x, chosen.y, radius, cfg, valid)? {
+        let painted = find_dot_if(frame, chosen.x, chosen.y, radius, cfg, true, valid)?;
+        let dot = match painted {
+            Some(mark) => Some(mark),
+            None => find_dot_if(frame, chosen.x, chosen.y, radius, cfg, false, valid)?,
+        };
+        if let Some(dot) = dot {
             if (dot.0 - chosen.x).abs() > 3.0 || (dot.1 - chosen.y).abs() > 3.0 {
                 chosen.x = dot.0;
                 chosen.y = dot.1;
@@ -530,7 +695,7 @@ fn find_target(
             }
         }
     }
-    Ok(Some(chosen))
+    Ok(TargetSelection::Found(chosen))
 }
 
 fn piece_templates() -> Result<Vec<crate::template::PieceTemplate>, String> {
@@ -679,10 +844,10 @@ impl Vision {
             return Err("Mask dimensions differ from the BGR frame".into());
         }
         let piece = self.find_piece(frame, &mut piece_mask, &mut block_mask)?;
-        let mut target = None;
+        let mut selection = TargetSelection::Missing;
         if let Some(p) = &piece {
             if want_target {
-                target = find_target(
+                selection = find_target(
                     frame,
                     &block_mask,
                     p,
@@ -694,9 +859,14 @@ impl Vision {
             }
             self.prior = Some(p.clone());
         }
+        let unresolved_target_shadow = matches!(selection, TargetSelection::UnresolvedShadow);
         Ok(Detection {
             piece,
-            target,
+            target: match selection {
+                TargetSelection::Found(block) => Some(block),
+                _ => None,
+            },
+            unresolved_target_shadow,
             piece_mask,
             block_mask,
         })
@@ -945,6 +1115,61 @@ mod dark_board_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bottle_shadow_requires_a_supported_top() {
+        let images = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/bottle-shadow");
+        for (name, x, y) in [
+            ("development.png", 400usize, 501usize),
+            ("holdout.png", 393, 505),
+        ] {
+            let frame = Frame::read(&images.join(name)).unwrap();
+            for dots in [true, false] {
+                let mut cfg = Config::default();
+                if !dots {
+                    cfg.0["center_dot_max_offset_px"] = 0.into();
+                }
+                let mut vision = Vision::new(&cfg, "cpu").unwrap();
+                let seen = vision.detect(&frame).unwrap();
+                let cap = seen.target.unwrap();
+                assert!(!seen.unresolved_target_shadow && cap.dot.is_some() == dots);
+                assert!((cap.x - x as f64).hypot(cap.y - y as f64) <= 2.);
+
+                // Keep the bottle and its cast shadow, covering the marker when
+                // enabled, or the independently checked bright top when disabled.
+                let mut covered = frame.clone();
+                let tint = if dots { [255; 3] } else { [160, 180, 200] };
+                for yy in y - 7..=y + 7 {
+                    for xx in x - 19..=x + 19 {
+                        covered.bgr.as_chunks_mut::<3>().0[yy * frame.width + xx] = tint;
+                    }
+                }
+                vision.reset_prior();
+                let rejected = vision.detect(&covered).unwrap();
+                assert!(
+                    rejected.piece.is_some()
+                        && rejected.target.is_none()
+                        && rejected.unresolved_target_shadow,
+                    "{name}, dots={dots}"
+                );
+                covered.bgr.fill(200);
+                let [px, py, w, h] = seen.piece.unwrap().bbox.map(|v| v as usize);
+                for row in py..py + h {
+                    let start = (row * frame.width + px) * 3;
+                    covered.bgr[start..start + 3 * w]
+                        .copy_from_slice(&frame.bgr[start..start + 3 * w]);
+                }
+                vision.reset_prior();
+                let missing = vision.detect(&covered).unwrap();
+                assert!(
+                    missing.piece.is_some()
+                        && missing.target.is_none()
+                        && !missing.unresolved_target_shadow
+                );
+            }
+        }
+    }
 
     #[test]
     fn sat_div_table_matches_f64_formula_for_all_bytes() {

@@ -1,6 +1,6 @@
 use crate::{
     console::{Console, Mode},
-    painting::{self, Colors, Fonts, Layout, Scene, SCENE},
+    painting::{self, Colors, Divider, Fonts, Layout, Scene, SCENE},
     Host, BACKENDS,
 };
 use std::{
@@ -20,9 +20,11 @@ use windows_sys::{
         Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*},
         System::{LibraryLoader::GetModuleHandleW, Registry::*},
         UI::{
-            Controls::{BST_CHECKED, DRAWITEMSTRUCT},
+            Controls::{SetWindowTheme, BST_CHECKED, DRAWITEMSTRUCT},
             HiDpi::*,
-            Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled},
+            Input::KeyboardAndMouse::{
+                EnableWindow, GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -52,6 +54,8 @@ pub enum Id {
     Check,
     Empty,
     Ledger,
+    LogSmaller,
+    LogLarger,
 }
 use Id::*;
 const IDS: &[(Id, &str)] = &[
@@ -76,6 +80,8 @@ const IDS: &[(Id, &str)] = &[
     (Check, "check"),
     (Empty, "empty"),
     (Ledger, "ledger"),
+    (LogSmaller, "log-font-smaller"),
+    (LogLarger, "log-font-larger"),
 ];
 impl Id {
     pub fn from_raw(n: usize) -> Option<Self> {
@@ -89,8 +95,137 @@ const ACTION: u32 = WM_APP + 1;
 const RESIZE: u32 = WM_APP + 2;
 const CLOSE: u32 = WM_APP + 3;
 const SETTINGS: u32 = WM_APP + 4;
+unsafe fn divider_cursor(d: Divider) {
+    let shape = if d == Divider::Columns {
+        IDC_SIZEWE
+    } else {
+        IDC_SIZENS
+    };
+    SetCursor(LoadCursorW(null_mut(), shape));
+}
+
+unsafe fn end_drag(hwnd: HWND) {
+    let dragging = SCENE.with_borrow_mut(|s| s.as_mut().and_then(|s| s.drag.take()).is_some());
+    // ReleaseCapture synchronously sends WM_CAPTURECHANGED back into this procedure.
+    if dragging && GetCapture() == hwnd {
+        ReleaseCapture();
+    }
+}
+
+unsafe fn log_position(list: HWND) -> (isize, bool) {
+    let top = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
+    let mut r = RECT::default();
+    GetClientRect(list, &mut r);
+    let page = (r.bottom as isize / SendMessageW(list, LB_GETITEMHEIGHT, 0, 0).max(1)).max(1);
+    (top, top + page >= SendMessageW(list, LB_GETCOUNT, 0, 0))
+}
+unsafe fn restore_log_position(list: HWND, top: isize, tail: bool) {
+    let n = SendMessageW(list, LB_GETCOUNT, 0, 0);
+    if n > 0 {
+        SendMessageW(
+            list,
+            LB_SETTOPINDEX,
+            if tail { n - 1 } else { top } as usize,
+            0,
+        );
+    }
+}
+
+unsafe fn place_controls(
+    hwnd: HWND,
+    layout: Layout,
+    previous: Option<Layout>,
+    fonts_changed: bool,
+) {
+    for &(id, _) in IDS {
+        let child = GetDlgItem(hwnd, id as i32);
+        if fonts_changed {
+            let font = SCENE.with_borrow(|s| s.as_ref().unwrap().fonts.control(id));
+            SendMessageW(child, WM_SETFONT, font as usize, 0);
+        }
+        let r = layout.bounds(id);
+        if previous.is_none_or(|old| EqualRect(&old.bounds(id), &r) == 0) {
+            // Keep the same content in view when a divider or the notice changes its height.
+            let position = (id == Ledger && !fonts_changed).then(|| log_position(child));
+            MoveWindow(child, r.left, r.top, r.right - r.left, r.bottom - r.top, 0);
+            if let Some((top, tail)) = position {
+                restore_log_position(child, top, tail);
+            }
+        }
+    }
+    RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     match msg {
+        WM_SETCURSOR if wp == h as usize && lp as u16 == HTCLIENT as u16 => {
+            let mut pt = POINT::default();
+            let in_client = GetCursorPos(&mut pt) != 0 && ScreenToClient(h, &mut pt) != 0;
+            let d = SCENE.with_borrow(|s| {
+                let s = s.as_ref()?;
+                s.drag.map(|(d, _)| d).or_else(|| {
+                    if in_client {
+                        s.layout.hit(pt.x, pt.y)
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(d) = d {
+                divider_cursor(d);
+                1
+            } else {
+                DefWindowProcW(h, msg, wp, lp)
+            }
+        }
+        WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP => {
+            let x = lp as i16 as i32;
+            let y = (lp >> 16) as i16 as i32;
+            if msg == WM_LBUTTONDOWN {
+                let hit = SCENE.with_borrow(|s| {
+                    let l = s.as_ref()?.layout;
+                    let d = l.hit(x, y)?;
+                    Some((d, l.logical_axis(d, x, y) - l.position(d)))
+                });
+                if let Some((d, offset)) = hit {
+                    SetCapture(h);
+                    if GetCapture() == h {
+                        SCENE.with_borrow_mut(|s| s.as_mut().unwrap().drag = Some((d, offset)));
+                        divider_cursor(d);
+                    }
+                    return 0;
+                }
+            } else if GetCapture() == h {
+                let changed = SCENE.with_borrow_mut(|s| {
+                    let s = s.as_mut()?;
+                    let (d, offset) = s.drag?;
+                    let old = s.layout;
+                    s.layout
+                        .move_to(d, old.logical_axis(d, x, y) - offset)
+                        .then_some((old, s.layout))
+                });
+                if let Some((old, layout)) = changed {
+                    place_controls(h, layout, Some(old), false);
+                }
+                if msg == WM_LBUTTONUP {
+                    end_drag(h);
+                }
+                return 0;
+            }
+            DefWindowProcW(h, msg, wp, lp)
+        }
+        WM_CANCELMODE => {
+            end_drag(h);
+            DefWindowProcW(h, msg, wp, lp)
+        }
+        WM_CAPTURECHANGED => {
+            SCENE.with_borrow_mut(|s| {
+                if let Some(s) = s {
+                    s.drag = None;
+                }
+            });
+            0
+        }
         WM_PAINT => {
             painting::paint(h);
             0
@@ -138,6 +273,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: usize, lp: isize) -> is
             0
         }
         WM_SIZE => {
+            end_drag(h);
             if wp != SIZE_MINIMIZED as usize {
                 PostMessageW(h, RESIZE, 0, 0);
             }
@@ -210,6 +346,7 @@ struct View {
     annotations: IAccPropServices,
     text: HashMap<Id, String>,
     log_sequence: u64,
+    log_size: i32,
     dark: bool,
     manual: bool,
     motion: bool,
@@ -235,6 +372,7 @@ impl View {
             annotations,
             text: HashMap::new(),
             log_sequence: 0,
+            log_size: 13,
             dark: system_dark(),
             manual: false,
             motion: system_motion(),
@@ -245,10 +383,12 @@ impl View {
         };
         for &(id, name) in IDS {
             let (class, style, caption) = match id {
-                Theme | Primary | Stop | Check => (
+                LogSmaller | LogLarger | Theme | Primary | Stop | Check => (
                     w!("BUTTON"),
                     WS_TABSTOP | BS_OWNERDRAW as u32,
                     match id {
+                        LogSmaller => "A−",
+                        LogLarger => "A+",
                         Stop => "停止",
                         Check => "无输入自检",
                         Primary => "启动脚本",
@@ -313,15 +453,12 @@ impl View {
                 )
             };
             annotate(AutomationId_Property_GUID, name)?;
-            if id == Backend || id == Ledger {
-                annotate(
-                    PROPID_ACC_NAME,
-                    if id == Backend {
-                        "识别后端"
-                    } else {
-                        "最近运行日志"
-                    },
-                )?;
+            match id {
+                Backend => annotate(PROPID_ACC_NAME, "识别后端")?,
+                Ledger => annotate(PROPID_ACC_NAME, "最近运行日志")?,
+                LogSmaller => annotate(PROPID_ACC_NAME, "减小日志字号")?,
+                LogLarger => annotate(PROPID_ACC_NAME, "增大日志字号")?,
+                _ => {}
             }
         }
         for (label, _) in BACKENDS {
@@ -368,52 +505,114 @@ impl View {
             EnableWindow(h, on as i32);
         }
     }
-    unsafe fn layout(&mut self, notice: bool) {
+    unsafe fn layout(&mut self, ui: &Console) {
+        let notice = !ui.notice.is_empty();
         let mut r = RECT::default();
         GetClientRect(self.hwnd, &mut r);
         if r.right <= 0 || r.bottom <= 0 {
             return;
         }
-        let layout = Layout::new(r.right, r.bottom, GetDpiForWindow(self.hwnd), notice);
-        let old = SCENE.with_borrow_mut(|s| {
-            s.replace(Scene {
-                layout,
-                colors: Colors::new(self.dark),
-                fonts: Fonts::new(layout),
-                motion: self.motion,
-                transition: self.transition,
-                frame_time: Instant::now(),
-                landing: s.as_ref().and_then(|s| s.landing),
-                notice,
-            })
+        let (top, tail) = log_position(self.child(Ledger));
+        let dpi = GetDpiForWindow(self.hwnd);
+        let (layout, previous, old_fonts) = SCENE.with_borrow_mut(|slot| {
+            let previous = slot.as_ref().map(|s| s.layout);
+            let ratios = previous.map_or([0.58, 0.66, 0.66], |l| l.ratios);
+            let layout = Layout::new(r.right, r.bottom, dpi, notice, ratios);
+            let colors = Colors::new(self.dark);
+            let old_fonts = if let Some(s) = slot {
+                let changed = s.layout.scale != layout.scale;
+                s.layout = layout;
+                s.colors = colors;
+                s.notice = notice;
+                s.motion = self.motion;
+                s.transition = self.transition;
+                changed.then(|| std::mem::replace(&mut s.fonts, Fonts::new(layout, self.log_size)))
+            } else {
+                *slot = Some(Scene {
+                    layout,
+                    colors,
+                    fonts: Fonts::new(layout, self.log_size),
+                    motion: self.motion,
+                    transition: self.transition,
+                    frame_time: Instant::now(),
+                    landing: None,
+                    notice,
+                    drag: None,
+                });
+                None
+            };
+            (layout, previous, old_fonts)
         });
-        for &(id, _) in IDS {
-            let r = layout.bounds(id);
-            let font = SCENE.with_borrow(|s| s.as_ref().unwrap().fonts.control(id));
-            self.send(id, WM_SETFONT, font as usize, 0);
-            MoveWindow(
-                self.child(id),
-                r.left,
-                r.top,
-                r.right - r.left,
-                r.bottom - r.top,
-                0,
-            );
+        place_controls(
+            self.hwnd,
+            layout,
+            previous,
+            previous.is_none() || old_fonts.is_some(),
+        );
+        if previous.is_none() || old_fonts.is_some() {
+            self.log_metrics(ui);
+            restore_log_position(self.child(Ledger), top, tail);
         }
-        drop(old);
+        // Child windows may select the previous fonts until WM_SETFONT returns.
+        drop(old_fonts);
+    }
+    unsafe fn apply_theme(&self) {
+        let theme = if self.dark {
+            w!("DarkMode_Explorer")
+        } else {
+            w!("Explorer")
+        };
+        SetWindowTheme(self.child(Ledger), theme, null());
         let dark = self.dark as i32;
         DwmSetWindowAttribute(self.hwnd, 20, (&dark as *const i32).cast(), 4);
-        RedrawWindow(
-            self.hwnd,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN,
-        );
+    }
+    unsafe fn log_metrics(&self, s: &Console) {
+        let dc = GetDC(self.child(Ledger));
+        let font = self.send(Ledger, WM_GETFONT, 0, 0);
+        let old = SelectObject(dc, font as HGDIOBJ);
+        let mut tm = TEXTMETRICW::default();
+        if GetTextMetricsW(dc, &mut tm) != 0 {
+            let height = (tm.tmHeight + 1).clamp(1, 255);
+            if self.send(Ledger, LB_GETITEMHEIGHT, 0, 0) != height as isize {
+                self.send(Ledger, LB_SETITEMHEIGHT, 0, height as isize);
+            }
+        }
+        let extent = s
+            .logs
+            .iter()
+            .map(|line| {
+                let v = wide(line);
+                let mut size = SIZE::default();
+                GetTextExtentPoint32W(dc, v.as_ptr(), (v.len() - 1) as i32, &mut size);
+                size.cx
+            })
+            .max()
+            .unwrap_or(0);
+        SelectObject(dc, old);
+        ReleaseDC(self.child(Ledger), dc);
+        self.send(Ledger, LB_SETHORIZONTALEXTENT, extent as usize + 5, 0);
+    }
+    unsafe fn zoom_log(&mut self, delta: i32, ui: &Console) {
+        let (top, tail) = log_position(self.child(Ledger));
+        self.log_size = (self.log_size + delta).clamp(10, 20);
+        let (old, font) = SCENE.with_borrow_mut(|scene| {
+            let scene = scene.as_mut().unwrap();
+            let font = Fonts::log(scene.layout, self.log_size);
+            (std::mem::replace(&mut scene.fonts.log, font), font)
+        });
+        for id in [Ledger, Empty] {
+            self.send(id, WM_SETFONT, font as usize, 1);
+        }
+        DeleteObject(old);
+        self.log_metrics(ui);
+        restore_log_position(self.child(Ledger), top, tail);
+        self.enabled(LogSmaller, self.log_size > 10);
+        self.enabled(LogLarger, self.log_size < 20);
     }
     unsafe fn sync(&mut self, s: &Console) {
         let notice = !s.notice.is_empty();
         if !SCENE.with_borrow(|scene| scene.as_ref().is_some_and(|v| v.notice == notice)) {
-            self.layout(notice);
+            self.layout(s);
         }
         let scene_moving = SCENE.with_borrow_mut(|v| {
             let scene = v.as_mut().unwrap();
@@ -518,40 +717,18 @@ impl View {
             self.log_sequence = 0;
         }
         if self.log_sequence < s.log_sequence {
-            let count = self.send(Ledger, LB_GETCOUNT, 0, 0);
-            let top = self.send(Ledger, LB_GETTOPINDEX, 0, 0);
-            let mut r = RECT::default();
-            GetClientRect(self.child(Ledger), &mut r);
-            let tail =
-                top + (r.bottom as isize / self.send(Ledger, LB_GETITEMHEIGHT, 0, 0).max(1)) + 1
-                    >= count;
+            let (top, tail) = log_position(self.child(Ledger));
             let delta = (s.log_sequence - self.log_sequence).min(s.logs.len() as u64) as usize;
+            let mut removed = 0;
             for line in s.logs.iter().skip(s.logs.len() - delta) {
                 if self.send(Ledger, LB_GETCOUNT, 0, 0) >= 60 {
                     self.send(Ledger, LB_DELETESTRING, 0, 0);
+                    removed += 1;
                 }
                 self.send(Ledger, LB_ADDSTRING, 0, wide(line).as_ptr() as isize);
             }
-            let dc = GetDC(self.child(Ledger));
-            let font = self.send(Ledger, WM_GETFONT, 0, 0);
-            let old = SelectObject(dc, font as HGDIOBJ);
-            let extent = s
-                .logs
-                .iter()
-                .map(|line| {
-                    let v = wide(line);
-                    let mut size = SIZE::default();
-                    GetTextExtentPoint32W(dc, v.as_ptr(), (v.len() - 1) as i32, &mut size);
-                    size.cx
-                })
-                .max()
-                .unwrap_or(0);
-            SelectObject(dc, old);
-            ReleaseDC(self.child(Ledger), dc);
-            self.send(Ledger, LB_SETHORIZONTALEXTENT, extent as usize + 5, 0);
-            if tail {
-                self.send(Ledger, LB_SETTOPINDEX, s.logs.len().saturating_sub(1), 0);
-            }
+            self.log_metrics(s);
+            restore_log_position(self.child(Ledger), (top - removed).max(0), tail);
             self.log_sequence = s.log_sequence;
         }
         self.visible(Ledger, !s.logs.is_empty());
@@ -660,6 +837,7 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
             return Err(io::Error::last_os_error().into());
         }
         let mut v = View::new(hwnd)?;
+        v.apply_theme();
         v.sync(&host.ui);
         ShowWindow(hwnd, SW_SHOWNORMAL);
         let mut msg = MSG::default();
@@ -670,6 +848,11 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
             }
             if got == 0 {
                 break;
+            }
+            if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize && GetCapture() == hwnd
+            {
+                end_drag(hwnd);
+                continue;
             }
             match (msg.hwnd == hwnd, msg.message) {
                 (true, ACTION) if !host.closing => {
@@ -689,13 +872,16 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         }
+                        LogSmaller => v.zoom_log(-1, &host.ui),
+                        LogLarger => v.zoom_log(1, &host.ui),
                         Stop => host.stop(),
                         Check => host.start(2, false, true),
                         Theme => {
                             v.dark = !v.dark;
+                            v.apply_theme();
                             v.manual = true;
                             v.transition = Instant::now();
-                            v.layout(!host.ui.notice.is_empty());
+                            v.layout(&host.ui);
                         }
                         _ => {}
                     }
@@ -704,13 +890,17 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                     host.closing = true;
                     host.stop();
                 }
-                (true, RESIZE) => v.layout(!host.ui.notice.is_empty()),
+                (true, RESIZE) => v.layout(&host.ui),
                 (true, SETTINGS) => {
                     if !v.manual {
-                        v.dark = system_dark();
+                        let dark = system_dark();
+                        if dark != v.dark {
+                            v.dark = dark;
+                            v.apply_theme();
+                        }
                     }
                     v.motion = system_motion();
-                    v.layout(!host.ui.notice.is_empty());
+                    v.layout(&host.ui);
                 }
                 (true, WM_TIMER) => host.poll(),
                 _ => {
