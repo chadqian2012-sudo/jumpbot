@@ -7,7 +7,7 @@ use crate::{
     records::Records,
     runtime::{annotated, detection},
     screen::{Screen, ScreenState},
-    vision::{axis_components, Detection, Vision},
+    vision::{axis_components, points_close, Detection, Vision},
     Config, Frame, Result,
 };
 use serde_json::{json, Value};
@@ -247,11 +247,7 @@ impl Game<'_> {
                 let d = self.vision.detect_piece_only(&frame)?;
                 let p = d.piece.as_ref().map(|p| (p.x, p.y));
                 let tol = self.c.f("settle_anchor_tol_px");
-                let close =
-                    p.zip(anchor)
-                        .is_some_and(|((x, y), (u, v)): ((f64, f64), (f64, f64))| {
-                            (x - u).abs() <= tol && (y - v).abs() <= tol
-                        });
+                let close = p.zip(anchor).is_some_and(|(a, b)| points_close(a, b, tol));
                 stable = if close && landing::foot(&frame, &d) {
                     stable + 1
                 } else {
@@ -372,9 +368,6 @@ fn refresh_period() -> Duration {
     }
     ms(17.)
 }
-fn confirmed(old: Option<(f64, f64)>, new: (f64, f64), tol: f64) -> bool {
-    old.is_some_and(|(x, y)| (x - new.0).abs() <= tol && (y - new.1).abs() <= tol)
-}
 fn diagnostics(game: &mut Game<'_>) -> Result<()> {
     let o = game.o;
     let cfg = game.c;
@@ -443,9 +436,8 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
             let mut f = raw.for_recognition(cfg)?;
             let mut d = game.vision.detect(&f)?;
             if i == 0 && jump {
-                let first = d.target.as_ref().map(|t| (t.x, t.y));
-                if d.piece.is_none()
-                    || first.is_none()
+                let first = d.aim();
+                if first.is_none()
                     || !game
                         .screen
                         .state(&f, cfg)?
@@ -462,9 +454,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                     .screen
                     .state(&f, cfg)?
                     .playable(&f, cfg, game.screen, &d)
-                    || !d.target.as_ref().is_some_and(|t| {
-                        confirmed(first, (t.x, t.y), cfg.f("target_consistency_px"))
-                    })
+                    || !d.aim().is_some_and(|aim| aim.confirmed(first, cfg))
                 {
                     return Err("无法确认新帧目标，取消试跳".into());
                 }
@@ -551,11 +541,11 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut alive = 0;
     let mut death_streak = 0;
     let mut ema = 0.;
-    let mut previous_center = None;
+    let mut previous_aim = None;
     let mut attempts = 0;
     let mut rejects = 0;
-    let mut blind = Some(0);
-    let mut last_hold: f64 = 0.;
+    // Only a measured jump that landed can supply a fallback duration.
+    let mut blind: Option<(f64, i64)> = None;
     let adaptive = !o.calibrate && cfg.f("gamma") > 0.;
     let mut last_error = None;
     let mut acquisition = Instant::now();
@@ -595,11 +585,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             };
             baseline = true;
             records.resync(None);
-            previous_center = None;
+            previous_aim = None;
             attempts = 0;
             rejects = 0;
             ema = 0.;
-            last_hold = 0.;
             pressed_button = None;
             last_error = None;
             let timeout = if interrupted {
@@ -609,7 +598,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 Some(sec(cfg.f("window_wait_s")))
             };
             // Reacquisition starts from a fresh board, including after a pause.
-            // Allow blind retries only after a new target passes both frame checks.
             blind = None;
             window = game.gate(false, timeout)?;
             if window.is_none() && !game.ctl.state().stopped {
@@ -643,7 +631,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                     "capture_blocked",
                     json!({"game_state":"capture_blocked","stop_reason":reason}),
                 );
-                previous_center = None;
+                previous_aim = None;
+                blind = None;
                 baseline = true;
                 attempts = 0;
                 game.vision.reset_prior();
@@ -677,7 +666,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if attempts >= cfg.i("detect_retry_limit") {
                 return Err("开始/重玩按钮持续未消失".into());
             }
-            previous_center = None;
+            previous_aim = None;
+            blind = None;
             baseline = true;
             game.vision.reset_prior();
             game.ctl.sleep(g, ms(1400.));
@@ -708,7 +698,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             pressed_button = None;
             blind = None;
             attempts = 0;
-            previous_center = None;
+            previous_aim = None;
             baseline = true;
             game.vision.reset_prior();
             game.ctl.sleep(g, ms(300.));
@@ -725,10 +715,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             k = base * o.calib_k_scales[band]
         }
         let k_before = k;
-        let pair = d.piece.as_ref().zip(d.target.as_ref());
-        let (dist, axis, hold, bias) = if let Some((p, t)) = pair {
-            let tol = cfg.f("target_consistency_px");
-            if !confirmed(previous_center.replace((t.x, t.y)), (t.x, t.y), tol) {
+        let pair = d.aim().zip(d.target.as_ref());
+        let (dist, axis, hold, bias) = if let Some((aim, t)) = pair {
+            if !aim.confirmed(previous_aim.replace(aim), cfg) {
                 attempts += 1;
                 if attempts >= cfg.i("detect_retry_limit") {
                     return Err("连续识别到的位置不稳定，已停止".into());
@@ -740,7 +729,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
             attempts = 0;
             let (axis, mut dist, cross) =
-                axis_components(t.x - p.x, t.y - p.y, cfg.f("axis_slope"));
+                axis_components(t.x - aim.piece.0, t.y - aim.piece.1, cfg.f("axis_slope"));
             if dist <= 0.
                 || dist < cfg.f("min_jump_dist_ratio") * f.width as f64 * 0.4
                 || dist > cfg.f("max_jump_dist_ratio") * f.width as f64
@@ -752,13 +741,12 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                         "沿轴距离或方向持续异常，已停止。本次距离 {dist:.1}px"
                     ));
                 }
-                previous_center = None;
+                previous_aim = None;
                 game.ctl.sleep(g, ms(250.));
                 window = Some((w, g));
                 continue;
             }
             rejects = 0;
-            blind = Some(0);
             if cfg.f("low_ratio_trim_ratio") > 0.
                 && t.top_width < cfg.f("low_ratio_gate") * t.bbox[2] as f64
             {
@@ -788,7 +776,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             );
             (Some(dist), axis, hold, bias)
         } else {
-            previous_center = None;
+            previous_aim = None;
             game.vision.reset_prior();
             attempts += 1;
             if attempts < cfg.i("detect_retry_limit") {
@@ -806,12 +794,14 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if d.piece.is_none() && cfg.b("piece_skin_shape_enabled") {
                 return Err("无法可靠识别人物或皮肤，已停止".into());
             }
-            let Some(used) = blind.as_mut().filter(|n| **n < cfg.i("blind_jump_limit")) else {
+            let Some((hold, used)) = blind
+                .as_mut()
+                .filter(|(_, n)| *n < cfg.i("blind_jump_limit"))
+            else {
                 return Err("识别重试次数已用尽".into());
             };
             *used += 1;
             attempts = 0;
-            let hold = if last_hold > 0. { last_hold } else { k * 270. };
             (
                 None,
                 (0., 0.),
@@ -837,7 +827,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
         }
         game.vision.reset_prior();
-        previous_center = None;
+        previous_aim = None;
         game.report("landing", json!({"last_hold_ms":hold,"last_dist_px":dist}));
         let land_start = Instant::now();
         let observation = game.settle(&w, g, records.prev, &f);
@@ -893,12 +883,14 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 &annotated(&f, &d),
             )
         }
+        blind = match (landed.result, dist) {
+            ("landed", Some(_)) => Some((hold, 0)),
+            ("landed", None) => blind,
+            _ => None,
+        };
         if landed.result == "landed" {
             alive += 1;
             death_streak = 0;
-            if dist.is_some() {
-                last_hold = hold
-            }
             if let (Some((e, width, _)), Some(dist)) = (err, dist) {
                 if o.calibrate {
                     calibration.push((hold, dist + e, dist, k))
@@ -1164,9 +1156,14 @@ mod tests {
         moved = w.clone();
         moved.pid += 1;
         assert!(!same_window(&w, &moved));
-        assert!(!confirmed(None, (120., 100.), 8.));
-        assert!(!confirmed(Some((110., 100.)), (120., 100.), 8.));
-        assert!(confirmed(Some((113., 105.)), (120., 100.), 8.));
+        use crate::vision::Aim;
+        let cfg = Config(json!({"target_consistency_px":8.0,"settle_anchor_tol_px":3.0}));
+        let frame = |piece, target| Aim { piece, target };
+        let current = frame((40., 150.), (120., 100.));
+        assert!(!current.confirmed(None, &cfg));
+        assert!(!current.confirmed(Some(frame((40., 150.), (110., 100.))), &cfg));
+        assert!(!current.confirmed(Some(frame((40., 156.), (120., 100.))), &cfg));
+        assert!(current.confirmed(Some(frame((42., 149.), (113., 105.))), &cfg));
     }
     #[test]
     fn cli_dashboard_replaces_complete_json_on_stop() {

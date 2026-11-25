@@ -31,6 +31,35 @@ pub struct Detection {
     pub block_mask: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Aim {
+    pub piece: (f64, f64),
+    pub target: (f64, f64),
+}
+
+impl Detection {
+    pub(crate) fn aim(&self) -> Option<Aim> {
+        let (piece, target) = self.piece.as_ref().zip(self.target.as_ref())?;
+        Some(Aim {
+            piece: (piece.x, piece.y),
+            target: (target.x, target.y),
+        })
+    }
+}
+
+pub(crate) fn points_close((x, y): (f64, f64), (u, v): (f64, f64), tolerance: f64) -> bool {
+    (x - u).abs() <= tolerance && (y - v).abs() <= tolerance
+}
+
+impl Aim {
+    pub(crate) fn confirmed(self, previous: Option<Self>, cfg: &Config) -> bool {
+        previous.is_some_and(|old| {
+            points_close(old.piece, self.piece, cfg.f("settle_anchor_tol_px"))
+                && points_close(old.target, self.target, cfg.f("target_consistency_px"))
+        })
+    }
+}
+
 fn check_frame(frame: &Frame) -> Result<(), String> {
     let area = frame.width.checked_mul(frame.height);
     if !frame.valid() || area.is_none_or(|n| n > i32::MAX as usize) {

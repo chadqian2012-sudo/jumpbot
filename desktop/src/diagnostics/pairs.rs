@@ -1,7 +1,7 @@
 use super::{median, name, paths, Report};
 use crate::{
     landing,
-    vision::{axis_components, find_dot_near, Vision},
+    vision::{axis_components, find_dot_near, points_close, Vision},
     Config, Frame,
 };
 use std::path::{Path, PathBuf};
@@ -183,10 +183,9 @@ pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usiz
                 }
                 let d = vision.detect_piece_only(&b)?;
                 let observed = d.piece.as_ref().map(|p| (p.x, p.y));
-                let close = previous.zip(observed).is_some_and(|((x, y), (u, v))| {
-                    (x - u).abs() <= cfg.f("settle_anchor_tol_px")
-                        && (y - v).abs() <= cfg.f("settle_anchor_tol_px")
-                });
+                let close = previous
+                    .zip(observed)
+                    .is_some_and(|(a, b)| points_close(a, b, cfg.f("settle_anchor_tol_px")));
                 stable = if close && landing::foot(&b, &d) {
                     stable + 1
                 } else {
@@ -215,17 +214,8 @@ pub(super) fn replay(cfg: &Config, debug: &Path, dir: Option<&Path>, limit: usiz
                 if !state.playable(&a, cfg, &screen, &d) {
                     break;
                 }
-                let current = d
-                    .piece
-                    .zip(d.target)
-                    .map(|(_, target)| (target.x, target.y));
-                if last
-                    .zip(current)
-                    .is_some_and(|((x, y), (u, v)): ((f64, f64), (f64, f64))| {
-                        (x - u).abs() <= cfg.f("target_consistency_px")
-                            && (y - v).abs() <= cfg.f("target_consistency_px")
-                    })
-                {
+                let current = d.aim();
+                if current.is_some_and(|aim| aim.confirmed(last, cfg)) {
                     acquired = true;
                     break;
                 }
