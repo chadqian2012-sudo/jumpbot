@@ -235,13 +235,18 @@ impl Layout {
                 };
                 rect(x, body + 113, width, 43)
             }
-            Ledger | Empty => rect(right + 16, split + 72, right_width - 32, h - split - 97),
+            LogSmaller | LogLarger => {
+                let inset = if id == LogSmaller { 84 } else { 48 };
+                rect(w - 24 - inset, split + 20, 32, 26)
+            }
+            Ledger | Empty => rect(right + 16, split + 57, right_width - 32, h - split - 85),
         };
         self.pixels(b)
     }
 }
 pub struct Fonts {
     pub body: HFONT,
+    pub log: HFONT,
     pub small: HFONT,
     pub strong: HFONT,
     pub latin: HFONT,
@@ -250,27 +255,32 @@ pub struct Fonts {
     pub section: HFONT,
 }
 impl Fonts {
-    pub unsafe fn new(l: Layout) -> Self {
-        let f = |face: &str, height, weight| {
-            CreateFontW(
-                -l.px(height),
-                0,
-                0,
-                0,
-                weight,
-                0,
-                0,
-                0,
-                1,
-                0,
-                0,
-                5,
-                0,
-                wide(face).as_ptr(),
-            )
-        };
+    unsafe fn make(l: Layout, face: &str, height: i32, weight: i32) -> HFONT {
+        CreateFontW(
+            -l.px(height),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            wide(face).as_ptr(),
+        )
+    }
+    pub unsafe fn log(l: Layout, size: i32) -> HFONT {
+        Self::make(l, "Microsoft YaHei UI", size, 400)
+    }
+    pub unsafe fn new(l: Layout, log_size: i32) -> Self {
+        let f = |face, height, weight| Self::make(l, face, height, weight);
         Self {
             body: f("Microsoft YaHei UI", 15, 400),
+            log: Self::log(l, log_size),
             small: f("Microsoft YaHei UI", 13, 400),
             strong: f("Microsoft YaHei UI", 16, 700),
             latin: f("Saira", 15, 700),
@@ -281,6 +291,7 @@ impl Fonts {
     }
     pub fn control(&self, id: Id) -> HFONT {
         match id {
+            Id::Ledger | Id::Empty => self.log,
             Id::Score => self.score,
             Id::Phase | Id::Primary | Id::Check | Id::Stop => self.strong,
             Id::Jumps | Id::Hit | Id::Land | Id::Elapsed | Id::Countdown => self.latin,
@@ -294,6 +305,7 @@ impl Drop for Fonts {
         unsafe {
             for h in [
                 self.body,
+                self.log,
                 self.small,
                 self.strong,
                 self.latin,
@@ -441,6 +453,12 @@ impl Scene {
         ] {
             box_at(x, y, w, h, c.panel);
             box_at(x, y, w, 1, c.rule);
+            if x == l.right() && y == right_split + 12 {
+                text(x + 16, y + 6, 120, 29, f.strong, c.ink, cn);
+                text(x + 96, y + 8, w - 190, 25, f.small, c.muted, "ACTIVITY");
+                box_at(x + 16, y + 37, w - 32, 1, c.rule);
+                continue;
+            }
             box_at(x, y, (68. * amount) as i32, 4, c.ink);
             text(x + 17, y + 8, w - 34, 19, f.latin, c.muted, en);
             text(x + 16, y + 26, w - 34, 30, f.section, c.ink, cn);
@@ -689,7 +707,8 @@ pub unsafe fn button(d: &DRAWITEMSTRUCT) {
                     c.panel
                 },
             );
-            let cut = s.layout.px(10);
+            let zoom = matches!(id, Some(Id::LogSmaller | Id::LogLarger));
+            let cut = s.layout.px(if zoom { 4 } else { 10 });
             let pts = [
                 POINT {
                     x: r.left,
@@ -715,7 +734,7 @@ pub unsafe fn button(d: &DRAWITEMSTRUCT) {
             SelectObject(dc, GetStockObject(DC_PEN));
             SelectObject(dc, GetStockObject(DC_BRUSH));
             SetDCBrushColor(dc, base);
-            SetDCPenColor(dc, if off { c.rule } else { c.ink });
+            SetDCPenColor(dc, if off || zoom { c.rule } else { c.ink });
             Polygon(dc, pts.as_ptr(), 5);
             if id == Some(Id::Primary) && !off {
                 fill(dc, rect(1, 1, s.layout.px(5), r.bottom - 2), AMBER);
