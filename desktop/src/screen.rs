@@ -444,13 +444,16 @@ pub(super) fn segment_glyphs(
 
 pub(super) fn glyph_feature(glyph: &GrayImage) -> opencv::Result<Vec<f32>> {
     let (w, h) = (glyph.width(), glyph.height());
-    let fitted = (w as f64 * 32. / h as f64).round_ties_even().clamp(1., 24.) as usize;
+    // Fit both axes: a full-width panel edge must stay a strip in the digit feature.
+    let scale = (24. / f64::from(w)).min(32. / f64::from(h));
+    let width = (f64::from(w) * scale).round_ties_even().max(1.) as usize;
+    let height = (f64::from(h) * scale).round_ties_even().max(1.) as usize;
     let raw = Mat::new_rows_cols_with_data(h as i32, w as i32, glyph.as_raw())?;
     let mut scaled = Mat::default();
     imgproc::resize(
         &raw,
         &mut scaled,
-        Size::new(fitted as i32, 32),
+        Size::new(width as i32, height as i32),
         0.,
         0.,
         imgproc::INTER_AREA,
@@ -458,10 +461,10 @@ pub(super) fn glyph_feature(glyph: &GrayImage) -> opencv::Result<Vec<f32>> {
     let mut out = vec![0.; 24 * 32];
     for (src, row) in scaled
         .data_bytes()?
-        .chunks_exact(fitted)
-        .zip(out.as_chunks_mut::<24>().0)
+        .chunks_exact(width)
+        .zip(out.as_chunks_mut::<24>().0.iter_mut().skip((32 - height) / 2))
     {
-        for (&p, v) in src.iter().zip(&mut row[(24 - fitted) / 2..]) {
+        for (&p, v) in src.iter().zip(&mut row[(24 - width) / 2..]) {
             *v = f32::from(p) / 255.
         }
     }
@@ -1792,6 +1795,36 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn score_rejects_a_panel_edge_but_reads_narrow_and_wide_digits() {
+        let mut cfg = Config::default();
+        cfg.0["score_roi"] = serde_json::json!([0., 0., 1., 1.]);
+        let dir = crate::asset_dir().join("templates");
+        let screen = Screen::new(&dir, &cfg).unwrap();
+
+        // The two recorded result pages have a 398 x 47 panel edge in a 398 x 116 ROI.
+        let mut frame = Frame {
+            width: 398,
+            height: 116,
+            bgr: vec![255; 398 * 116 * 3],
+        };
+        frame.bgr[69 * 398 * 3..].fill(0);
+        assert_eq!(screen.score(&frame, &cfg), None);
+
+        for (digit, width) in [(1, 17), (8, 34), (8, 41)] {
+            let template = image::open(dir.join(format!("digit_{digit}.png"))).unwrap();
+            let mut glyph = template.resize_exact(width, 43, image::imageops::FilterType::Triangle);
+            glyph.invert();
+            // A tight crop may touch every edge and still contain a complete digit.
+            let frame = Frame {
+                width: width as usize,
+                height: 43,
+                bgr: glyph.to_rgb8().into_raw(),
+            };
+            assert_eq!(screen.score(&frame, &cfg), Some(digit), "width {width}");
+        }
+    }
+
     #[test]
     fn pasted_buttons_return_their_center_after_frame_dimensions_change() {
         let dir = crate::asset_dir().join("templates");

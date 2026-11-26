@@ -155,6 +155,9 @@ pub struct Console {
     pub log_sequence: u64,
     pub landed: Option<Jump>,
 }
+const LANDING_RETRY_NOTE: &str = "本次按压已释放，只读取游戏画面，不会重复按压。";
+const LANDING_PAUSE_NOTE: &str = "请查看游戏后再恢复。";
+
 impl Console {
     pub fn new(error: Option<String>) -> Self {
         Self {
@@ -212,8 +215,16 @@ impl Console {
         }
         if matches!(self.mode, Mode::Live | Mode::Stopping) {
             let phase = s["state"].as_str().unwrap_or("starting");
-            if s["state"] != self.status["state"] || s["stop_reason"] != self.status["stop_reason"]
+            let state_changed = s["state"] != self.status["state"];
+            if phase == "paused"
+                && (state_changed || s["control_generation"] != self.status["control_generation"])
             {
+                match s["landing_pause_reason"].as_str() {
+                    Some(reason) => self.log(format!("已暂停。{reason}。{LANDING_PAUSE_NOTE}")),
+                    None => self.log("已暂停，可以切换窗口。".into()),
+                }
+            }
+            if state_changed || s["stop_reason"] != self.status["stop_reason"] {
                 let reason = s["stop_reason"].as_str().unwrap_or("");
                 match phase {
                     "waiting_window" | "capture_blocked" | "blocked_modal" | "result_pending"
@@ -222,7 +233,9 @@ impl Console {
                     {
                         self.log(reason.to_owned())
                     }
-                    "paused" => self.log("已暂停，可以切换窗口。".into()),
+                    "landing_retry" if state_changed => {
+                        self.log(format!("正在复核落点。{LANDING_RETRY_NOTE}"))
+                    }
                     "resuming" => self.log("正在重新获取游戏窗口。".into()),
                     "countdown" => self.log(format!(
                         "已找到游戏窗口，准备开始。进程 {}",
@@ -335,11 +348,15 @@ impl Console {
             "waiting_window" => ("等待游戏窗口", "请在微信里手动打开「跳一跳」。"),
             "countdown" => ("启动倒计时", "倒计时结束后开始识别画面。"),
             "resuming" => ("正在恢复", "重新查找窗口并采集新画面。"),
+            "paused" if self.status["landing_pause_reason"].is_string() => {
+                ("已暂停", LANDING_PAUSE_NOTE)
+            }
             "paused" => ("已暂停", "现在可以切换窗口。"),
             "pausing" => ("正在暂停", "正在等待当前按压结束。"),
             "playing" => ("运行中", "正在识别棋子与目标。"),
             "acquiring" => ("正在识别", "正在寻找可用的游戏画面。"),
             "landing" => ("正在核对落点", "本次按压已释放，正在读取落点。"),
+            "landing_retry" => ("正在复核落点", LANDING_RETRY_NOTE),
             "capture_blocked" => (
                 "无法读取画面",
                 self.status["stop_reason"]
@@ -442,6 +459,46 @@ mod tests {
             assert_eq!(after.target_tile, turn.to);
             assert_eq!(turn.pose(interrupt + turn.duration()), turn.rest());
         }
+    }
+    #[test]
+    fn landing_retry_keeps_controls_and_only_logs_the_transition() {
+        let mut s = Console::new(None);
+        s.started(false);
+        let mut packet = json!({"state":"landing","hotkey_registered":true,"control_generation":0});
+        s.update(packet.clone());
+        let jump = s.landed;
+        packet["state"] = "landing_retry".into();
+        s.update(packet.clone());
+        assert_eq!(s.labels(), ("正在复核落点", LANDING_RETRY_NOTE));
+        assert!(s.primary_enabled());
+        assert_eq!(s.primary_label(), "暂停运行");
+        assert!(!s.is_charging());
+        s.log("其他事件".into());
+        packet["stop_reason"] = "采集异常".into();
+        s.update(packet.clone());
+        assert_eq!(s.log_sequence, 2);
+        assert_eq!(s.landed, jump);
+
+        packet["state"] = "paused".into();
+        packet["control_generation"] = 1.into();
+        packet["landing_pause_reason"] = "落点仍未确认".into();
+        s.update(packet.clone());
+        assert_eq!(s.labels(), ("已暂停", LANDING_PAUSE_NOTE));
+        assert_eq!(
+            s.logs.back().unwrap(),
+            "已暂停。落点仍未确认。请查看游戏后再恢复。"
+        );
+        assert!(s.primary_enabled());
+        assert_eq!(s.primary_label(), "恢复运行");
+        s.update(packet.clone());
+        assert_eq!(s.log_sequence, 3);
+
+        // Resume and a new manual pause can arrive between two UI updates.
+        packet["control_generation"] = 3.into();
+        packet["landing_pause_reason"] = Value::Null;
+        s.update(packet);
+        assert_eq!(s.labels(), ("已暂停", "现在可以切换窗口。"));
+        assert_eq!(s.logs.back().unwrap(), "已暂停，可以切换窗口。");
     }
     #[test]
     fn generation_conflict_and_stop_gate_controls() {
