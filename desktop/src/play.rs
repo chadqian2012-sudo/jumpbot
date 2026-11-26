@@ -4,7 +4,7 @@ use crate::{
     landing,
     options::Options,
     platform::{CaptureMode, PressOutcome, Window},
-    records::Records,
+    records::{same_game_score, Records},
     runtime::{annotated, detection},
     screen::{Screen, ScreenState},
     vision::{axis_components, points_close, Detection, Vision},
@@ -182,10 +182,10 @@ impl Game<'_> {
             eprintln!("{e}")
         }
     }
-    fn landing_readout(&mut self, f: &Frame) -> Result<(Option<&'static str>, Option<i32>)> {
+    fn landing_readout(&mut self, f: &Frame, previous: Option<i32>) -> Result<LandingReadout> {
         let state = self.screen.state(f, self.c)?;
         if state.is_result() {
-            return Ok((Some("dead"), None));
+            return Ok(LandingReadout::Dead);
         }
         let board = match state {
             ScreenState::Board => true,
@@ -195,18 +195,22 @@ impl Game<'_> {
             _ => false,
         };
         if board {
-            Ok((None, self.screen.score(f, self.c)))
+            Ok(LandingReadout::board(
+                self.screen.score(f, self.c),
+                previous,
+            ))
         } else {
-            Ok((Some("unknown"), None))
+            Ok(LandingReadout::Unclear)
         }
     }
     fn settle(
         &mut self,
         w: &Window,
         g: u64,
-        previous: Option<i32>,
+        scores: &Records,
         before: &Frame,
     ) -> Result<Option<Landing>> {
+        let previous = scores.prev;
         let reference = before.motion_sample(self.c)?;
         let mut departed = false;
         let mut small = None;
@@ -214,7 +218,11 @@ impl Game<'_> {
         let mut stable = 0;
         let mut outcome = Landing::default();
         let start = Instant::now();
-        while start.elapsed() < sec(self.c.f("settle_timeout_s")) {
+        let timeout = sec(self.c.f("settle_timeout_s"));
+        let deadline = timeout.saturating_mul(2);
+        let mut last_score = None;
+        while start.elapsed() < deadline {
+            let retry = start.elapsed() >= timeout;
             if self.ctl.state().stopped {
                 outcome.result = "stopped";
                 return Ok(Some(outcome));
@@ -223,13 +231,30 @@ impl Game<'_> {
                 if self.status["state"] != "pausing" {
                     self.report("pausing", json!({}))
                 }
-                if !w.is_foreground() {
-                    return Ok(Some(Landing::default()));
+                if retry || !w.is_foreground() {
+                    return Ok(Some(outcome));
                 }
+            } else if retry && self.status["state"] != "landing_retry" {
+                self.report("landing_retry", json!({}));
             }
-            let Some(frame) = self.recognition_frame(w)? else {
-                return Ok(None);
+            let frame = match self.recognition_frame(w) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(None),
+                Err(reason) => {
+                    // A gap breaks consecutive-frame evidence. Only observe until the deadline.
+                    outcome.error = Some(reason);
+                    small = None;
+                    anchor = None;
+                    stable = 0;
+                    last_score = None;
+                    self.ctl.sleep(
+                        self.ctl.generation(),
+                        ms(200.).min(deadline.saturating_sub(start.elapsed())),
+                    );
+                    continue;
+                }
             };
+            outcome.error = None;
             let current = frame.motion_sample(self.c)?;
             let mean_diff = |a: &[u8], b: &[u8]| {
                 a.iter()
@@ -259,90 +284,123 @@ impl Game<'_> {
                 anchor = None;
                 stable = 0
             }
+            let supported = stable >= self.c.i("settle_frames").max(1);
+            if supported || retry {
+                let t = Instant::now();
+                let reading = self.landing_readout(&frame, scores.last_known_score)?;
+                (outcome.result, outcome.score) =
+                    reading.verdict(supported, previous.filter(|_| departed), &mut last_score);
+                outcome.score_ms += t.elapsed().as_secs_f64() * 1000.;
+            }
             outcome.frame = Some(frame);
-            if stable >= self.c.i("settle_frames").max(1) {
-                outcome.result = "landed";
+            if outcome.result != "unknown" {
                 break;
             }
+            let poll = if retry {
+                ms(100.)
+            } else {
+                ms(self.c.f("settle_poll_ms"))
+            };
             self.ctl.sleep(
                 self.ctl.generation(),
-                ms(self.c.f("settle_poll_ms"))
-                    .max(self.frame_period)
-                    .min(sec(self.c.f("settle_timeout_s")).saturating_sub(start.elapsed())),
+                poll.max(self.frame_period)
+                    .min(deadline.saturating_sub(start.elapsed())),
             );
         }
         let t = Instant::now();
-        if let Some(f) = &outcome.frame {
-            let (result, score) = self.landing_readout(f)?;
-            if let Some(result) = result {
-                outcome.result = result;
-            }
-            outcome.score = score;
-        }
-        if outcome.result != "dead" && previous.is_some() {
+        if outcome.result == "landed" && previous.is_some() {
             for delay in [self.c.f("score_reread_first_ms"), 250., 250.] {
                 if outcome.score.is_some() && outcome.score != previous {
                     break;
                 }
-                if self.ctl.state().stopped || self.ctl.generation() != g {
+                if self.ctl.guard(g, true).is_err() {
                     break;
                 }
                 self.ctl.sleep(g, ms(delay));
                 if self.ctl.guard(g, true).is_err() {
                     break;
                 }
-                let Some(f) = self.recognition_frame(w)? else {
-                    return Ok(None);
+                // The landing is already confirmed. A missing HUD sample cannot undo it.
+                let f = match self.recognition_frame(w) {
+                    Ok(Some(f)) => f,
+                    _ => break,
                 };
-                let (result, score) = self.landing_readout(&f)?;
-                if let Some(result) = result {
-                    outcome.result = result;
-                    outcome.score = None;
-                    outcome.frame = Some(f);
-                    outcome.detect = None;
-                    if result == "dead" {
+                match self.landing_readout(&f, scores.last_known_score)? {
+                    LandingReadout::Dead => {
+                        outcome.result = "dead";
+                        outcome.score = None;
+                        outcome.frame = Some(f);
+                        outcome.detect = None;
                         break;
                     }
-                }
-                if let Some(n) = score {
-                    outcome.score = Some(n)
+                    LandingReadout::Board(Some(n)) => outcome.score = Some(n),
+                    _ => {}
                 }
             }
         }
-        outcome.result = score_verdict(outcome.result, previous, outcome.score);
-        if !w.still_current()? {
+        if outcome.result == "unknown" && !w.still_current()? {
             return Ok(None);
         }
-        outcome.score_ms = t.elapsed().as_secs_f64() * 1000.;
+        outcome.score_ms += t.elapsed().as_secs_f64() * 1000.;
         Ok(Some(outcome))
     }
 }
-fn score_verdict(observed: &'static str, previous: Option<i32>, now: Option<i32>) -> &'static str {
-    if observed == "unknown" && previous.zip(now).is_some_and(|(a, b)| b > a) {
-        "landed"
-    } else {
-        observed
+enum LandingReadout {
+    Board(Option<i32>),
+    Dead,
+    Unclear,
+}
+impl LandingReadout {
+    fn board(raw: Option<i32>, previous: Option<i32>) -> Self {
+        Self::Board(same_game_score(previous, raw))
+    }
+
+    fn verdict(
+        self,
+        supported: bool,
+        takeoff_score: Option<i32>,
+        last: &mut Option<i32>,
+    ) -> (&'static str, Option<i32>) {
+        match self {
+            Self::Dead => ("dead", None),
+            Self::Unclear => {
+                *last = None;
+                ("unknown", None)
+            }
+            Self::Board(score) => {
+                let repeated_gain =
+                    score == *last && takeoff_score.zip(score).is_some_and(|(old, n)| n > old);
+                *last = score.filter(|_| takeoff_score.is_some());
+                if supported || repeated_gain {
+                    ("landed", score)
+                } else {
+                    ("unknown", None)
+                }
+            }
+        }
     }
 }
 struct Landing {
     result: &'static str,
+    error: Option<String>,
     score: Option<i32>,
     frame: Option<Frame>,
     detect: Option<Detection>,
     score_ms: f64,
 }
 impl Landing {
-    fn after_input(observation: Result<Self>) -> (Self, Option<String>) {
-        match observation {
-            Ok(landed) => (landed, None),
-            Err(reason) => (Self::default(), Some(reason)),
-        }
+    fn after_input(observation: Result<Self>) -> Self {
+        observation.unwrap_or_else(|reason| Self {
+            error: Some(reason),
+            ..Self::default()
+        })
     }
 }
 impl Default for Landing {
     fn default() -> Self {
         Self {
             result: "unknown",
+            error: None,
             score: None,
             frame: None,
             detect: None,
@@ -651,7 +709,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             );
             if pressed_button != Some(dead) {
                 match game.press(&w, g, (p[0] / f.width as f64, p[1] / f.height as f64), 60.)? {
-                    PressOutcome::Sent => pressed_button = Some(dead),
+                    PressOutcome::Sent => {
+                        pressed_button = Some(dead);
+                        records.resync(None);
+                    }
                     PressOutcome::WindowChanged => continue,
                     PressOutcome::Suppressed => {
                         window = Some((w, g));
@@ -703,7 +764,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         pressed_button = None;
         if baseline {
             blind = None;
-            records.resync(game.screen.score(&f, cfg));
+            records.resync_same_game(game.screen.score(&f, cfg));
             baseline = false
         }
         game.report("acquiring",json!({"piece_source":d.piece.as_ref().map(|p|p.source),"piece_shape_score":d.piece.as_ref().map(|p|p.shape_score),"game_state":"playing","stop_reason":"","score":records.prev}));
@@ -829,9 +890,9 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         previous_aim = None;
         game.report("landing", json!({"last_hold_ms":hold,"last_dist_px":dist}));
         let land_start = Instant::now();
-        let observation = game.settle(&w, g, records.prev, &f);
+        let observation = game.settle(&w, g, &records, &f);
         let changed = matches!(observation, Ok(None));
-        let (mut landed, settle_error) = Landing::after_input(
+        let mut landed = Landing::after_input(
             observation.and_then(|o| o.ok_or_else(|| "落地观测期间客户区已变化".to_string())),
         );
         if game.ctl.state().stopped && landed.result == "unknown" {
@@ -922,7 +983,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
         }
         let outcome = records.judge(landed.result, landed.score, cfg.i("score_bonus_cap") as i32);
-        if o.save_debug || outcome.result == "dead" || outcome.hit == Some(false) {
+        let unresolved = outcome.result == "unknown" && game.ctl.guard(g, true).is_ok();
+        if o.save_debug || outcome.result == "dead" || outcome.hit == Some(false) || unresolved {
             let id = chrono::Local::now().format("%Y%m%d_%H%M%S_%f").to_string();
             let tag = if outcome.hit == Some(false) {
                 "miss"
@@ -957,7 +1019,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             cfg.f("center_hit_tolerance_px"),
             t,
             dot_error,
-            settle_error
+            landed
+                .error
                 .as_deref()
                 .unwrap_or(if dist.is_none() { "盲跳" } else { "" }),
         )?;
@@ -980,16 +1043,22 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         if game.ctl.state().stopped {
             break End::Stopped;
         }
+        if unresolved {
+            // A replacement game has its own startup gate. A moved instance may still
+            // show the original board, so it needs the same explicit resume as a timeout.
+            let same_game = !changed || w.same_instance_exists();
+            let reason = landed
+                .error
+                .as_deref()
+                .unwrap_or("棋子和分数都未能确认本跳结果");
+            if same_game && game.ctl.pause_if_current(g, reason) {
+                game.report("pausing", json!({}));
+                window = Some((w, g));
+                continue;
+            }
+        }
         if changed {
             continue;
-        }
-        if outcome.result == "unknown"
-            && game.ctl.guard(g, true).is_ok()
-            && Window::find(cfg, (1, 1))?.is_some_and(|fresh| same_window(&w, &fresh))
-        {
-            return Err(
-                settle_error.unwrap_or_else(|| "无法确认本跳是否完成，已停止以免重复按压".into())
-            );
         }
         acquisition = Instant::now();
         if records.stalled >= 3 {
@@ -1098,7 +1167,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut r = Records::new(dir.path().into());
         r.resync(Some(10));
-        let (landing, error) = Landing::after_input(Err("capture failed".into()));
+        let landing = Landing::after_input(Err("capture failed".into()));
         let o = r.judge(landing.result, landing.score, 32);
         r.emit(
             o,
@@ -1116,7 +1185,7 @@ mod tests {
             12.,
             None,
             None,
-            error.as_deref().unwrap(),
+            landing.error.as_deref().unwrap(),
         )?;
         let mut reader = csv::Reader::from_path(&r.path).unwrap();
         let rows = reader
@@ -1131,13 +1200,40 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn late_score_requires_a_baseline_and_cannot_override_game_over() {
-        assert_eq!(score_verdict("unknown", Some(10), Some(12)), "landed");
-        for previous in [Some(12), None] {
-            assert_eq!(score_verdict("unknown", previous, Some(12)), "unknown")
+    fn late_hud_requires_consecutive_gains_or_a_supported_landing() {
+        let previous = Some(467);
+        let mut last = None;
+        for _ in 0..2 {
+            assert_eq!(
+                LandingReadout::board(Some(499), previous).verdict(false, None, &mut last),
+                ("unknown", None)
+            );
         }
-        for known in ["dead", "stopped"] {
-            assert_eq!(score_verdict(known, Some(10), Some(12)), known)
+        assert_eq!(
+            LandingReadout::board(Some(499), previous).verdict(false, previous, &mut last),
+            ("unknown", None)
+        );
+        let mut read = |raw, supported| {
+            LandingReadout::board(raw, previous).verdict(supported, previous, &mut last)
+        };
+        for raw in [Some(8), Some(467), None, Some(499), Some(8), Some(499)] {
+            assert_eq!(read(raw, false), ("unknown", None));
+        }
+        assert_eq!(read(Some(499), false), ("landed", Some(499)));
+        assert_eq!(read(Some(8), true), ("landed", None));
+        assert_eq!(
+            LandingReadout::Unclear.verdict(true, previous, &mut last),
+            ("unknown", None)
+        );
+        assert_eq!(
+            LandingReadout::Dead.verdict(true, previous, &mut last),
+            ("dead", None)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                LandingReadout::board(Some(8), None).verdict(false, None, &mut last),
+                ("unknown", None)
+            );
         }
     }
     #[test]

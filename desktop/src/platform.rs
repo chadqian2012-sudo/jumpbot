@@ -248,11 +248,15 @@ impl Window {
         self.hwnd as HWND
     }
 
+    pub(crate) fn same_instance_exists(&self) -> bool {
+        pid(self.handle()) == self.pid
+    }
+
     pub(crate) fn still_current(&self) -> Result<bool> {
         let _dpi = PhysicalPixels::enter()?;
         let hwnd = self.handle();
         if unsafe { IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 }
-            || pid(hwnd) != self.pid
+            || !self.same_instance_exists()
             || title(hwnd) != self.title
         {
             return Ok(false);
@@ -261,7 +265,7 @@ impl Window {
     }
 
     pub fn is_foreground(&self) -> bool {
-        unsafe { GetForegroundWindow() == self.handle() && pid(self.handle()) == self.pid }
+        unsafe { GetForegroundWindow() == self.handle() && self.same_instance_exists() }
     }
 
     /// One foreground request. The owner handles countdown, retries and pause.
@@ -997,6 +1001,10 @@ mod tests {
                 client_rect: client_rect(hwnd).unwrap().expect("fixture has a client area"),
             };
             assert_eq!(window.title, caption);
+            ShowWindow(hwnd, SW_HIDE);
+            assert!(window.same_instance_exists());
+            assert_eq!(window.still_current(), Ok(false));
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // A visible HWND may temporarily have no drawable client area during a resize.
             assert_ne!(
                 SetWindowPos(hwnd, null_mut(), 30, 30, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER),
@@ -1125,6 +1133,7 @@ mod tests {
             drop(keys);
             drop(Hotkeys::register("Ctrl+Shift+7").unwrap());
             assert_ne!(DestroyWindow(hwnd), 0);
+            assert!(!window.same_instance_exists());
         }
     }
 
