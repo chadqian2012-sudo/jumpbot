@@ -2497,8 +2497,6 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 animating = v.sync(&host.ui);
-                // Present the parent and every invalidated child in the same frame.
-                RedrawWindow(hwnd, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
             } else {
                 let got = GetMessageW(&mut msg, null_mut(), 0, 0);
                 if got < 0 {
@@ -2513,6 +2511,12 @@ pub fn run(mut host: Host) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if need_sync {
                     animating = v.sync(&host.ui);
+                    if msg.hwnd == hwnd
+                        && msg.message == ACTION
+                        && matches!(Id::from_raw(msg.wParam), Some(Primary | Check))
+                    {
+                        last_poll = Instant::now();
+                    }
                     if animating {
                         next_frame = Instant::now() + frame;
                     }
