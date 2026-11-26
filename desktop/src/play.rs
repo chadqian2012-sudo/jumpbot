@@ -613,6 +613,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut band_ok = 0;
     let mut band_attempts = 0;
     let mut baseline = true;
+    let mut score_window = None;
     let mut last_progress = game.ctl.clock();
     let mut warned = false;
     let limit = cfg.0["max_jumps"].as_u64().unwrap();
@@ -642,7 +643,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 Window::find(cfg, (1, 1))?.is_none()
             };
             baseline = true;
-            records.resync(None);
             previous_aim = None;
             attempts = 0;
             rejects = 0;
@@ -711,7 +711,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 match game.press(&w, g, (p[0] / f.width as f64, p[1] / f.height as f64), 60.)? {
                     PressOutcome::Sent => {
                         pressed_button = Some(dead);
-                        records.resync(None);
+                        score_window = None;
                     }
                     PressOutcome::WindowChanged => continue,
                     PressOutcome::Suppressed => {
@@ -764,7 +764,13 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         pressed_button = None;
         if baseline {
             blind = None;
-            records.resync_same_game(game.screen.score(&f, cfg));
+            let session = (w.hwnd, w.pid, g);
+            let score = game.screen.score(&f, cfg);
+            if score_window.replace(session) == Some(session) {
+                records.resync_same_game(score);
+            } else {
+                records.resync(score);
+            }
             baseline = false
         }
         game.report("acquiring",json!({"piece_source":d.piece.as_ref().map(|p|p.source),"piece_shape_score":d.piece.as_ref().map(|p|p.shape_score),"game_state":"playing","stop_reason":"","score":records.prev}));

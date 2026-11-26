@@ -44,7 +44,7 @@ pub(crate) struct Records {
     all: Counts,
     recent: VecDeque<Outcome>,
     pub index: u64,
-    /// Score immediately before this jump, if the previous observation was readable.
+    /// Baseline for one jump. A missing or late score update breaks the delta chain.
     pub prev: Option<i32>,
     /// Same-game lower bound, including across unreadable jumps.
     pub last_known_score: Option<i32>,
@@ -81,8 +81,10 @@ impl Records {
         self.resync_same_game(score);
     }
     pub fn resync_same_game(&mut self, reading: Option<i32>) {
-        self.prev = same_game_score(self.last_known_score, reading);
-        self.last_known_score = self.prev.or(self.last_known_score);
+        let score = same_game_score(self.last_known_score, reading);
+        // Seeing the pre-gap value again does not recover a missing jump's score.
+        self.prev = score.filter(|_| self.prev.is_some() || score != self.last_known_score);
+        self.last_known_score = score.or(self.last_known_score);
         self.streak = 0;
         self.stalled = 0;
     }
@@ -90,27 +92,30 @@ impl Records {
         let score = same_game_score(self.last_known_score, score);
         let mut hit = None;
         if let ("landed", Some(now)) = (result, score) {
-            if let Some(prev) = self.prev {
-                let delta = now - prev;
-                let delayed = self.stalled > 0;
-                self.stalled = if delta == 0 { self.stalled + 1 } else { 0 };
-                if delayed && delta != 0 {
-                    self.streak = 0
-                } else if delta == 1 {
-                    hit = Some(false);
-                    self.streak = 0
-                } else if delta > 0
-                    && delta <= 200
-                    && delta == self.streak.saturating_add(1).saturating_mul(2).min(cap)
-                {
-                    hit = Some(true);
-                    self.streak = self.streak.saturating_add(1)
-                } else if (4..=cap.min(200)).contains(&delta) && delta % 2 == 0 {
-                    hit = Some(true);
-                    self.streak = delta / 2
+            let advanced = self.last_known_score != Some(now);
+            if advanced {
+                self.stalled = 0;
+                if let Some(prev) = self.prev {
+                    let delta = now - prev;
+                    if delta == 1 {
+                        hit = Some(false);
+                        self.streak = 0
+                    } else if delta <= 200
+                        && delta == self.streak.saturating_add(1).saturating_mul(2).min(cap)
+                    {
+                        hit = Some(true);
+                        self.streak = self.streak.saturating_add(1)
+                    } else if (4..=cap.min(200)).contains(&delta) && delta % 2 == 0 {
+                        hit = Some(true);
+                        self.streak = delta / 2
+                    }
+                } else {
+                    self.streak = 0;
                 }
+            } else {
+                self.stalled += 1;
             }
-            self.prev = Some(now);
+            self.prev = advanced.then_some(now);
             self.last_known_score = Some(now);
             self.best_score = Some(self.best_score.map_or(now, |old| old.max(now)));
             self.best_streak = self.best_streak.max(self.streak);
@@ -235,6 +240,10 @@ mod tests {
         let mut r = Records::new(PathBuf::new());
         r.resync(Some(10));
         assert_eq!(r.judge("landed", None, 32).hit, None);
+        let late = r.judge("landed", Some(10), 32);
+        assert_eq!((late.score, late.hit, r.prev), (Some(10), None, None));
+        r.resync_same_game(Some(10));
+        assert_eq!(r.prev, None);
         assert_eq!(r.judge("landed", Some(14), 32).hit, None);
         assert_eq!(r.judge("landed", Some(15), 32).hit, Some(false));
     }
