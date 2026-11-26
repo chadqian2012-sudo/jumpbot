@@ -168,9 +168,9 @@ fn consider(selection: &mut Selection, new: (Rect, SkinMatch)) {
 pub(crate) struct SkinScratch {
     lab: Mat,
     gray: Mat,
-    edges: Mat,
-    edge: Mat,
     channels: Vector<Mat>,
+    edge_bufs: [Vec<u8>; 4],
+    pool: Option<crate::screen::WorkPool>,
     widths: Vec<i32>,
     median_buf: Vec<i32>,
 }
@@ -195,10 +195,40 @@ fn count_nonzero_bytes(bytes: &[u8]) -> usize {
     active + bytes[offset..].iter().filter(|&&b| b != 0).count()
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn or_assign_avx2(dst: &mut [u8], src: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let n = dst.len().min(src.len());
+    let mut offset = 0usize;
+    for (d, s) in dst[..n]
+        .as_chunks_mut::<32>()
+        .0
+        .iter_mut()
+        .zip(src[..n].as_chunks::<32>().0)
+    {
+        // SAFETY: AVX2 support is verified by caller and 32-byte slices stay in bounds.
+        unsafe {
+            let va = _mm256_loadu_si256(d.as_ptr().cast());
+            let vb = _mm256_loadu_si256(s.as_ptr().cast());
+            _mm256_storeu_si256(d.as_mut_ptr().cast(), _mm256_or_si256(va, vb));
+        }
+        offset += 32;
+    }
+    offset
+}
+
+#[cfg(test)]
 fn or_assign_bytes(dst: &mut [u8], src: &[u8]) {
     let n = dst.len().min(src.len());
-    let (dst_words, dst_tail) = dst[..n].as_chunks_mut::<8>();
-    let (src_words, src_tail) = src[..n].as_chunks::<8>();
+    let mut offset = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support is verified above.
+        offset = unsafe { or_assign_avx2(dst, src) };
+    }
+    let (dst_words, dst_tail) = dst[offset..n].as_chunks_mut::<8>();
+    let (src_words, src_tail) = src[offset..n].as_chunks::<8>();
     for (d, s) in dst_words.iter_mut().zip(src_words) {
         let a = u64::from_ne_bytes(*d);
         let b = u64::from_ne_bytes(*s);
@@ -206,6 +236,58 @@ fn or_assign_bytes(dst: &mut [u8], src: &[u8]) {
     }
     for (d, &s) in dst_tail.iter_mut().zip(src_tail) {
         *d |= s;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn or4_avx2(dst: &mut [u8], a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let n = dst.len().min(a.len()).min(b.len()).min(c.len());
+    let mut offset = 0usize;
+    for (((d, sa), sb), sc) in dst[..n]
+        .as_chunks_mut::<32>()
+        .0
+        .iter_mut()
+        .zip(a[..n].as_chunks::<32>().0)
+        .zip(b[..n].as_chunks::<32>().0)
+        .zip(c[..n].as_chunks::<32>().0)
+    {
+        // SAFETY: AVX2 support is verified by caller and 32-byte slices stay in bounds.
+        unsafe {
+            let vd = _mm256_loadu_si256(d.as_ptr().cast());
+            let va = _mm256_loadu_si256(sa.as_ptr().cast());
+            let vb = _mm256_loadu_si256(sb.as_ptr().cast());
+            let vc = _mm256_loadu_si256(sc.as_ptr().cast());
+            let merged = _mm256_or_si256(_mm256_or_si256(vd, va), _mm256_or_si256(vb, vc));
+            _mm256_storeu_si256(d.as_mut_ptr().cast(), merged);
+        }
+        offset += 32;
+    }
+    offset
+}
+
+fn or4_bytes(dst: &mut [u8], a: &[u8], b: &[u8], c: &[u8]) {
+    let n = dst.len().min(a.len()).min(b.len()).min(c.len());
+    let mut offset = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 support is verified above.
+        offset = unsafe { or4_avx2(dst, a, b, c) };
+    }
+    let (d_words, d_tail) = dst[offset..n].as_chunks_mut::<8>();
+    let (a_words, a_tail) = a[offset..n].as_chunks::<8>();
+    let (b_words, b_tail) = b[offset..n].as_chunks::<8>();
+    let (c_words, c_tail) = c[offset..n].as_chunks::<8>();
+    for (((d, sa), sb), sc) in d_words.iter_mut().zip(a_words).zip(b_words).zip(c_words) {
+        let merged = u64::from_ne_bytes(*d)
+            | u64::from_ne_bytes(*sa)
+            | u64::from_ne_bytes(*sb)
+            | u64::from_ne_bytes(*sc);
+        *d = merged.to_ne_bytes();
+    }
+    for (((d, &sa), &sb), &sc) in d_tail.iter_mut().zip(a_tail).zip(b_tail).zip(c_tail) {
+        *d |= sa | sb | sc;
     }
 }
 
@@ -390,7 +472,7 @@ impl Scene<'_> {
         widths.extend(
             mask.data_bytes()?
                 .chunks_exact(b.width as usize)
-                .map(|row| row.iter().filter(|&&p| p != 0).count() as i32),
+                .map(|row| count_nonzero_bytes(row) as i32),
         );
         if !has_waist(widths, median_buf) {
             return Ok(false);
@@ -480,24 +562,103 @@ fn visit(
         }
     }
     let top = (f64::from(height) * 0.35) as i32;
+    let crop_rows = height - top;
+    let crop_cols = width;
     let borrowed = crate::template::bgr(frame)?;
-    let crop = borrowed.roi(Rect::new(0, top, width, height - top))?;
+    let crop = borrowed.roi(Rect::new(0, top, width, crop_rows))?;
     imgproc::cvt_color_def(&crop, &mut scratch.lab, imgproc::COLOR_BGR2Lab)?;
     imgproc::cvt_color_def(&crop, &mut scratch.gray, imgproc::COLOR_BGR2GRAY)?;
-    imgproc::canny_def(&scratch.gray, &mut scratch.edges, 25., 70.)?;
     core::split(&scratch.lab, &mut scratch.channels)?;
-    let channel_count = scratch.channels.len();
-    {
-        let combined = scratch.edges.data_bytes_mut()?;
-        for i in 0..channel_count {
-            let channel = scratch.channels.get(i)?;
-            imgproc::canny_def(&channel, &mut scratch.edge, 20., 60.)?;
-            or_assign_bytes(combined, scratch.edge.data_bytes()?);
+    let crop_len = crop_rows as usize * crop_cols as usize;
+    for buf in &mut scratch.edge_bufs {
+        buf.resize(crop_len, 0);
+    }
+    let ensure_cont = |m: Mat| -> CvResult<Mat> {
+        if m.is_continuous() {
+            Ok(m)
+        } else {
+            m.try_clone()
+        }
+    };
+    let gray_cont = if scratch.gray.is_continuous() {
+        None
+    } else {
+        Some(scratch.gray.try_clone()?)
+    };
+    let gray_ref = gray_cont.as_ref().unwrap_or(&scratch.gray);
+    let ch0 = ensure_cont(scratch.channels.get(0)?)?;
+    let ch1 = ensure_cont(scratch.channels.get(1)?)?;
+    let ch2 = ensure_cont(scratch.channels.get(2)?)?;
+    let [e0, e1, e2, e3] = &mut scratch.edge_bufs;
+    struct EdgeTask<'a> {
+        src: &'a [u8],
+        dst: &'a mut [u8],
+        t1: f64,
+        t2: f64,
+        err: Option<opencv::Error>,
+    }
+    let mut tasks = [
+        EdgeTask {
+            src: gray_ref.data_bytes()?,
+            dst: e0.as_mut_slice(),
+            t1: 25.,
+            t2: 70.,
+            err: None,
+        },
+        EdgeTask {
+            src: ch0.data_bytes()?,
+            dst: e1.as_mut_slice(),
+            t1: 20.,
+            t2: 60.,
+            err: None,
+        },
+        EdgeTask {
+            src: ch1.data_bytes()?,
+            dst: e2.as_mut_slice(),
+            t1: 20.,
+            t2: 60.,
+            err: None,
+        },
+        EdgeTask {
+            src: ch2.data_bytes()?,
+            dst: e3.as_mut_slice(),
+            t1: 20.,
+            t2: 60.,
+            err: None,
+        },
+    ];
+    let run_canny = |_i: usize, task: &mut EdgeTask<'_>| {
+        let res = (|| -> CvResult<()> {
+            let src_mat = Mat::new_rows_cols_with_bytes::<u8>(crop_rows, crop_cols, task.src)?;
+            let mut dst_mat =
+                Mat::new_rows_cols_with_bytes_mut::<u8>(crop_rows, crop_cols, task.dst)?;
+            imgproc::canny_def(&src_mat, &mut dst_mat, task.t1, task.t2)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            task.err = Some(e);
+        }
+    };
+    if crop_len >= 32_768 {
+        let pool = scratch
+            .pool
+            .get_or_insert_with(|| crate::screen::WorkPool::new(3));
+        pool.for_each_mut(&mut tasks, run_canny);
+    } else {
+        for (i, task) in tasks.iter_mut().enumerate() {
+            run_canny(i, task);
         }
     }
+    for task in tasks {
+        if let Some(e) = task.err {
+            return Err(e);
+        }
+    }
+    or4_bytes(e0, e1, e2, e3);
+    let edges_mat = Mat::new_rows_cols_with_bytes::<u8>(crop_rows, crop_cols, e0)?;
     let (mut heads, mut shapes, mut platforms) = (Vec::new(), Vec::new(), Vec::new());
     let head_range = 8f64.max(f64::from(width) * 0.018)..=f64::from(width) * 0.10;
-    for c in contours(&scratch.edges, imgproc::RETR_LIST, Point::default())? {
+    for c in contours(&edges_mat, imgproc::RETR_LIST, Point::default())? {
         let b = imgproc::bounding_rect(&c)?;
         if b.x <= 1
             || b.br().x >= width - 1
@@ -830,12 +991,72 @@ mod tests {
 
     #[test]
     fn or_assign_bytes_matches_scalar_across_tail_lengths() {
-        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 65] {
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 65] {
             let mut dst: Vec<u8> = (0..len).map(|i| ((i * 19) % 256) as u8).collect();
             let src: Vec<u8> = (0..len).map(|i| ((i * 41 + 7) % 256) as u8).collect();
             let expected: Vec<u8> = dst.iter().zip(&src).map(|(&a, &b)| a | b).collect();
             or_assign_bytes(&mut dst, &src);
             assert_eq!(dst, expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn parallel_canny_or4_matches_sequential_canny_edges() {
+        for len in [0usize, 1, 7, 8, 15, 31, 32, 33, 63, 64, 65, 99] {
+            let mut dst: Vec<u8> = (0..len).map(|i| ((i * 13) % 256) as u8).collect();
+            let a: Vec<u8> = (0..len).map(|i| ((i * 29 + 3) % 256) as u8).collect();
+            let b: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+            let c: Vec<u8> = (0..len).map(|i| ((i * 53 + 19) % 256) as u8).collect();
+            let expected: Vec<u8> = (0..len).map(|i| dst[i] | a[i] | b[i] | c[i]).collect();
+            or4_bytes(&mut dst, &a, &b, &c);
+            assert_eq!(dst, expected, "or4 len={len}");
+        }
+
+        let frames = [
+            fixture("skin-gold-play"),
+            Frame {
+                width: 243,
+                height: 301,
+                bgr: (0..243 * 301)
+                    .flat_map(|i| {
+                        let v = ((i * 29 + (i / 243) * 17) % 220 + 15) as u8;
+                        [v, v.wrapping_mul(3), 255 - v]
+                    })
+                    .collect(),
+            },
+        ];
+        let mut scratch = SkinScratch::default();
+        for frame in &frames {
+            let (width, height) = (frame.width as i32, frame.height as i32);
+            let top = (f64::from(height) * 0.35) as i32;
+            let borrowed = crate::template::bgr(frame).unwrap();
+            let crop = borrowed.roi(Rect::new(0, top, width, height - top)).unwrap();
+            let (mut seq_lab, mut seq_gray, mut seq_edges, mut seq_edge) =
+                (Mat::default(), Mat::default(), Mat::default(), Mat::default());
+            let mut seq_channels = Vector::<Mat>::new();
+            imgproc::cvt_color_def(&crop, &mut seq_lab, imgproc::COLOR_BGR2Lab).unwrap();
+            imgproc::cvt_color_def(&crop, &mut seq_gray, imgproc::COLOR_BGR2GRAY).unwrap();
+            imgproc::canny_def(&seq_gray, &mut seq_edges, 25., 70.).unwrap();
+            core::split(&seq_lab, &mut seq_channels).unwrap();
+            let combined = seq_edges.data_bytes_mut().unwrap();
+            for i in 0..seq_channels.len() {
+                imgproc::canny_def(&seq_channels.get(i).unwrap(), &mut seq_edge, 20., 60.).unwrap();
+                or_assign_bytes(combined, seq_edge.data_bytes().unwrap());
+            }
+
+            let mut selection = Selection {
+                height,
+                min_foot_ratio: 0.5,
+                ..Selection::default()
+            };
+            visit(frame, None, true, &mut selection, &mut scratch).unwrap();
+            assert_eq!(
+                scratch.edge_bufs[0].as_slice(),
+                seq_edges.data_bytes().unwrap(),
+                "{}x{}",
+                frame.width,
+                frame.height
+            );
         }
     }
 }

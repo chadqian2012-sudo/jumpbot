@@ -155,6 +155,11 @@ fn material_plane_roi(lab: &Mat, roi: Rect, sample: &Material) -> CvResult<Mat> 
         let d = f64::from(v as u8) - sample.colour[2];
         d * d
     });
+    let tol_f32 = sample.tolerance as f32;
+    let tol_lo = f64::from(tol_f32.next_down());
+    let tol_hi = f64::from(tol_f32.next_up());
+    let tol_lo2 = tol_lo * tol_lo;
+    let tol_hi2 = tol_hi * tol_hi;
     let plane_data = plane.data_bytes_mut()?;
     for dy in 0..h {
         let lab_start = (oy + dy) * lab_cols + ox;
@@ -167,9 +172,15 @@ fn material_plane_roi(lab: &Mat, roi: Rect, sample: &Material) -> CvResult<Mat> 
             if l2 > 35. * 35. {
                 continue;
             }
-            let chroma2 = da2[usize::from(p[1])] + db2[usize::from(p[2])];
-            if l2 + chroma2 <= 35. * 35. && f64::from((chroma2 as f32).sqrt()) <= sample.tolerance
-            {
+            let a2 = da2[usize::from(p[1])];
+            if a2 > tol_hi2 {
+                continue;
+            }
+            let chroma2 = a2 + db2[usize::from(p[2])];
+            if l2 + chroma2 > 35. * 35. || chroma2 > tol_hi2 {
+                continue;
+            }
+            if chroma2 <= tol_lo2 || f64::from((chroma2 as f32).sqrt()) <= sample.tolerance {
                 *dst = 255;
             }
         }
@@ -584,13 +595,16 @@ mod tests {
             let b = (125 + ((idx * 11) % 45)) as u8;
             *p = Vec3b::from([l, a, b]);
         }
-        // Specific boundary pixels in ROI: l2 > 35^2, exact 35^2 border, and chroma border.
+        // Specific boundary pixels in ROI: l2 > 35^2, exact 35^2 border, a2 > tol_hi2, and chroma ULP band.
         let r0 = roi.y as usize * full_w as usize + roi.x as usize;
         data[r0] = Vec3b::from([120, 131, 145]);
         data[r0 + 1] = Vec3b::from([156, 131, 145]);
         data[r0 + 2] = Vec3b::from([85, 131, 145]);
         data[r0 + 3] = Vec3b::from([120, 145, 145]);
         data[r0 + 4] = Vec3b::from([120, 146, 145]);
+        data[r0 + 5] = Vec3b::from([120, 145, 148]);
+        data[r0 + 6] = Vec3b::from([120, 144, 151]);
+        data[r0 + 7] = Vec3b::from([120, 116, 145]);
         let sample = Material {
             mask: Mat::default(),
             core: Mat::default(),

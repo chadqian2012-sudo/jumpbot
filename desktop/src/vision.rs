@@ -306,15 +306,33 @@ pub(crate) fn face_center(
     face_center_with_scratch(parts.width, &parts.labels, id, stats, slope, &mut mask)
 }
 
-fn find_dot_if(
-    frame: &Frame,
+struct DotQuery {
     cx: f64,
     cy: f64,
     radius: f64,
-    cfg: &Config,
     painted: bool,
+}
+
+struct TargetScratch<'a> {
+    region: &'a mut RegionScratch,
+    face_mask: &'a mut Vec<u8>,
+    dot_mask: &'a mut Vec<u8>,
+}
+
+fn find_dot_if(
+    frame: &Frame,
+    query: DotQuery,
+    cfg: &Config,
+    region_scratch: &mut RegionScratch,
+    mask: &mut Vec<u8>,
     accept: impl Fn(f64, f64) -> bool,
 ) -> Result<Option<(f64, f64, i32)>, String> {
+    let DotQuery {
+        cx,
+        cy,
+        radius,
+        painted,
+    } = query;
     let x0 = (cx - radius).round_ties_even().max(0.0) as i32;
     let y0 = (cy - radius).round_ties_even().max(0.0) as i32;
     let x1 = ((cx + radius).round_ties_even() + 1.0).min(frame.width as f64) as i32;
@@ -326,31 +344,54 @@ fn find_dot_if(
     let (w, h) = (bounds[2] as usize, bounds[3] as usize);
     let min_value = cfg.f("center_dot_val_min").ceil() as i32;
     let max_sat = cfg.f("center_dot_sat_max").floor() as i32;
-    let mut mask = Vec::with_capacity(w * h);
+    let min_dot_area = cfg.f("center_dot_min_area");
+    let max_dot_area = cfg.f("center_dot_max_area");
+    if painted && (min_value > 245 || max_sat < 0) {
+        return Ok(None);
+    }
+    mask.clear();
+    mask.reserve(w * h);
     let sat_div = &*SAT_DIV;
-    for row in y0..y1 {
-        let start = (row as usize * frame.width + x0 as usize) * 3;
-        for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
-            if painted {
-                // The unblended game marker has the same ink on bright and dark faces.
-                mask.push(u8::from(
-                    *pixel == [245; 3] && min_value <= 245 && max_sat >= 0,
-                ));
-                continue;
+    let mut fg_count = 0usize;
+    if painted {
+        // The unblended game marker has the same ink on bright and dark faces.
+        for row in y0..y1 {
+            let start = (row as usize * frame.width + x0 as usize) * 3;
+            for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
+                let hit = *pixel == [245; 3];
+                fg_count += usize::from(hit);
+                mask.push(u8::from(hit));
             }
-            let v = i32::from(*pixel.iter().max().unwrap());
-            let d = v - i32::from(*pixel.iter().min().unwrap());
-            let saturation = (d * sat_div[v as usize] + 2048) >> 12;
-            mask.push(u8::from(v >= min_value && saturation <= max_sat));
+        }
+    } else {
+        for row in y0..y1 {
+            let start = (row as usize * frame.width + x0 as usize) * 3;
+            for pixel in frame.bgr[start..start + w * 3].as_chunks::<3>().0 {
+                let v = i32::from(*pixel.iter().max().unwrap());
+                let d = v - i32::from(*pixel.iter().min().unwrap());
+                let saturation = (d * sat_div[v as usize] + 2048) >> 12;
+                let hit = v >= min_value && saturation <= max_sat;
+                fg_count += usize::from(hit);
+                mask.push(u8::from(hit));
+            }
         }
     }
-    let regions = Mask::from_pixels(&mask, w, h).regions();
+    let min_fg = if min_dot_area > 0.0 {
+        min_dot_area.ceil() as usize
+    } else {
+        1
+    };
+    if fg_count < min_fg {
+        return Ok(None);
+    }
+    let regions = Mask::from_pixels(mask, w, h).regions_with(region_scratch);
     let labels = &regions.labels;
     let mut nearest = None;
     let mut best_distance = f64::INFINITY;
+    let bright_delta = cfg.f("center_dot_bright_delta");
     for (id, &[x, y, bw, bh, area]) in regions.stats.iter().enumerate().skip(1) {
-        if (area as f64) < cfg.f("center_dot_min_area")
-            || area as f64 > cfg.f("center_dot_max_area")
+        if (area as f64) < min_dot_area
+            || area as f64 > max_dot_area
             || (!painted && bw.max(bh) as f64 > 2.0 * bw.min(bh) as f64)
         {
             continue;
@@ -372,8 +413,9 @@ fn find_dot_if(
                 continue;
             }
             let ellipse = (y..y + bh).all(|yy| {
+                let dy_n = (f64::from(yy) - my) / ry;
                 (x..x + bw).all(|xx| {
-                    let radial = ((f64::from(xx) - mx) / rx).hypot((f64::from(yy) - my) / ry);
+                    let radial = ((f64::from(xx) - mx) / rx).hypot(dy_n);
                     let filled = labels[yy as usize * w + xx as usize] == id as i32;
                     filled == (radial <= 1.) || (radial - 1.).abs() * ry <= 1.
                 })
@@ -386,38 +428,71 @@ fn find_dot_if(
             }
             continue;
         }
-        let mut ring = Vec::new();
         let (mut sx, mut sy, mut brightness) = (0i64, 0i64, 0i64);
-        // A 5x5 dilation is the set of pixels within two rows and columns of
-        // this label. Ring samples are clipped to the ROI just like cv::dilate.
-        for yy in (y - 2).max(0)..(y + bh + 2).min(bounds[3]) {
-            for xx in (x - 2).max(0)..(x + bw + 2).min(bounds[2]) {
-                let pixel_val = || {
-                    let idx = ((yy + y0) as usize * frame.width + (xx + x0) as usize) * 3;
-                    *frame.bgr[idx..idx + 3].iter().max().unwrap()
-                };
-                if labels[yy as usize * w + xx as usize] == id as i32 {
+        for yy in y..y + bh {
+            let label_row = &labels[yy as usize * w..][..w];
+            let frame_row_start = (yy + y0) as usize * frame.width + x0 as usize;
+            for xx in x..x + bw {
+                if label_row[xx as usize] == id as i32 {
                     sx += xx as i64;
                     sy += yy as i64;
-                    brightness += pixel_val() as i64;
-                } else if ((yy - 2).max(0)..=(yy + 2).min(bounds[3] - 1)).any(|ry| {
-                    let row = &labels[ry as usize * w..][..w];
-                    row[(xx - 2).max(0) as usize..=(xx + 2).min(bounds[2] - 1) as usize]
-                        .contains(&(id as i32))
-                }) {
-                    ring.push(pixel_val());
+                    let idx = (frame_row_start + xx as usize) * 3;
+                    brightness += *frame.bgr[idx..idx + 3].iter().max().unwrap() as i64;
                 }
             }
         }
         let dx = sx as f64 / area as f64 + x0 as f64;
         let dy = sy as f64 / area as f64 + y0 as f64;
         let dist = (dx - cx).hypot(dy - cy);
-        if dist > radius || dist >= best_distance || !accept(dx, dy) || ring.is_empty() {
+        if dist > radius || dist >= best_distance || !accept(dx, dy) {
             continue;
         }
-        ring.sort_unstable();
-        let median = (ring[(ring.len() - 1) / 2] as f64 + ring[ring.len() / 2] as f64) * 0.5;
-        if brightness as f64 / (area as f64) < median + cfg.f("center_dot_bright_delta") {
+        // A 5x5 dilation is the set of pixels within two rows and columns of
+        // this label. Ring samples are clipped to the ROI just like cv::dilate.
+        let mut hist = [0u32; 256];
+        let mut ring_count = 0usize;
+        for yy in (y - 2).max(0)..(y + bh + 2).min(bounds[3]) {
+            let label_row = &labels[yy as usize * w..][..w];
+            let ry0 = (yy - 2).max(0);
+            let ry1 = (yy + 2).min(bounds[3] - 1);
+            let frame_row_start = (yy + y0) as usize * frame.width + x0 as usize;
+            for xx in (x - 2).max(0)..(x + bw + 2).min(bounds[2]) {
+                if label_row[xx as usize] == id as i32 {
+                    continue;
+                }
+                let rx0 = (xx - 2).max(0) as usize;
+                let rx1 = (xx + 2).min(bounds[2] - 1) as usize;
+                if (ry0..=ry1).any(|ry| labels[ry as usize * w..][rx0..=rx1].contains(&(id as i32)))
+                {
+                    let idx = (frame_row_start + xx as usize) * 3;
+                    let val = *frame.bgr[idx..idx + 3].iter().max().unwrap();
+                    hist[val as usize] += 1;
+                    ring_count += 1;
+                }
+            }
+        }
+        if ring_count == 0 {
+            continue;
+        }
+        let lo_idx = (ring_count - 1) / 2;
+        let hi_idx = ring_count / 2;
+        let mut acc = 0usize;
+        let (mut lo_val, mut hi_val) = (None, None);
+        for (val, &cnt) in hist.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            acc += cnt as usize;
+            if lo_val.is_none() && acc > lo_idx {
+                lo_val = Some(val as f64);
+            }
+            if acc > hi_idx {
+                hi_val = Some(val as f64);
+                break;
+            }
+        }
+        let median = (lo_val.unwrap_or(0.0) + hi_val.unwrap_or(0.0)) * 0.5;
+        if brightness as f64 / (area as f64) < median + bright_delta {
             continue;
         }
         nearest = Some((dx, dy, area));
@@ -434,7 +509,19 @@ pub fn find_dot_near(
     cfg: &Config,
 ) -> Result<Option<(f64, f64, i32)>, String> {
     check_frame(frame)?;
-    find_dot_if(frame, x, y, radius, cfg, false, |_, _| true)
+    find_dot_if(
+        frame,
+        DotQuery {
+            cx: x,
+            cy: y,
+            radius,
+            painted: false,
+        },
+        cfg,
+        &mut RegionScratch::default(),
+        &mut Vec::new(),
+        |_, _| true,
+    )
 }
 
 struct TargetCandidate {
@@ -458,13 +545,12 @@ fn find_target(
     piece: &Piece,
     piece_mask: &[u8],
     cfg: &Config,
-    region_scratch: &mut RegionScratch,
-    face_mask: &mut Vec<u8>,
+    scratch: &mut TargetScratch<'_>,
 ) -> Result<TargetSelection, String> {
     let (w, h) = (frame.width as f64, frame.height as f64);
     let parts = Mask::from_pixels(block_mask, frame.width, frame.height).blocks_with(
         Mask::from_pixels(piece_mask, frame.width, frame.height),
-        region_scratch,
+        scratch.region,
     );
     let slope = cfg.f("axis_slope");
     let min_area = cfg.f("block_min_area_ratio") * (w * h);
@@ -487,7 +573,7 @@ fn find_target(
             continue;
         }
         let Some((x, mut y, top_width)) =
-            face_center_with_scratch(parts.width, parts.labels, id, stats, slope, face_mask)
+            face_center_with_scratch(parts.width, parts.labels, id, stats, slope, scratch.face_mask)
         else {
             continue;
         };
@@ -519,6 +605,7 @@ fn find_target(
             cross_ratio: cross / along.abs().max(1.0),
         });
     }
+    drop(parts);
 
     let min_dist = cfg.f("min_jump_dist_ratio") * w;
     let max_dist = cfg.f("max_jump_dist_ratio") * w;
@@ -626,13 +713,25 @@ fn find_target(
                 if radius <= 0.0 {
                     return Ok(TargetSelection::Found(b.clone()));
                 }
-                if let Some(dot) = find_dot_if(frame, b.x, b.y, radius, cfg, true, |x, y| {
-                    let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
-                    (b.top_y..=b.top_y + b.top_width * slope).contains(&y)
-                        && y < max_y
-                        && (lower..=max_dist).contains(&along)
-                        && cross <= ratio * along
-                })? {
+                if let Some(dot) = find_dot_if(
+                    frame,
+                    DotQuery {
+                        cx: b.x,
+                        cy: b.y,
+                        radius,
+                        painted: true,
+                    },
+                    cfg,
+                    scratch.region,
+                    scratch.dot_mask,
+                    |x, y| {
+                        let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
+                        (b.top_y..=b.top_y + b.top_width * slope).contains(&y)
+                            && y < max_y
+                            && (lower..=max_dist).contains(&along)
+                            && cross <= ratio * along
+                    },
+                )? {
                     let mut cap = b.clone();
                     cap.x = dot.0;
                     cap.y = dot.1;
@@ -682,10 +781,34 @@ fn find_target(
             let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
             (lower..=max_dist).contains(&along) && cross / along.abs().max(1.0) <= ratio
         };
-        let painted = find_dot_if(frame, chosen.x, chosen.y, radius, cfg, true, valid)?;
+        let painted = find_dot_if(
+            frame,
+            DotQuery {
+                cx: chosen.x,
+                cy: chosen.y,
+                radius,
+                painted: true,
+            },
+            cfg,
+            scratch.region,
+            scratch.dot_mask,
+            valid,
+        )?;
         let dot = match painted {
             Some(mark) => Some(mark),
-            None => find_dot_if(frame, chosen.x, chosen.y, radius, cfg, false, valid)?,
+            None => find_dot_if(
+                frame,
+                DotQuery {
+                    cx: chosen.x,
+                    cy: chosen.y,
+                    radius,
+                    painted: false,
+                },
+                cfg,
+                scratch.region,
+                scratch.dot_mask,
+                valid,
+            )?,
         };
         if let Some(dot) = dot {
             if (dot.0 - chosen.x).abs() > 3.0 || (dot.1 - chosen.y).abs() > 3.0 {
@@ -804,6 +927,7 @@ pub struct Vision {
     prior: Option<Piece>,
     region_scratch: RegionScratch,
     face_mask: Vec<u8>,
+    dot_mask: Vec<u8>,
     skin_scratch: crate::skin::SkinScratch,
 }
 
@@ -816,6 +940,7 @@ impl Vision {
             prior: None,
             region_scratch: RegionScratch::default(),
             face_mask: Vec::new(),
+            dot_mask: Vec::new(),
             skin_scratch: crate::skin::SkinScratch::default(),
         })
     }
@@ -847,15 +972,13 @@ impl Vision {
         let mut selection = TargetSelection::Missing;
         if let Some(p) = &piece {
             if want_target {
-                selection = find_target(
-                    frame,
-                    &block_mask,
-                    p,
-                    &piece_mask,
-                    &self.cfg,
-                    &mut self.region_scratch,
-                    &mut self.face_mask,
-                )?;
+                let mut scratch = TargetScratch {
+                    region: &mut self.region_scratch,
+                    face_mask: &mut self.face_mask,
+                    dot_mask: &mut self.dot_mask,
+                };
+                selection =
+                    find_target(frame, &block_mask, p, &piece_mask, &self.cfg, &mut scratch)?;
             }
             self.prior = Some(p.clone());
         }

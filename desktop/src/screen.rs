@@ -498,14 +498,14 @@ struct PoolState {
 
 type SharedPool = Arc<(Mutex<PoolState>, Condvar, Condvar)>;
 
-/// Persistent thread pool owned by `Screen`'s `ButtonCache` (joined deterministically on Drop).
-struct WorkPool {
+/// Persistent thread pool owned by `Screen` / `Masks` / `Skin` (joined deterministically on Drop).
+pub(crate) struct WorkPool {
     shared: SharedPool,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl WorkPool {
-    fn new(n_workers: usize) -> Self {
+    pub(crate) fn new(n_workers: usize) -> Self {
         let shared = Arc::new((
             Mutex::new(PoolState {
                 generation: 0,
@@ -562,11 +562,11 @@ impl WorkPool {
         Self { shared, workers }
     }
 
-    fn max_threads(&self) -> usize {
+    pub(crate) fn max_threads(&self) -> usize {
         self.workers.len() + 1
     }
 
-    fn for_each_mut<T: Send, F: Fn(usize, &mut T) + Sync>(&self, items: &mut [T], f: F) {
+    pub(crate) fn for_each_mut<T: Send, F: Fn(usize, &mut T) + Sync>(&self, items: &mut [T], f: F) {
         if items.len() <= 1 || self.workers.is_empty() {
             for (idx, item) in items.iter_mut().enumerate() {
                 f(idx, item);
@@ -1588,6 +1588,17 @@ pub struct Screen {
     fft_threads: usize,
     cache: RefCell<ButtonCache>,
 }
+static OPENCV_THREADS: Mutex<Option<i32>> = Mutex::new(None);
+
+fn configure_opencv_threads(threads: i32) -> Result<()> {
+    let mut guard = OPENCV_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if *guard != Some(threads) {
+        core::set_num_threads(threads).map_err(|e| e.to_string())?;
+        *guard = Some(threads);
+    }
+    Ok(())
+}
+
 impl Screen {
     pub fn new(path: &Path, cfg: &Config) -> Result<Self> {
         let threads_cfg = cfg.i("cv2_threads");
@@ -1596,7 +1607,10 @@ impl Screen {
         } else {
             threads_cfg.min(128) as i32
         };
-        core::set_num_threads(threads).map_err(|e| e.to_string())?;
+        // Avoid mutating OpenCV's global thread pool concurrently across parallel unit tests.
+        if cfg!(not(test)) || threads_cfg > 0 {
+            configure_opencv_threads(threads)?;
+        }
         let fft_threads = if threads_cfg <= 0 {
             thread::available_parallelism().map_or(1, |n| n.get().min(6))
         } else {

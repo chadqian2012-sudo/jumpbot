@@ -4,58 +4,134 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose {
     pub along: f32,
     pub lift: f32,
     pub squash: f32,
+    pub camera: f32,
+    pub target_tile: i32,
+}
+
+impl Default for Pose {
+    fn default() -> Self {
+        Self {
+            along: 0.0,
+            lift: 0.0,
+            squash: 0.0,
+            camera: 0.0,
+            target_tile: 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Jump {
     pub started: Instant,
-    from: Pose,
-    pub to: f32,
+    from_pawn: f32,
+    from_lift: f32,
+    from_squash: f32,
+    from_cam: f32,
+    pub to: i32,
+    pub bullseye: bool,
 }
 
 impl Jump {
+    pub const FLIGHT_DURATION: Duration = Duration::from_millis(340);
+    pub const TOTAL_DURATION: Duration = Duration::from_millis(780);
+
     pub fn next(previous: Option<Self>, now: Instant) -> Self {
-        Self {
-            started: now,
-            from: previous.map_or_else(Pose::default, |jump| jump.pose(now)),
-            to: previous.map_or(1., |jump| 1. - jump.to),
+        match previous {
+            None => Self {
+                started: now,
+                from_pawn: 0.0,
+                from_lift: 0.0,
+                from_squash: 0.0,
+                from_cam: 0.0,
+                to: 1,
+                bullseye: false,
+            },
+            Some(prev) => {
+                let p = prev.pose(now);
+                Self {
+                    started: now,
+                    from_pawn: p.camera + p.along,
+                    from_lift: p.lift,
+                    from_squash: p.squash,
+                    from_cam: p.camera,
+                    to: prev.to + 1,
+                    bullseye: false,
+                }
+            }
         }
     }
 
+    #[cfg(test)]
+    pub fn with_bullseye(mut self, bullseye: bool) -> Self {
+        self.bullseye = bullseye;
+        self
+    }
+
+    pub fn flight_duration(self) -> Duration {
+        Self::FLIGHT_DURATION
+    }
+
     pub fn duration(self) -> Duration {
-        Duration::from_millis(if self.to == 1. { 440 } else { 260 })
+        Self::TOTAL_DURATION
     }
 
     pub fn rest(self) -> Pose {
         Pose {
-            along: self.to,
-            ..Pose::default()
+            along: 0.0,
+            lift: 0.0,
+            squash: 0.0,
+            camera: self.to as f32,
+            target_tile: self.to + 1,
         }
     }
 
     pub fn pose(self, now: Instant) -> Pose {
-        let t = now.saturating_duration_since(self.started).as_secs_f32()
-            / self.duration().as_secs_f32();
-        if t >= 1. {
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f32();
+        let total = Self::TOTAL_DURATION.as_secs_f32();
+        if elapsed >= total {
             return self.rest();
         }
-        // Reserve the final part of the movement for a single, foot-anchored landing.
-        let flight = (t / 0.80).min(1.);
-        let u = flight * flight * (3. - 2. * flight);
-        let air = 4. * u * (1. - u);
-        let apex: f32 = if self.to == 1. { 0.31 } else { 0.16 };
-        let settle = ((t - 0.80) / 0.20).max(0.);
-        let contact = 4. * settle * (1. - settle);
+        let flight_s = Self::FLIGHT_DURATION.as_secs_f32();
+        let pan_s = total - flight_s;
+        let f = (elapsed / flight_s).min(1.0);
+        let u = f * f * (3.0 - 2.0 * f);
+        let air = 4.0 * u * (1.0 - u);
+        let to_f = self.to as f32;
+        let dist = (to_f - self.from_pawn).abs().min(1.5);
+        let pawn_world = self.from_pawn + (to_f - self.from_pawn) * u;
+        let lift = self.from_lift * (1.0 - u) + (0.31 - self.from_lift).max(0.0) * dist * air;
+
+        // Foot-anchored landing squash right upon touchdown.
+        let s = ((elapsed - flight_s) / 0.14).clamp(0.0, 1.0);
+        let contact = 4.0 * s * (1.0 - s);
+        let squash = self.from_squash * (1.0 - u) + contact * contact;
+
+        // Camera smoothly follows immediately upon landing so the ground recedes beneath the pawn.
+        let base_cam = (self.to - 1) as f32;
+        let camera = if elapsed < flight_s {
+            self.from_cam + (base_cam - self.from_cam) * u
+        } else {
+            let pan_t = ((elapsed - flight_s) / pan_s).clamp(0.0, 1.0);
+            let s = pan_t * pan_t * (3.0 - 2.0 * pan_t);
+            let ease = 1.0 - (1.0 - s) * (1.0 - s);
+            base_cam + ease
+        };
+        let target_tile = if elapsed < flight_s {
+            self.to
+        } else {
+            self.to + 1
+        };
         Pose {
-            along: self.from.along + (self.to - self.from.along) * u,
-            lift: self.from.lift * (1. - u)
-                + (apex - self.from.lift).max(0.) * (self.to - self.from.along).abs() * air,
-            squash: self.from.squash * (1. - u) + contact * contact,
+            along: pawn_world - camera,
+            lift,
+            squash,
+            camera,
+            target_tile,
         }
     }
 }
@@ -114,6 +190,9 @@ impl Console {
             _ => false,
         }
     }
+    pub fn is_charging(&self) -> bool {
+        self.mode == Mode::Live && matches!(self.phase.as_str(), "playing" | "acquiring")
+    }
     pub fn primary_label(&self) -> &str {
         match (self.mode, self.phase.as_str()) {
             (Mode::Idle, _) => "启动脚本",
@@ -158,11 +237,20 @@ impl Console {
                 }
             }
             if s["jump_uid"].is_string() && s["jump_uid"] != self.status["jump_uid"] {
-                let score = s["score"]
-                    .as_i64()
-                    .map_or_else(|| "待判定".to_owned(), |v| v.to_string());
+                let prev_score = self.status["score"].as_i64();
+                let next_score = s["score"].as_i64();
+                let score = next_score.map_or_else(|| "待判定".to_owned(), |v| v.to_string());
                 let result = match s["last_result"].as_str() {
-                    Some("landed") => "已落地",
+                    Some("landed") => {
+                        if let (Some(prev), Some(next)) = (prev_score, next_score) {
+                            if next - prev >= 2 {
+                                if let Some(j) = self.landed.as_mut() {
+                                    j.bullseye = true;
+                                }
+                            }
+                        }
+                        "已落地"
+                    }
                     Some("dead") => "本局结束",
                     _ => "落点待判定",
                 };
@@ -306,18 +394,53 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn return_takes_a_lower_faster_arc_and_retargeting_preserves_the_pose() {
+    fn forward_jump_recedes_ground_and_retargeting_preserves_the_pose() {
         let now = Instant::now();
-        let out = Jump::next(None, now);
-        let back = Jump::next(Some(out), now + out.duration());
-        let mid_flight = |j: Jump| j.started + j.duration().mul_f32(0.4);
-        assert!(back.duration() < out.duration());
-        assert!(back.pose(mid_flight(back)).lift < out.pose(mid_flight(out)).lift);
-        for fraction in [0.4, 0.9] {
-            let interrupt = now + out.duration().mul_f32(fraction);
-            let turn = Jump::next(Some(out), interrupt);
-            assert_eq!(turn.pose(interrupt), out.pose(interrupt));
-            assert_eq!(turn.pose(interrupt + turn.duration()), Pose::default());
+        let first = Jump::next(None, now);
+        let mid_flight = first.pose(now + first.flight_duration().mul_f32(0.5));
+        assert!(mid_flight.lift > 0.2);
+        assert!(mid_flight.along > 0.4 && mid_flight.along < 0.6);
+        assert_eq!(mid_flight.camera, 0.0);
+
+        // Immediately after touchdown, camera advances so ground recedes back toward 0.
+        let mid_pan = first.pose(now + first.flight_duration() + Duration::from_millis(160));
+        assert!(mid_pan.camera > 0.0 && mid_pan.camera < 1.0);
+        assert!(mid_pan.along > 0.0 && mid_pan.along < 1.0);
+        assert_eq!(mid_pan.target_tile, 2);
+
+        let rested = first.pose(now + first.duration());
+        assert_eq!(rested, first.rest());
+        assert_eq!(rested.along, 0.0);
+        assert_eq!(rested.camera, 1.0);
+
+        // Next jump always advances forward (never backwards).
+        let second = Jump::next(Some(first), now + first.duration()).with_bullseye(true);
+        assert!(second.bullseye);
+        assert_eq!(second.to, 2);
+        let second_mid = second.pose(second.started + second.flight_duration().mul_f32(0.5));
+        assert!(second_mid.along > 0.4 && second_mid.lift > 0.2);
+
+        let mut c = Console::new(None);
+        assert!(!c.is_charging());
+        c.started(false);
+        c.update(json!({"state": "playing", "score": 2}));
+        assert!(c.is_charging());
+        c.update(json!({"state": "landing", "score": 2}));
+        assert!(!c.is_charging());
+        c.update(json!({"state": "playing", "jump_uid": "j-1", "last_index": 1, "last_result": "landed", "last_hold_ms": 420.0, "score": 4}));
+        assert!(c.landed.is_some_and(|j| j.bullseye));
+
+        for fraction in [0.25, 0.7] {
+            let interrupt = now + first.duration().mul_f32(fraction);
+            let turn = Jump::next(Some(first), interrupt);
+            let before = first.pose(interrupt);
+            let after = turn.pose(interrupt);
+            assert_eq!(
+                (after.along, after.lift, after.squash, after.camera),
+                (before.along, before.lift, before.squash, before.camera)
+            );
+            assert_eq!(after.target_tile, turn.to);
+            assert_eq!(turn.pose(interrupt + turn.duration()), turn.rest());
         }
     }
     #[test]

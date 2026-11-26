@@ -168,26 +168,92 @@ fn scalar_row(
     }
 }
 
-fn cpu(frame: &Frame, bg: &[u8], table: &Tables, rows: [usize; 2], simd: bool) -> Pair {
+fn cpu_with_pool(
+    frame: &Frame,
+    bg: &[u8],
+    table: &Tables,
+    rows: [usize; 2],
+    simd: bool,
+    pool: Option<&crate::screen::WorkPool>,
+) -> Pair {
     let w = frame.width;
     let mut pair = (vec![0; w * frame.height], vec![0; w * frame.height]);
-    for y in rows[0]..rows[1] {
-        let row = &frame.bgr[3 * w * y..3 * w * (y + 1)];
-        let color = &bg[3 * y..3 * y + 3];
-        let base = hsv(color, table);
-        let piece = &mut pair.0[w * y..w * (y + 1)];
-        let block = &mut pair.1[w * y..w * (y + 1)];
-        #[cfg(target_arch = "x86_64")]
-        if simd {
-            // simd can only be set after AVX2 runtime detection.
-            unsafe {
-                avx2::row(row, color, base, table, piece, block);
-            }
-            continue;
-        }
-        scalar_row(row, color, base, table, piece, block);
+    if rows[1] <= rows[0] {
+        return pair;
     }
+    let active_rows = rows[1] - rows[0];
+    let n_threads = pool
+        .filter(|_| w.saturating_mul(active_rows) >= 65_536)
+        .map_or(1, |p| p.max_threads().min(active_rows))
+        .max(1);
+    if n_threads <= 1 {
+        for y in rows[0]..rows[1] {
+            let row = &frame.bgr[3 * w * y..3 * w * (y + 1)];
+            let color = &bg[3 * y..3 * y + 3];
+            let base = hsv(color, table);
+            let piece = &mut pair.0[w * y..w * (y + 1)];
+            let block = &mut pair.1[w * y..w * (y + 1)];
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                // simd can only be set after AVX2 runtime detection.
+                unsafe {
+                    avx2::row(row, color, base, table, piece, block);
+                }
+                continue;
+            }
+            scalar_row(row, color, base, table, piece, block);
+        }
+        return pair;
+    }
+    struct Band<'a> {
+        y0: usize,
+        y1: usize,
+        piece: &'a mut [u8],
+        block: &'a mut [u8],
+    }
+    let mut bands = Vec::with_capacity(n_threads);
+    let mut rem_piece = &mut pair.0[rows[0] * w..rows[1] * w];
+    let mut rem_block = &mut pair.1[rows[0] * w..rows[1] * w];
+    for b in 0..n_threads {
+        let y0 = rows[0] + b * active_rows / n_threads;
+        let y1 = rows[0] + (b + 1) * active_rows / n_threads;
+        let span = (y1 - y0) * w;
+        let (piece, rest_p) = rem_piece.split_at_mut(span);
+        rem_piece = rest_p;
+        let (block, rest_b) = rem_block.split_at_mut(span);
+        rem_block = rest_b;
+        bands.push(Band {
+            y0,
+            y1,
+            piece,
+            block,
+        });
+    }
+    let bgr = &frame.bgr;
+    pool.unwrap().for_each_mut(&mut bands, |_, band| {
+        for (ly, y) in (band.y0..band.y1).enumerate() {
+            let row = &bgr[3 * w * y..3 * w * (y + 1)];
+            let color = &bg[3 * y..3 * y + 3];
+            let base = hsv(color, table);
+            let piece = &mut band.piece[w * ly..w * (ly + 1)];
+            let block = &mut band.block[w * ly..w * (ly + 1)];
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                // simd can only be set after AVX2 runtime detection.
+                unsafe {
+                    avx2::row(row, color, base, table, piece, block);
+                }
+                continue;
+            }
+            scalar_row(row, color, base, table, piece, block);
+        }
+    });
     pair
+}
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+fn cpu(frame: &Frame, bg: &[u8], table: &Tables, rows: [usize; 2], simd: bool) -> Pair {
+    cpu_with_pool(frame, bg, table, rows, simd, None)
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -209,6 +275,7 @@ pub struct Masks {
     left: Vec<f32>,
     right: Vec<f32>,
     bg: Vec<u8>,
+    pool: Option<crate::screen::WorkPool>,
     #[cfg(any(feature = "cuda", feature = "opencl"))]
     gpu: GpuSelection,
 }
@@ -257,6 +324,7 @@ impl Masks {
             left: Vec::new(),
             right: Vec::new(),
             bg: Vec::new(),
+            pool: None,
             #[cfg(any(feature = "cuda", feature = "opencl"))]
             gpu: GpuSelection {
                 cuda: cfg!(feature = "cuda") && enabled("cuda_enabled", "JUMPBOT_DISABLE_CUDA"),
@@ -305,8 +373,25 @@ impl Masks {
         let expected = cpu(f, &bg, &self.table, rows, false);
         let mut best = f64::INFINITY;
         if self.mode == Mode::Auto {
-            self.gpu.cpu_ms =
-                benchmark(|| Ok(cpu(f, &background(f), &self.table, rows, self.simd))).unwrap();
+            let workers = std::thread::available_parallelism()
+                .map_or(1, |n| n.get().min(4))
+                .saturating_sub(1);
+            if workers > 0 && f.width.saturating_mul(rows[1].saturating_sub(rows[0])) >= 65_536 {
+                self.pool
+                    .get_or_insert_with(|| crate::screen::WorkPool::new(workers));
+            }
+            let pool = self.pool.as_ref();
+            self.gpu.cpu_ms = benchmark(|| {
+                Ok(cpu_with_pool(
+                    f,
+                    &background(f),
+                    &self.table,
+                    rows,
+                    self.simd,
+                    pool,
+                ))
+            })
+            .unwrap();
             best = self.gpu.cpu_ms / 1.5;
             eprintln!(
                 "{}: {:.3} ms",
@@ -412,7 +497,21 @@ impl Masks {
             eprintln!("{requested} 未能执行本帧，已回退到 CPU。");
         }
         self.last = if self.simd { "simd" } else { "cpu" };
-        Ok(cpu(f, &self.bg, &self.table, rows, self.simd))
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get().min(4))
+            .saturating_sub(1);
+        if workers > 0 && f.width.saturating_mul(rows[1].saturating_sub(rows[0])) >= 65_536 {
+            self.pool
+                .get_or_insert_with(|| crate::screen::WorkPool::new(workers));
+        }
+        Ok(cpu_with_pool(
+            f,
+            &self.bg,
+            &self.table,
+            rows,
+            self.simd,
+            self.pool.as_ref(),
+        ))
     }
 }
 
@@ -490,6 +589,38 @@ mod tests {
                 assert_eq!(&mask[..3], &[0; 3]);
                 assert_eq!(&mask[20..], &[0; 3]);
             }
+        }
+    }
+
+    #[test]
+    fn cpu_with_pool_matches_scalar_cpu_across_sizes() {
+        let cfg = Config::default();
+        let pool = crate::screen::WorkPool::new(3);
+        for (w, h) in [(257usize, 293usize), (553, 210)] {
+            let frame = Frame {
+                width: w,
+                height: h,
+                bgr: (0..w * h)
+                    .flat_map(|i| {
+                        let b = ((i * 23 + (i / w) * 7) % 240) as u8;
+                        let g = ((i * 11 + 40) % 240) as u8;
+                        let r = ((i * 17 + 85) % 240) as u8;
+                        [b, g, r]
+                    })
+                    .collect(),
+            };
+            let mut masks = Masks::new(&cfg, "simd");
+            let rows = [h / 10, h - h / 12];
+            let mut left = Vec::new();
+            let mut right = Vec::new();
+            let mut bg = Vec::new();
+            background_into(&frame, &mut left, &mut right, &mut bg);
+            let tbl = tables(&cfg);
+            let single = cpu_with_pool(&frame, &bg, &tbl, rows, false, None);
+            let parallel = cpu_with_pool(&frame, &bg, &tbl, rows, true, Some(&pool));
+            let via_masks = masks.compute(&frame).unwrap();
+            assert_eq!(parallel, single, "{w}x{h} pool vs scalar");
+            assert!(!via_masks.0.is_empty());
         }
     }
 }

@@ -369,7 +369,7 @@ impl Mask {
         stats
     }
 
-    fn regions_with<'a>(&self, scratch: &'a mut RegionScratch) -> RegionsRef<'a> {
+    pub(crate) fn regions_with<'a>(&self, scratch: &'a mut RegionScratch) -> RegionsRef<'a> {
         self.spans_into(true, &mut scratch.spans, &mut scratch.parents);
         scratch.ids.clear();
         scratch.ids.resize(scratch.parents.len(), 0);

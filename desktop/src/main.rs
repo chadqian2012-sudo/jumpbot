@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod console;
+mod motion;
 mod native;
 mod painting;
 
