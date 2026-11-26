@@ -462,7 +462,7 @@ pub(super) fn glyph_feature(glyph: &GrayImage) -> opencv::Result<Vec<f32>> {
     for (src, row) in scaled
         .data_bytes()?
         .chunks_exact(width)
-        .zip(out.chunks_exact_mut(24).skip((32 - height) / 2))
+        .zip(out.as_chunks_mut::<24>().0.iter_mut().skip((32 - height) / 2))
     {
         for (&p, v) in src.iter().zip(&mut row[(24 - width) / 2..]) {
             *v = f32::from(p) / 255.
