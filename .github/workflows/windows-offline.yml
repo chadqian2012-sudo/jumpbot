@@ -35,6 +35,14 @@ jobs:
           @("JUMPBOT_OPENCV_DIR=$root", "OPENCV_INCLUDE_PATHS=$root\include", "OPENCV_LINK_LIBS=$($lib.BaseName)", "OPENCV_LINK_PATHS=$($lib.DirectoryName)", "LIBCLANG_PATH=$(Split-Path $clang)") >> $env:GITHUB_ENV
       - name: Test the accelerated Rust build
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked
+      - name: Verify foreground screen pixels and overlay hit routing
+        env:
+          JUMPBOT_TEST_FOREGROUND: '1'
+        timeout-minutes: 5
+        run: |
+          cargo test --manifest-path desktop/Cargo.toml --locked --release -p jumpbot-desktop --lib platform::tests::foreground_overlay_capture -- --exact --ignored --nocapture | Tee-Object -Variable result
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!($result -match '^test result: ok\. 1 passed;')) { throw 'Foreground acceptance did not execute exactly one test' }
       - name: Test the CPU-only Rust build
         run: cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked --no-default-features
       - name: Build installers and ZIPs from the same payload

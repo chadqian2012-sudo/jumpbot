@@ -132,7 +132,11 @@ fn measure_image<T>(
 }
 
 // The public image result and its annotation use the caller's pixel coordinates.
-fn map_detection_to_capture(d: &mut Detection, sx: f64, rows: crate::screen::CaptureRows) {
+pub(crate) fn map_detection_to_capture(
+    d: &mut Detection,
+    sx: f64,
+    rows: crate::screen::CaptureRows,
+) {
     let sy = rows.board_scale();
     let area = |n: i32| (f64::from(n) * sx * sy).round() as i32;
     let bbox = |[x, y, w, h]: [i32; 4]| {
