@@ -33,6 +33,10 @@ impl Counts {
         json!({"attempts":self.n,"landed":self.land,"deaths":self.dead,"hits":self.hits,"misses":self.misses,"unknown":self.n-self.dead-judged,"judged":judged,"hit_rate":rate(self.hits,judged),"landing_rate":rate(self.land,self.n),"judgement_coverage":rate(judged,self.n)})
     }
 }
+pub(crate) fn same_game_score(previous: Option<i32>, reading: Option<i32>) -> Option<i32> {
+    reading.filter(|now| previous.is_none_or(|prev| *now >= prev))
+}
+
 pub(crate) struct Records {
     pub path: PathBuf,
     pub run_uid: String,
@@ -40,7 +44,10 @@ pub(crate) struct Records {
     all: Counts,
     recent: VecDeque<Outcome>,
     pub index: u64,
+    /// Baseline for one jump. A missing or late score update breaks the delta chain.
     pub prev: Option<i32>,
+    /// Same-game lower bound, including across unreadable jumps.
+    pub last_known_score: Option<i32>,
     pub streak: i32,
     pub stalled: i32,
     best_streak: i32,
@@ -63,30 +70,37 @@ impl Records {
             recent: VecDeque::new(),
             index: 0,
             prev: None,
+            last_known_score: None,
             streak: 0,
             stalled: 0,
         }
     }
+    /// Start scoring a game whose score may be lower than the previous game's.
     pub fn resync(&mut self, score: Option<i32>) {
-        self.prev = score;
+        self.last_known_score = None;
+        self.resync_same_game(score);
+    }
+    pub fn resync_same_game(&mut self, reading: Option<i32>) {
+        let score = same_game_score(self.last_known_score, reading);
+        // Seeing the pre-gap value again does not recover a missing jump's score.
+        self.prev = score.filter(|_| self.prev.is_some() || score != self.last_known_score);
+        self.last_known_score = score.or(self.last_known_score);
         self.streak = 0;
         self.stalled = 0;
     }
     pub fn judge(&mut self, result: &'static str, score: Option<i32>, cap: i32) -> Outcome {
+        let score = same_game_score(self.last_known_score, score);
         let mut hit = None;
-        if result == "landed" {
-            if let Some(now) = score {
+        if let ("landed", Some(now)) = (result, score) {
+            let advanced = self.last_known_score != Some(now);
+            if advanced {
+                self.stalled = 0;
                 if let Some(prev) = self.prev {
                     let delta = now - prev;
-                    let delayed = self.stalled > 0;
-                    self.stalled = if delta == 0 { self.stalled + 1 } else { 0 };
-                    if delayed && delta != 0 {
-                        self.streak = 0
-                    } else if delta == 1 {
+                    if delta == 1 {
                         hit = Some(false);
                         self.streak = 0
-                    } else if delta > 0
-                        && delta <= 200
+                    } else if delta <= 200
                         && delta == self.streak.saturating_add(1).saturating_mul(2).min(cap)
                     {
                         hit = Some(true);
@@ -94,18 +108,21 @@ impl Records {
                     } else if (4..=cap.min(200)).contains(&delta) && delta % 2 == 0 {
                         hit = Some(true);
                         self.streak = delta / 2
-                    } else if delta < 0 {
-                        self.streak = 0
                     }
+                } else {
+                    self.streak = 0;
                 }
-                self.prev = Some(now);
-                self.best_score = Some(self.best_score.map_or(now, |old| old.max(now)));
-                self.best_streak = self.best_streak.max(self.streak);
             } else {
-                self.resync(None)
+                self.stalled += 1;
             }
+            self.prev = advanced.then_some(now);
+            self.last_known_score = Some(now);
+            self.best_score = Some(self.best_score.map_or(now, |old| old.max(now)));
+            self.best_streak = self.best_streak.max(self.streak);
+        } else if result == "dead" {
+            self.resync(None);
         } else {
-            self.resync(None)
+            self.resync_same_game(None);
         }
         Outcome { result, score, hit }
     }
@@ -223,8 +240,51 @@ mod tests {
         let mut r = Records::new(PathBuf::new());
         r.resync(Some(10));
         assert_eq!(r.judge("landed", None, 32).hit, None);
+        let late = r.judge("landed", Some(10), 32);
+        assert_eq!((late.score, late.hit, r.prev), (Some(10), None, None));
+        r.resync_same_game(Some(10));
+        assert_eq!(r.prev, None);
         assert_eq!(r.judge("landed", Some(14), 32).hit, None);
         assert_eq!(r.judge("landed", Some(15), 32).hit, Some(false));
+    }
+    #[test]
+    fn backward_score_is_unknown_and_breaks_the_delta_chain() {
+        for (previous, result) in [(467, "landed"), (467, "unknown"), (1081, "unknown")] {
+            let mut r = Records::new(PathBuf::new());
+            r.resync(Some(previous - 2));
+            assert_eq!(r.judge("landed", Some(previous), 32).hit, Some(true));
+
+            let rejected = r.judge(result, Some(8), 32);
+            assert_eq!(
+                (rejected.result, rejected.score, rejected.hit),
+                (result, None, None)
+            );
+            assert_eq!((r.prev, r.streak, r.stalled), (None, 0, 0));
+            assert_eq!(r.best_score, Some(previous));
+            assert_eq!(r.last_known_score, Some(previous));
+            let repeated = r.judge("landed", Some(8), 32);
+            assert_eq!((repeated.score, repeated.hit, r.prev), (None, None, None));
+
+            assert_eq!(r.judge("landed", Some(previous + 2), 32).hit, None);
+            assert_eq!(r.judge("landed", Some(previous + 3), 32).hit, Some(false));
+            r.resync(Some(0));
+            assert_eq!(r.judge("landed", Some(2), 32).hit, Some(true));
+        }
+    }
+    #[test]
+    fn same_game_resync_keeps_the_floor_until_a_new_game() {
+        let mut r = Records::new(PathBuf::new());
+        r.resync(Some(467));
+        r.resync_same_game(None);
+        r.resync_same_game(Some(8));
+        assert_eq!((r.last_known_score, r.prev), (Some(467), None));
+        r.resync_same_game(Some(469));
+        assert_eq!(r.judge("landed", Some(470), 32).hit, Some(false));
+
+        r.judge("dead", None, 32);
+        assert_eq!((r.last_known_score, r.prev), (None, None));
+        let first = r.judge("landed", Some(0), 32);
+        assert_eq!((first.score, first.hit), (Some(0), None));
     }
     #[test]
     fn late_hud_delta_after_an_unchanged_read_is_not_one_jumps_bonus() {

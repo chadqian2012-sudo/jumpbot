@@ -19,6 +19,7 @@ pub(crate) struct State {
     stopped_at: Option<Instant>,
     pause_count: u64,
     pub(crate) stop_reason: Option<&'static str>,
+    landing_pause_reason: Option<String>,
     paused_time: Duration,
     registered: bool,
     error: Option<String>,
@@ -73,6 +74,7 @@ impl State {
                 }
             }
         }
+        self.landing_pause_reason = None;
         self.generation += 1;
     }
     fn admits(&self, g: u64, ready: bool) -> bool {
@@ -88,6 +90,16 @@ impl State {
     }
 }
 impl Control {
+    fn pause_if_current(&self, g: u64, reason: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.admits(g, true) {
+            return false;
+        }
+        state.request(Request::Pause, Instant::now());
+        state.landing_pause_reason = Some(reason.to_owned());
+        self.changed.notify_all();
+        true
+    }
     fn request(&self, request: Request) {
         self.state.lock().unwrap().request(request, Instant::now());
         self.changed.notify_all();
@@ -186,6 +198,9 @@ impl Controls {
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.shared.state.lock().unwrap()
     }
+    pub(crate) fn pause_if_current(&self, g: u64, reason: &str) -> bool {
+        self.shared.pause_if_current(g, reason)
+    }
     pub(crate) fn generation(&self) -> u64 {
         self.state().generation
     }
@@ -235,7 +250,7 @@ impl Controls {
             _ if s.needs_resume && phase != "waiting_window" => "resuming",
             _ => phase,
         };
-        json!({"state":phase,"alive":phase!="stopped","paused":s.pause,"pause_count":s.pause_count,"control_generation":s.generation,"hotkey_registered":s.registered,"hotkey_error":s.error,"pause_total_s":paused.as_secs_f64(),"elapsed_running":round_start.is_some() && phase!="stopped" && s.acknowledged.is_none() && !s.stopped,"active_elapsed_s":elapsed.as_secs_f64()})
+        json!({"state":phase,"alive":phase!="stopped","paused":s.pause,"landing_pause_reason":s.landing_pause_reason,"pause_count":s.pause_count,"control_generation":s.generation,"hotkey_registered":s.registered,"hotkey_error":s.error,"pause_total_s":paused.as_secs_f64(),"elapsed_running":round_start.is_some() && phase!="stopped" && s.acknowledged.is_none() && !s.stopped,"active_elapsed_s":elapsed.as_secs_f64()})
     }
     pub(crate) fn sleep(&self, g: u64, t: Duration) {
         let s = self.state();
@@ -275,6 +290,45 @@ mod tests {
         assert!(!s.admits(0, true));
         assert!(!s.admits(s.generation, true));
         assert!(s.admits(s.generation, false));
+    }
+    #[test]
+    fn landing_pause_only_applies_to_the_current_runnable_generation() {
+        let ctrl = Control {
+            state: Mutex::new(State {
+                registered: true,
+                ..State::default()
+            }),
+            changed: Condvar::new(),
+        };
+        let reason = "落点仍未确认";
+        assert!(ctrl.pause_if_current(0, reason));
+        ctrl.request(Request::Pause); // Already paused.
+        assert!(!ctrl.pause_if_current(1, "迟到的原因"));
+        assert_eq!(
+            ctrl.state.lock().unwrap().landing_pause_reason.as_deref(),
+            Some(reason)
+        );
+
+        ctrl.request(Request::Resume);
+        assert!(ctrl.state.lock().unwrap().landing_pause_reason.is_none());
+        ctrl.request(Request::Toggle); // Pause again before a window has been found.
+        {
+            let s = ctrl.state.lock().unwrap();
+            assert!(s.pause);
+            assert!(s.landing_pause_reason.is_none());
+        }
+
+        ctrl.request(Request::Resume);
+        assert!(!ctrl.pause_if_current(4, reason)); // Resume countdown is still running.
+        ctrl.state.lock().unwrap().needs_resume = false;
+        assert!(!ctrl.pause_if_current(0, reason));
+        assert!(ctrl.pause_if_current(4, reason));
+        ctrl.request(Request::Stop("F8 停止"));
+        assert!(!ctrl.pause_if_current(6, reason));
+        let s = ctrl.state.lock().unwrap();
+        assert_eq!(s.generation, 6);
+        assert!(s.landing_pause_reason.is_none());
+        assert_eq!(s.stop_reason, Some("F8 停止"));
     }
     #[test]
     fn hotkey_conflict_denies_pipe_resume_and_stop_wins_over_toggle() {
