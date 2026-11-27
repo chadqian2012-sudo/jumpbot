@@ -3,6 +3,69 @@
 在 Windows 上截取微信小游戏「跳一跳」窗口画面，用 OpenCV 识别棋子与目标方块，
 模拟鼠标按住蓄力完成自动跳跃。当前配置按压系数固定为 k=2.61，在线自适应关闭。
 
+## Windows 桌面控制台
+
+琥珀高亮、暖白底、切角面板。支持深色模式和系统的「减少动态效果」。
+进入落点检查时，棋子会跳向另一块平台。去程弧线较高，回程更短、更低。右侧显示本轮分数、跳数和命中率。
+窗口可启动、暂停、恢复、停止、切换识别后端和运行无输入自检。
+
+Windows x64 软件目录内双击 `jumpbot-desktop.exe` 打开界面。界面由 Rust 绘制，使用 Windows 原生控件。保留同目录的 `jumpbot.exe`、OpenCV 与 Visual C++ DLL、`config.json` 和 `templates`。这个版本的运行、构建和打包都可在没有 Python 的环境进行。
+
+拖动中间的竖分隔线可以调整两列宽度。左右两列各有一条横分隔线，可以分别调整上、下板块的高度。日志标题右侧的 `A−` 可以缩小字号，让同样的高度多显示几行。`A+` 可以放大。
+
+启动后手动打开小游戏。按 Alt+P 或点面板按钮暂停，等到显示「已暂停」即可切换窗口。恢复时会重新抓图，F8 可停止整轮。日常启动不限跳数，验收时可在命令行单独给出次数。真实中心命中率来自游戏分数的变化，无法读分的跳跃单独统计。
+
+窗口可以按你习惯的大小使用。面板在游戏名称旁显示实际客户区的宽和高。脚本将充满客户区的游戏画面换算到标定宽高，再识别棋子、计算蓄力。放大同一局面时，画面上的距离变长，按压时间应基本相同。拖动或缩放后会重新抓图。默认标定尺寸为 553×1050，继续使用原有 `k` 和按压上下限。
+
+离线 `--image` 输出中的 `capture_size` 为原图宽高，`recognition_size` 为识别宽高。`piece`、`target` 和标注图使用原图坐标，`calibrated_dist_px` 是计算蓄力所用的标定距离。日志中的跳跃距离、误差和标定样本都使用标定像素，可跨窗口尺寸比较。
+
+完整包会试用机器现有的 CUDA 或 OpenCL 驱动，自动比较速度。缺少驱动时回退到 CPU。轻量包使用 CPU，有 AVX2 时可以选 SIMD。自检结果中的 `actual` 表示实际运行的后端。
+
+```powershell
+.\jumpbot.exe --selftest
+.\jumpbot.exe --image "D:\frames\board.png" --backend simd
+```
+
+## 从源码运行和打包
+
+Windows x64 使用 Rust 的 MSVC 工具链、Visual C++ 构建工具和 OpenCV 4.x 的 x64 SDK。生成 Rust 绑定时需要能读取当前 MSVC 头文件的 Clang。本机 Visual Studio 18 使用 Clang 20。安装包由 Inno Setup 6 根据声明式安装清单生成。
+
+在 x64 开发者 PowerShell 中，设置 `JUMPBOT_OPENCV_DIR` 为含 `include` 与 `x64` 的 SDK 目录。将 Clang 的 `bin` 加入 PATH，然后执行以下命令。
+
+```powershell
+$lib = Get-ChildItem "$env:JUMPBOT_OPENCV_DIR\x64\vc*\lib\opencv_world*.lib" | Where-Object BaseName -Match '^opencv_world\d+$' | Select-Object -First 1
+$env:OPENCV_INCLUDE_PATHS = "$env:JUMPBOT_OPENCV_DIR\include"
+$env:OPENCV_LINK_PATHS = $lib.DirectoryName
+$env:OPENCV_LINK_LIBS = $lib.BaseName
+$env:LIBCLANG_PATH = Split-Path (Get-Command clang.exe).Source
+cargo build --manifest-path desktop/Cargo.toml --release --bin jumpbot --bin jumpbot-desktop --locked
+cargo test --manifest-path desktop/Cargo.toml --workspace --release --locked
+```
+
+对比两个工作程序时，使用同一批 PNG。工具会交替运行新旧版本，核对人物、目标、分数、蓄力与两张掩码，再输出中位数和第 95 百分位耗时。
+
+```powershell
+cargo run --manifest-path desktop/Cargo.toml --release --example compare -- OLD.exe NEW.exe "tests/fixtures/*.png"
+cargo run --manifest-path desktop/Cargo.toml --release --bin jumpbot-profile -- --backend cuda --image "tests/fixtures/skin-gold-play.png" --masks-only --repeat 500
+```
+
+需要固定跳数时，单独使用验收工具。下面第一条会向用户手动打开的小游戏发送输入。第二条只读取保存的 CSV。
+
+```powershell
+cargo run --manifest-path desktop/Cargo.toml -p jumpbot-qa -- run-frozen-acceptance --execute-live --exe PATH/TO/jumpbot.exe --out build/acceptance-500 --jumps 500 --backend simd
+cargo run --manifest-path desktop/Cargo.toml -p jumpbot-qa -- report PATH/TO/run.csv
+```
+
+以下命令生成完整和轻量两套 ZIP 与安装 EXE，并从交付文件重新验证校验清单和离线识别。每次选择新的输出目录。正式封包还要有对应版本的测试报告与干净的 Git 工作树。
+
+```powershell
+cargo run --manifest-path desktop/Cargo.toml -p jumpbot-dist -- --candidate --version 0.0.0-local --output build/check-package
+cargo run --manifest-path desktop/Cargo.toml -p jumpbot-dist -- --verify --version 0.0.0-local --output build/check-package
+```
+
+<details>
+<summary>历史版本的交付记录与旧版命令</summary>
+
 ## 日志流式读取与面板缓存优化（v1.3）
 
 - 将 CSV 逐行解析提取成同一份 `iter_csv`，面板统计及多日志遍历不再先构建完整
@@ -1465,3 +1528,5 @@ jumpbot/
   logs/             run_*.csv 每跳记录
   debug/            探针图、dry-run 标注图、每跳快照、分数样本
 ```
+
+</details>

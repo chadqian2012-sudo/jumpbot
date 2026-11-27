@@ -1,23 +1,8 @@
 # Third-party notices
 
-The integer BGR-to-HSV conversions in `Vision._masks_gpu` and the OpenCL
-kernel in `Vision._init_opencl` are adapted from the
-OpenCV project's `RGB2HSV_b` implementation in
-`modules/imgproc/src/color_hsv.simd.hpp` (OpenCV 4.14.0).
+The Windows packages contain the Rust CLI and desktop application. Both editions use the native OpenCV world library for image processing. The full edition enables the CUDA and OpenCL backends. The portable edition uses the CPU.
 
-Source: https://github.com/opencv/opencv/blob/4.14.0/modules/imgproc/src/color_hsv.simd.hpp
-
-OpenCV is distributed under the Apache License, Version 2.0. A copy is included
-in `LICENSE-OpenCV.txt`. The adapted implementation combines the conversion
-with jumpbot's CUDA mask thresholds and uses persistent lookup tables and
-device buffers. OpenCV's original integer lookup and rounding rules are retained.
-
-Windows software deliveries also include a `licenses/` directory containing
-the license files supplied by the installed runtime distributions (Python,
-NumPy, OpenCV, MSS, PyOpenCL/PyTools and the PyInstaller bootloader terms).
-Full builds additionally include the CuPy and bundled NVIDIA CUDA runtime,
-NVRTC and nvJitLink license texts. Other dependency license files may remain
-under `_internal/` in their original distribution directories.
-
-These notices do not replace the vendor terms. The portable build omits the
-CuPy/CUDA libraries; OpenCL uses the device driver's runtime.
+- OpenCV and the integer BGR-to-HSV conversion adapted from OpenCV's `RGB2HSV_b` use Apache-2.0. See [the upstream implementation](https://github.com/opencv/opencv/blob/4.14.0/modules/imgproc/src/color_hsv.simd.hpp), `LICENSE-OpenCV.txt`, and the SDK notices in `licenses/OpenCV/`.
+- The desktop UI embeds Saira. Its SIL Open Font License and copyright notice are in `licenses/Saira-OFL.txt` in the package and `desktop/ui/Saira-OFL.txt` in the source tree.
+- The Rust standard library notices are included in `licenses/rust-standard-library.html`. The package lists Cargo dependencies, versions and declared licenses in `licenses/cargo-dependencies.txt`. License texts supplied with these crates are in the corresponding package directories.
+- The native desktop window uses Windows system APIs. Microsoft Visual C++ redistributable terms apply to the app-local runtime DLLs. [Visual Studio licensing](https://visualstudio.microsoft.com/license-terms/).
