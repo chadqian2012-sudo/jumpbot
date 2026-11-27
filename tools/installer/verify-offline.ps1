@@ -135,7 +135,7 @@ try {
     Check (!(Test-Path -LiteralPath $key) -and !(Test-Path -LiteralPath (Join-Path $app 'jumpbot.exe'))) '无效的 DLL 来源启动了安装'
     if ($PreviousInstaller) {
         $previous = (Resolve-Path -LiteralPath $PreviousInstaller).Path
-        Check ((Get-Item -LiteralPath $previous).VersionInfo.FileDescription -ceq '跳一跳控制台（离线测试版） 安装程序') '旧文件与预览安装器不符'
+        Check ((Get-Item -LiteralPath $previous).VersionInfo.FileDescription.TrimEnd() -ceq '跳一跳控制台（离线测试版） 安装程序') '旧文件与预览安装器不符'
         $programs = [Environment]::GetFolderPath('Programs')
         $legacyGroup = Join-Path $programs '跳一跳控制台（离线测试版）'
         foreach ($dir in @($legacyGroup, (Join-Path $programs 'JumpBot'))) {
