@@ -26,6 +26,11 @@ pub fn edge_medians(
         ] {
             let pixels = band.as_chunks::<3>().0;
             let n = pixels.len();
+            // Equal slices shifted by one pixel mean the entire band has one BGR color.
+            if n != 0 && pixels[1..] == pixels[..n - 1] {
+                output.copy_from_slice(&pixels[0].map(f32::from));
+                continue;
+            }
             if n <= 32 {
                 let mut buf = [[0u8; 32]; 3];
                 for (i, p) in pixels.iter().enumerate() {
@@ -151,11 +156,19 @@ mod tests {
 
     #[test]
     fn edge_medians_matches_scalar_reference_for_small_and_large_bands() {
-        for (width, band) in [(17, 3), (40, 4), (553, 17), (1066, 32), (1200, 36)] {
+        for (width, band) in [(1, 1), (17, 3), (40, 4), (553, 17), (1066, 32), (1200, 36)] {
             let height = 9;
-            let frame: Vec<u8> = (0..width * height * 3)
+            let mut frame: Vec<u8> = (0..width * height * 3)
                 .map(|i| ((i * 73 + i / 11 + 19) % 256) as u8)
                 .collect();
+            for (y, row) in frame.chunks_exact_mut(width * 3).enumerate().take(4) {
+                for p in row.as_chunks_mut::<3>().0 {
+                    p.copy_from_slice(&[11, y as u8, 231]);
+                }
+                if y % 2 == 1 {
+                    row[band * 3 - 1] ^= 0xff;
+                }
+            }
             let (exp_left, exp_right) = reference_edge_medians(&frame, width, band, width - band);
             let mut left = vec![0.0f32; height * 3];
             let mut right = vec![0.0f32; height * 3];

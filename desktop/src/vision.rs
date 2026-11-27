@@ -968,31 +968,49 @@ impl Vision {
         if piece_mask.len() != expected || block_mask.len() != expected {
             return Err("Mask dimensions differ from the BGR frame".into());
         }
-        let piece = self.find_piece(frame, &mut piece_mask, &mut block_mask)?;
-        let mut selection = TargetSelection::Missing;
-        if let Some(p) = &piece {
-            if want_target {
-                let mut scratch = TargetScratch {
-                    region: &mut self.region_scratch,
-                    face_mask: &mut self.face_mask,
-                    dot_mask: &mut self.dot_mask,
-                };
-                selection =
-                    find_target(frame, &block_mask, p, &piece_mask, &self.cfg, &mut scratch)?;
-            }
-            self.prior = Some(p.clone());
-        }
-        let unresolved_target_shadow = matches!(selection, TargetSelection::UnresolvedShadow);
-        Ok(Detection {
-            piece,
-            target: match selection {
-                TargetSelection::Found(block) => Some(block),
-                _ => None,
-            },
-            unresolved_target_shadow,
+        let mut detection = Detection {
+            piece: self.find_piece(frame, &mut piece_mask, &mut block_mask)?,
+            target: None,
+            unresolved_target_shadow: false,
             piece_mask,
             block_mask,
-        })
+        };
+        if want_target {
+            self.complete_target(frame, &mut detection)?;
+        }
+        if let Some(p) = &detection.piece {
+            self.prior = Some(p.clone());
+        }
+        Ok(detection)
+    }
+
+    /// Complete a piece-only detection from this same frame.
+    pub(crate) fn complete_target(
+        &mut self,
+        frame: &Frame,
+        d: &mut Detection,
+    ) -> Result<(), String> {
+        if let Some(p) = &d.piece {
+            let mut scratch = TargetScratch {
+                region: &mut self.region_scratch,
+                face_mask: &mut self.face_mask,
+                dot_mask: &mut self.dot_mask,
+            };
+            let selection = find_target(
+                frame,
+                &d.block_mask,
+                p,
+                &d.piece_mask,
+                &self.cfg,
+                &mut scratch,
+            )?;
+            d.unresolved_target_shadow = matches!(selection, TargetSelection::UnresolvedShadow);
+            d.target = match selection {
+                TargetSelection::Found(block) => Some(block),
+                _ => None,
+            };
+        }
+        Ok(())
     }
 
     fn find_piece(
@@ -1161,6 +1179,18 @@ mod dark_board_tests {
             assert_eq!(screen.score(&f, &cfg), Some(3458));
             vision.reset_prior();
             let mut d = vision.detect(&f).unwrap();
+            vision.reset_prior();
+            let mut sampled = vision.detect_piece_only(&f).unwrap();
+            vision.complete_target(&f, &mut sampled).unwrap();
+            assert_eq!(sampled.piece_mask, d.piece_mask);
+            assert_eq!(sampled.block_mask, d.block_mask);
+            assert_eq!(serde_json::json!(sampled.piece), serde_json::json!(d.piece));
+            assert_eq!(
+                serde_json::json!(sampled.target),
+                serde_json::json!(d.target)
+            );
+            assert_eq!(sampled.unresolved_target_shadow, d.unresolved_target_shadow);
+            assert_eq!(screen.dark_board_score(&f, &cfg, &sampled), Some(3458));
             assert!(
                 clear_dark_board(&f, &d, &cfg),
                 "{tint:?}: {:?} {:?}",
