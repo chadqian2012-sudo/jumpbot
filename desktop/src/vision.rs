@@ -406,11 +406,58 @@ fn find_dot_if(
                 || y == 0
                 || x + bw == bounds[2]
                 || y + bh == bounds[3]
-                || (ry - rx * cfg.f("axis_slope")).abs() > 1.
                 || (dx - cx).hypot(dy - cy) > radius.min(f64::from(bw))
                 || !accept(dx, dy)
             {
                 continue;
+            }
+            let slope = cfg.f("axis_slope");
+            if (ry - rx * slope).abs() > 1. {
+                // Resizing can erode both ends of the exact-245 core vertically.
+                // On a white cap the half-coverage contour is 250 (245 ink, 255 face).
+                let pad = 4;
+                let (left, right, top, bottom) = (x - pad, x + bw + pad, y - pad, y + bh + pad);
+                if ry >= rx * slope
+                    || left < 0
+                    || top < 0
+                    || right > bounds[2]
+                    || bottom > bounds[3]
+                {
+                    continue;
+                }
+                let pixels = frame.bgr.as_chunks::<3>().0;
+                let pixel = |xx: i32, yy: i32| {
+                    pixels[(y0 + yy) as usize * frame.width + (x0 + xx) as usize]
+                };
+                if ![top, bottom - 1]
+                    .into_iter()
+                    .all(|yy| pixel(left, yy) == [255; 3] && pixel(right - 1, yy) == [255; 3])
+                {
+                    continue;
+                }
+                let diameter = (left..right)
+                    .filter(|&xx| pixel(xx, my.round() as i32).into_iter().all(|v| v <= 250))
+                    .count() as f64;
+                let outer_ry = diameter * 0.5 * slope;
+                if diameter <= f64::from(bw) || outer_ry >= ry + f64::from(pad) - 0.5 {
+                    continue;
+                }
+                // The same measured center must explain the entire contour, within
+                // half a raster row. A straight cut or a bright fringe alone cannot.
+                let matches = (top..bottom).all(|yy| {
+                    (left..right).all(|xx| {
+                        let [b, g, r] = pixel(xx, yy);
+                        let (lo, hi) = (b.min(g).min(r), b.max(g).max(r));
+                        let distance = ((f64::from(xx) - mx) * slope).hypot(f64::from(yy) - my);
+                        lo >= 245
+                            && hi - lo <= 1
+                            && ((hi <= 250) == (distance <= outer_ry)
+                                || (distance - outer_ry).abs() <= 0.5)
+                    })
+                });
+                if !matches {
+                    continue;
+                }
             }
             let ellipse = |mx: f64, my: f64| {
                 (y..y + bh).all(|yy| {
@@ -661,10 +708,10 @@ fn find_target(
     };
     let mut chosen = selected.block.clone();
     let width = chosen.bbox[2] as f64;
-    // A small asymmetric component can be just the detached shadow on the left
+    // Even a component with a broad top can be the detached shadow on the left
     // of a bottle. Compare the shade against the exposed background on two sides.
     let [bx, by, bw, bh] = chosen.bbox.map(|v| v as usize);
-    if !selected.strict && chosen.top_width < low_gate * width && bx >= 3 && by >= 3 {
+    if !selected.strict && bx >= 3 && by >= 3 {
         let pixel = |x, y| frame.bgr.as_chunks::<3>().0[y * frame.width + x];
         let x = bx + bw / 2;
         let above: [u8; 3] = pixel(x, by - 3);
@@ -726,33 +773,39 @@ fn find_target(
                 if !white {
                     return Ok(TargetSelection::UnresolvedShadow);
                 }
-                if radius <= 0.0 {
-                    return Ok(TargetSelection::Found(b.clone()));
-                }
-                if let Some(dot) = find_dot_if(
-                    frame,
-                    DotQuery {
-                        cx: b.x,
-                        cy: b.y,
-                        radius,
-                        painted: true,
-                    },
-                    cfg,
-                    scratch.region,
-                    scratch.dot_mask,
-                    |x, y| {
-                        let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
-                        (b.top_y..=b.top_y + b.top_width * slope).contains(&y)
-                            && y < max_y
-                            && (lower..=max_dist).contains(&along)
-                            && cross <= ratio * along
-                    },
-                )? {
-                    let mut cap = b.clone();
-                    cap.x = dot.0;
-                    cap.y = dot.1;
-                    cap.dot = Some(dot);
-                    return Ok(TargetSelection::Found(cap));
+                let on_face = |x, y| {
+                    let (_, along, cross) = axis_components(x - piece.x, y - piece.y, slope);
+                    (b.top_y..=b.top_y + b.top_width * slope).contains(&y)
+                        && y < max_y
+                        && (lower..=max_dist).contains(&along)
+                        && cross <= ratio * along
+                };
+                let aim = if radius <= 0.0 {
+                    // This midline was verified on both sides of the cap.
+                    on_face(b.x, cap_y).then_some((b.x, cap_y, None))
+                } else {
+                    find_dot_if(
+                        frame,
+                        DotQuery {
+                            cx: b.x,
+                            cy: b.y,
+                            radius,
+                            painted: true,
+                        },
+                        cfg,
+                        scratch.region,
+                        scratch.dot_mask,
+                        on_face,
+                    )?
+                    .map(|dot| (dot.0, dot.1, Some(dot)))
+                };
+                if let Some((x, y, dot)) = aim {
+                    return Ok(TargetSelection::Found(Block {
+                        x,
+                        y,
+                        dot,
+                        ..b.clone()
+                    }));
                 }
             }
             return Ok(TargetSelection::UnresolvedShadow);
@@ -1321,6 +1374,54 @@ mod tests {
     }
 
     #[test]
+    fn white_cap_requires_a_complete_blended_disc_around_a_flat_ink_core() {
+        let cfg = Config::default();
+        let slope = cfg.f("axis_slope");
+        let (cx, cy) = (20.5, 18.);
+        let mut frame = Frame {
+            width: 42,
+            height: 37,
+            bgr: vec![255; 42 * 37 * 3],
+        };
+        for (i, p) in frame.bgr.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let (x, y) = ((i % 42) as f64 - cx, (i / 42) as f64 - cy);
+            let value = if (x / 8.).hypot(y / 3.5) <= 1. {
+                245
+            } else if (x * slope).hypot(y) <= 10. * slope {
+                248
+            } else {
+                255
+            };
+            *p = [value; 3];
+        }
+        let read = |f: &Frame| {
+            find_dot_if(
+                f,
+                DotQuery {
+                    cx,
+                    cy,
+                    radius: 17.,
+                    painted: true,
+                },
+                &cfg,
+                &mut RegionScratch::default(),
+                &mut Vec::new(),
+                |_, _| true,
+            )
+            .unwrap()
+            .map(|(x, y, _)| (x, y))
+        };
+        assert_eq!(read(&frame), Some((cx, cy)));
+        // Keep the exact same ink; remove only the lower antialiased edge.
+        for p in frame.bgr[19 * 42 * 3..].as_chunks_mut::<3>().0 {
+            if *p == [248; 3] {
+                *p = [255; 3];
+            }
+        }
+        assert_eq!(read(&frame), None);
+    }
+
+    #[test]
     fn thin_capture_edges_leave_the_gold_piece_and_platform_visible() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/skin-gold-play.png");
@@ -1431,12 +1532,16 @@ mod tests {
     fn bottle_shadow_requires_a_supported_top() {
         let images = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/bottle-shadow");
-        for (name, x, y) in [
-            ("development.png", 400usize, 501usize),
-            ("holdout.png", 393, 505),
+        // The painted disc sits slightly above the white face center. For the
+        // unmarked geometry, opposite vertical rim chords give its midpoint.
+        for (name, x, mark_y, face_y) in [
+            ("development.png", 400usize, 501usize, 503usize),
+            ("holdout.png", 393, 505, 507),
+            ("wide-shadow.png", 385, 510, 512),
         ] {
             let frame = Frame::read(&images.join(name)).unwrap();
             for dots in [true, false] {
+                let y = if dots { mark_y } else { face_y };
                 let mut cfg = Config::default();
                 if !dots {
                     cfg.0["center_dot_max_offset_px"] = 0.into();
@@ -1444,7 +1549,10 @@ mod tests {
                 let mut vision = Vision::new(&cfg, "cpu").unwrap();
                 let seen = vision.detect(&frame).unwrap();
                 let cap = seen.target.unwrap();
-                assert!(!seen.unresolved_target_shadow && cap.dot.is_some() == dots);
+                assert!(
+                    !seen.unresolved_target_shadow && cap.dot.is_some() == dots,
+                    "{name}, dots={dots}"
+                );
                 assert!((cap.x - x as f64).hypot(cap.y - y as f64) <= 2.);
 
                 // Keep the bottle and its cast shadow, covering the marker when
