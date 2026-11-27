@@ -14,7 +14,7 @@
   #define AppFlavor "full"
 #endif
 #if AppFlavor == "offline"
-  #define AppTitle "跳一跳控制台（离线测试版）"
+  #define AppTitle "跳一跳控制台"
   #define AppSubdir "jumpbot-offline-preview"
   #define PreviewGuid "{AA105DEB-419A-4E5B-A840-4F7E2332A61C}"
   #define AppIdentity "{" + PreviewGuid
@@ -41,7 +41,11 @@ AppSupportURL=https://github.com/chadqian2012-sudo/jumpbot
 VersionInfoVersion={#AppVersionInfo}
 VersionInfoDescription={#AppTitle} 安装程序
 DefaultDirName={localappdata}\Programs\{#AppSubdir}
+#if AppFlavor == "offline"
+DefaultGroupName=JumpBot
+#else
 DefaultGroupName={#AppTitle}
+#endif
 PrivilegesRequired=lowest
 #if AppFlavor == "offline"
 DisableProgramGroupPage=no
@@ -56,6 +60,9 @@ OutputBaseFilename=jumpbot-setup-{#AppVersion}-{#AppFlavor}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+#if AppFlavor == "offline"
+WizardImageFile=wizard-brand.png
+#endif
 WizardSmallImageFile=..\..\desktop\ui\JumpBot-Interval.bmp
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -69,18 +76,46 @@ AllowNoIcons=yes
 Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
 
 #if AppFlavor == "offline"
+[LangOptions]
+DialogFontName=Microsoft YaHei UI
+WelcomeFontName=Microsoft YaHei UI
+WelcomeFontSize=18
+
 [Types]
-Name: "all"; Description: "自动选择（CPU、CUDA 和 OpenCL）"
-Name: "cpu"; Description: "仅 CPU（兼容模式）"
-Name: "custom"; Description: "自选加速组件"; Flags: iscustom
+Name: "all"; Description: "自动选择（推荐）"
+Name: "cpu"; Description: "仅 CPU"
+Name: "custom"; Description: "自定义"; Flags: iscustom
 
 [Components]
-Name: "core"; Description: "主程序、CPU、OpenCV 和 Visual C++ 运行库（必装）"; Types: all cpu custom; Flags: fixed
-Name: "cuda"; Description: "NVIDIA CUDA 加速"; Types: all
-Name: "opencl"; Description: "OpenCL 加速（Intel、AMD 或 NVIDIA）"; Types: all
+Name: "core"; Description: "主程序与运行库（必选）"; Types: all cpu custom; Flags: fixed
+Name: "cuda"; Description: "CUDA（NVIDIA）"; Types: all
+Name: "opencl"; Description: "OpenCL（Intel、AMD、NVIDIA）"; Types: all
 
 [Messages]
-SelectComponentsLabel2=选择可使用的加速方式，然后点击“下一步”。已有兼容驱动时可使用显卡，没有合适设备时自动使用 CPU。无需下载驱动或 CUDA Toolkit。
+WelcomeLabel1=[name]
+WelcomeLabel2=选择安装位置和加速方式。%n所需组件已随安装包提供。
+ClickNext=
+ButtonNext=下一步(&N)
+ButtonBack=上一步(&B)
+WizardSelectDir=安装位置
+SelectDirDesc=选择程序的安装文件夹。
+SelectDirLabel3=安装文件夹
+SelectDirBrowseLabel=首次安装请选择空文件夹，升级请沿用原目录。
+WizardSelectComponents=加速方式
+SelectComponentsDesc=按这台电脑的硬件选择。
+SelectComponentsLabel2=默认启用可用的显卡加速，没有兼容显卡时使用 CPU。
+WizardSelectTasks=快捷方式
+SelectTasksDesc=选择从哪里打开控制台。
+SelectTasksLabel2=
+WizardReady=确认安装
+ReadyLabel1=请确认以下设置。
+ReadyLabel2a=
+ReadyLabel2b=
+ReadyMemoTasks=快捷方式
+FinishedHeadingLabel=安装完成
+FinishedLabel=[name]已就绪。
+FinishedLabelNoIcons=[name]已就绪。
+ClickFinish=
 
 [INI]
 Filename: "{app}\.jumpbot-offline-preview.ini"; Section: "Install"; Key: "Channel"; String: "offline-preview"
@@ -88,11 +123,12 @@ Filename: "{app}\.jumpbot-offline-preview.ini"; Section: "Install"; Key: "Channe
 [InstallDelete]
 Type: files; Name: "{group}\NVIDIA CUDA 模式.lnk"; Check: not WizardIsComponentSelected('cuda')
 Type: files; Name: "{group}\OpenCL 模式.lnk"; Check: not WizardIsComponentSelected('opencl')
-Type: files; Name: "{autodesktop}\{#AppTitle}.lnk"; Check: not WizardIsTaskSelected('desktopicon')
+Type: files; Name: "{autodesktop}\跳一跳控制台（离线测试版）.lnk"; Check: (not WizardIsTaskSelected('desktopicon') or DesktopNameFree) and DesktopPointsToConsole('跳一跳控制台（离线测试版）')
+Type: files; Name: "{autodesktop}\JumpBot 控制台.lnk"; Check: not WizardIsTaskSelected('desktopicon') and DesktopPointsToConsole('JumpBot 控制台')
 #endif
 
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: checkedonce
+Name: "desktopicon"; Description: "创建桌面快捷方式"; Flags: checkedonce
 
 [Files]
 ; A v1.3 uninstall log can remove config.json. Restore saved user bytes first.
@@ -117,7 +153,11 @@ Name: "{group}\纯 CPU 模式"; Filename: "{app}\jumpbot.exe"; Parameters: "--ba
 Name: "{group}\只识别不发输入（安全演示）"; Filename: "{app}\jumpbot.exe"; Parameters: "--dry-run --samples 3"; WorkingDir: "{app}"
 Name: "{group}\配置文件夹"; Filename: "{app}"
 Name: "{group}\卸载 跳一跳自动脚本"; Filename: "{uninstallexe}"
+#if AppFlavor == "offline"
+Name: "{autodesktop}\JumpBot 控制台"; Filename: "{app}\jumpbot-desktop.exe"; WorkingDir: "{app}"; Tasks: desktopicon; Check: DesktopNameFree
+#else
 Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\jumpbot-desktop.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+#endif
 
 [Run]
 Filename: "{app}\run.exe"; Parameters: "--finish-config-restore"; Flags: runhidden
@@ -138,6 +178,92 @@ var
   CvFile: TInputFileWizardPage;
   CvSnapshot: String;
 
+function DesktopNameFree: Boolean;
+var
+  Base: String;
+begin
+  Base := ExpandConstant('{autodesktop}\JumpBot 控制台');
+  // Inno replaces .pif, .url and folder shortcuts of the same name as well.
+  Result := not (FileExists(Base + '.lnk') or FileExists(Base + '.pif') or
+    FileExists(Base + '.url') or DirExists(Base) or DirExists(Base + '.lnk'));
+end;
+
+function LinkPointsTo(Path, Expected, Args: String): Boolean;
+var
+  Shell, Folder, Item, Link: Variant;
+  Target: String;
+begin
+  Result := False;
+  if not FileExists(Path) then Exit;
+  try
+    Shell := CreateOleObject('Shell.Application');
+    Folder := Shell.NameSpace(ExtractFileDir(Path));
+    Item := Folder.ParseName(ExtractFileName(Path));
+    Link := Item.GetLink;
+    Target := Link.Path;
+    Result := (String(Link.Arguments) = Args) and ((CompareText(Target, Expected) = 0) or
+      ((Target <> '') and (CompareText(Target, GetShortName(Expected)) = 0)));
+  except
+    Log(GetExceptionMessage);
+  end;
+end;
+
+function DesktopPointsToConsole(Name: String): Boolean;
+begin
+  Result := LinkPointsTo(ExpandConstant('{autodesktop}\') + Name + '.lnk',
+    ExpandConstant('{app}\jumpbot-desktop.exe'), '');
+end;
+
+#define LegacyGroup "跳一跳控制台（离线测试版）"
+var
+  LegacyInstallDir: String;
+
+<event('InitializeWizard')>
+procedure RenameDefaultPreviewGroup;
+var
+  Key, Group: String;
+begin
+  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#PreviewGuid}_is1';
+  if not RegQueryStringValue(HKCU64, Key, 'Inno Setup: Icon Group', Group) then Exit;
+  if Group <> '{#LegacyGroup}' then Exit;
+  if not RegQueryStringValue(HKCU64, Key, 'Inno Setup: App Path', LegacyInstallDir) then Exit;
+  if WizardForm.GroupEdit.Text = Group then WizardForm.GroupEdit.Text := 'JumpBot';
+end;
+
+procedure RemoveLegacyMenuLink(Name, Expected, Args: String);
+var
+  Path: String;
+begin
+  Path := ExpandConstant('{userprograms}\{#LegacyGroup}\') + Name + '.lnk';
+  if LinkPointsTo(Path, Expected, Args) then DeleteFile(Path);
+end;
+
+<event('CurStepChanged')>
+procedure CleanPreviousDefaultGroup(Step: TSetupStep);
+var
+  Group, AppDir, Worker: String;
+  Info: TFindRec;
+begin
+  if Step <> ssPostInstall then Exit;
+  AppDir := ExpandConstant('{app}');
+  if (CompareText(LegacyInstallDir, AppDir) <> 0) or (WizardGroupValue = '{#LegacyGroup}') then Exit;
+  Group := ExpandConstant('{userprograms}\{#LegacyGroup}');
+  if not FindFirst(Group, Info) then Exit;
+  FindClose(Info);
+  if (Info.Attributes and $400) <> 0 then Exit; // Do not follow a junction.
+  Worker := AddBackslash(AppDir) + 'jumpbot.exe';
+  RemoveLegacyMenuLink('跳一跳控制台', AddBackslash(AppDir) + 'jumpbot-desktop.exe', '');
+  RemoveLegacyMenuLink('NVIDIA CUDA 模式', Worker, '--backend cuda --max-jumps 0 --daemon');
+  RemoveLegacyMenuLink('OpenCL 模式', Worker, '--backend opencl --max-jumps 0 --daemon');
+  RemoveLegacyMenuLink('跳一跳自动脚本（长跑）', Worker, '--max-jumps 0 --daemon');
+  RemoveLegacyMenuLink('自检（不碰游戏）', Worker, '--selftest');
+  RemoveLegacyMenuLink('纯 CPU 模式', Worker, '--backend simd --no-cuda --no-opencl --max-jumps 0 --daemon');
+  RemoveLegacyMenuLink('只识别不发输入（安全演示）', Worker, '--dry-run --samples 3');
+  RemoveLegacyMenuLink('配置文件夹', AppDir, '');
+  RemoveLegacyMenuLink('卸载 跳一跳自动脚本', ExpandConstant('{uninstallexe}'), '');
+  RemoveDir(Group); // Windows removes empty directories only.
+end;
+
 function GetDriveTypeW(Root: String): Cardinal;
   external 'GetDriveTypeW@kernel32.dll stdcall';
 
@@ -150,14 +276,19 @@ procedure InitializeWizard;
 var
   Choice: String;
 begin
-  CvSource := CreateInputOptionPage(wpSelectComponents, '选择 OpenCV 来源',
-    '程序必须使用 OpenCV', '安装程序会将所选 DLL 放在本程序目录，系统 PATH 保持原样。', True, False);
-  CvSource.Add('使用安装包内置的 OpenCV（推荐，离线可用）');
-  CvSource.Add('使用本机已有的兼容 OpenCV（高级）');
-  CvFile := CreateInputFilePage(CvSource.ID, '选择本机 OpenCV 文件',
-    '只接受与内置 x64 版本完全相同的文件',
-    '请选择本地 DLL，或留空以使用安装目录中已有的 {#CvDll}。' + #13#10 +
-    '安装前会按 SHA-256 校验。可点击“上一步”改用内置版本。');
+  with WizardForm.WelcomeLabel1 do
+    SetBounds(Left + ScaleX(14), WizardForm.WelcomePage.ClientHeight * 2 div 5,
+      Width - ScaleX(14), ScaleY(34));
+  with WizardForm.WelcomeLabel2 do
+    SetBounds(WizardForm.WelcomeLabel1.Left, WizardForm.WelcomeLabel1.Top + ScaleY(38),
+      WizardForm.WelcomeLabel1.Width, WizardForm.WelcomePage.ClientHeight div 3);
+  CvSource := CreateInputOptionPage(wpSelectComponents, 'OpenCV 运行库',
+    '选择图像识别使用的运行库。', '首次安装建议使用内置版本。', True, False);
+  CvSource.Add('使用内置版本（推荐）');
+  CvSource.Add('选择本机已有的 DLL');
+  CvFile := CreateInputFilePage(CvSource.ID, '本机 OpenCV 文件',
+    '选择与内置版本一致的 x64 DLL。',
+    '选择 {#CvDll}，或留空使用安装目录中的同名文件。');
   CvFile.Add('OpenCV 文件', '动态链接库 (*.dll)|*.dll|所有文件 (*.*)|*.*', '.dll');
   Choice := ExpandConstant('{param:OPENCV|bundled}');
   CvSource.SelectedValueIndex := 0;
@@ -171,6 +302,16 @@ end;
 function UseLocalOpenCV: Boolean;
 begin
   Result := CvSource.SelectedValueIndex = 1;
+end;
+
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
+  MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+begin
+  Result := MemoDirInfo + NewLine + NewLine + MemoComponentsInfo + NewLine + Space;
+  if UseLocalOpenCV then Result := Result + 'OpenCV（本机文件）'
+  else Result := Result + 'OpenCV（安装包内置）';
+  if MemoGroupInfo <> '' then Result := Result + NewLine + NewLine + MemoGroupInfo;
+  if MemoTasksInfo <> '' then Result := Result + NewLine + NewLine + MemoTasksInfo;
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -241,7 +382,7 @@ begin
   if RegQueryStringValue(HKCU64, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#PreviewGuid}_is1',
       'Inno Setup: App Path', Previous) and (CompareText(RemoveBackslashUnlessRoot(Previous), RemoveBackslashUnlessRoot(Dir)) <> 0) then
   begin
-    Result := '测试版已安装到 ' + Previous + '。请在原目录升级，或先卸载测试版再更换目录。';
+    Result := '控制台已安装到 ' + Previous + '。请在原目录升级，或先卸载再更换目录。';
     Exit;
   end;
   if GetIniString('Install', 'Channel', '', AddBackslash(Dir) + '.jumpbot-offline-preview.ini') = 'offline-preview' then Exit;
@@ -250,7 +391,7 @@ begin
     repeat
       if (Item.Name <> '.') and (Item.Name <> '..') then
       begin
-        Result := '请选择空文件夹或已有的离线测试版目录，以免覆盖正式版或其他文件。';
+        Result := '此文件夹已包含其他文件。请选择空文件夹，或沿用控制台原安装目录。';
         Exit;
       end;
     until not FindNext(Item);
