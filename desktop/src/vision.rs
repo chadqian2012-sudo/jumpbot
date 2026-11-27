@@ -867,9 +867,8 @@ fn piece_templates() -> Result<Vec<crate::template::PieceTemplate>, String> {
         // The source loader skips unreadable PNGs and keeps the other templates.
         if let Ok(template) = Frame::read(&path) {
             check_frame(&template)?;
-            templates.push(
-                crate::template::PieceTemplate::new(template).map_err(|e| e.to_string())?,
-            );
+            templates
+                .extend(crate::template::PieceTemplate::new(template).map_err(|e| e.to_string())?);
         }
     }
     Ok(templates)
@@ -892,15 +891,15 @@ fn template_score(
 }
 
 fn template_scan(frame: &Frame, tpl: &Frame, cfg: &Config) -> Result<Option<Piece>, String> {
-    let top = (0.30 * frame.height as f64) as usize;
-    if tpl.height >= frame.height - top || tpl.width >= frame.width {
+    let first_foot = (cfg.f("piece_min_y_ratio") * frame.height as f64).ceil() as usize;
+    let top =
+        ((0.30 * frame.height as f64) as usize).max(first_foot.saturating_sub(tpl.height - 1));
+    if tpl.height > frame.height.saturating_sub(top) || tpl.width >= frame.width {
         return Ok(None);
     }
     let (x, y, score) = crate::template::scan(frame, top, tpl).map_err(|e| e.to_string())?;
     let foot_y = (y + tpl.height as i32 - 1) as f64;
-    if score < cfg.f("piece_scan_min_score")
-        || foot_y < cfg.f("piece_min_y_ratio") * frame.height as f64
-    {
+    if score < cfg.f("piece_scan_min_score") {
         return Ok(None);
     }
     Ok(Some(Piece {
@@ -1284,6 +1283,39 @@ mod dark_board_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_scan_ranks_only_positions_with_an_eligible_foot() {
+        let flat = Frame {
+            width: 4,
+            height: 4,
+            bgr: [9, 30, 100].repeat(16),
+        };
+        assert!(crate::template::PieceTemplate::new(flat.clone())
+            .unwrap()
+            .is_none());
+        let mut tpl = flat;
+        tpl.bgr[..3].fill(230);
+        tpl.bgr[9..12].fill(0);
+        let mut frame = Frame {
+            width: 24,
+            height: 48,
+            bgr: vec![125; 24 * 48 * 3],
+        };
+        for (x, y) in [(2, 15), (13, 21)] {
+            for (row, src) in tpl.bgr.chunks_exact(12).enumerate() {
+                let start = ((y + row) * frame.width + x) * 3;
+                frame.bgr[start..start + 12].copy_from_slice(src);
+            }
+        }
+        // The upper decoy is exact. The lower piece's foot is on the first allowed row.
+        frame.bgr[(21 * frame.width + 13) * 3] -= 20;
+        let mut cfg = Config::default();
+        let found = template_scan(&frame, &tpl, &cfg).unwrap().unwrap();
+        assert_eq!(found.bbox, [13, 21, 4, 4]);
+        cfg.0["piece_min_y_ratio"] = serde_json::json!(1.0);
+        assert!(template_scan(&frame, &tpl, &cfg).unwrap().is_none());
+    }
 
     #[test]
     fn nearby_highlight_does_not_override_the_face_center() {

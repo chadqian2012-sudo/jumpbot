@@ -30,6 +30,11 @@ pub struct Frame {
     pub bgr: Vec<u8>,
 }
 impl Frame {
+    pub(crate) fn is_solid_color(&self) -> bool {
+        let pixels = self.bgr.as_chunks::<3>().0;
+        pixels.len() < 2 || pixels[1..] == pixels[..pixels.len() - 1]
+    }
+
     pub fn valid(&self) -> bool {
         self.width > 0
             && self.height > 0

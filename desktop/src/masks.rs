@@ -293,6 +293,18 @@ struct GpuSelection {
     samples: Vec<f64>,
 }
 
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+fn fastest_device(devices: &[gpu::Device], mut limit_ms: f64) -> Option<usize> {
+    let mut chosen = None;
+    for (index, device) in devices.iter().enumerate() {
+        if device.ms <= limit_ms {
+            limit_ms = device.ms;
+            chosen = Some(index);
+        }
+    }
+    chosen
+}
+
 impl Masks {
     pub fn new(cfg: &Config, backend: &str) -> Self {
         let backend = if backend.is_empty() {
@@ -371,7 +383,7 @@ impl Masks {
         }
         let bg = background(f);
         let expected = cpu(f, &bg, &self.table, rows, false);
-        let mut best = f64::INFINITY;
+        let mut limit_ms = f64::INFINITY;
         if self.mode == Mode::Auto {
             let workers = std::thread::available_parallelism()
                 .map_or(1, |n| n.get().min(4))
@@ -392,7 +404,7 @@ impl Masks {
                 ))
             })
             .unwrap();
-            best = self.gpu.cpu_ms / 1.5;
+            limit_ms = self.gpu.cpu_ms / 1.5;
             eprintln!(
                 "{}: {:.3} ms",
                 if self.simd { "SIMD" } else { "CPU" },
@@ -418,12 +430,7 @@ impl Masks {
                 }
             }
         });
-        for (index, device) in devices.iter().enumerate() {
-            if device.ms <= best {
-                best = device.ms;
-                self.gpu.chosen = Some(index);
-            }
-        }
+        self.gpu.chosen = fastest_device(devices, limit_ms);
         if self.mode == Mode::Auto {
             let selected = self
                 .gpu
@@ -484,7 +491,13 @@ impl Masks {
                 Err(e) => {
                     eprintln!("{} failed: {e}; retrying on CPU", d.name);
                     devices.remove(i);
-                    self.gpu.chosen = None;
+                    // This frame still falls through to CPU. An explicit OpenCL request
+                    // can use another already-validated adapter on the next frame.
+                    self.gpu.chosen = if self.mode == Mode::Opencl {
+                        fastest_device(devices, f64::INFINITY)
+                    } else {
+                        None
+                    };
                 }
             }
         }
@@ -617,7 +630,7 @@ mod tests {
             background_into(&frame, &mut left, &mut right, &mut bg);
             let tbl = tables(&cfg);
             let single = cpu_with_pool(&frame, &bg, &tbl, rows, false, None);
-            let parallel = cpu_with_pool(&frame, &bg, &tbl, rows, true, Some(&pool));
+            let parallel = cpu_with_pool(&frame, &bg, &tbl, rows, masks.simd, Some(&pool));
             let via_masks = masks.compute(&frame).unwrap();
             assert_eq!(parallel, single, "{w}x{h} pool vs scalar");
             assert!(!via_masks.0.is_empty());
