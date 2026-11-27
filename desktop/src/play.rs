@@ -165,38 +165,27 @@ impl Game<'_> {
     }
     // Only consult the window's own pixels after repeated failed screen reads.
     // They can explain a missing pawn, but must never supply a jump target.
-    fn hidden_piece_reason(&mut self, w: &Window) -> Option<String> {
+    fn hidden_piece_overlay(&mut self, w: &Window, since: Instant) -> Option<Overlay> {
         if self.mode != CaptureMode::Screen || !w.is_foreground() {
             return None;
         }
-        w.covering_pid(w.client_rect)?;
-        let raw = self.capturer.reference_frame(w)?;
+        w.overlap(w.client_rect)?;
+        let raw = self.capturer.reference_frame(w, since)?;
         // Read the desktop again after PrintWindow; the overlay may have moved.
         let visible = self.capturer.capture(w, CaptureMode::Screen).ok()??;
         let [wx, wy, _, _] = w.client_rect;
         self.vision.reset_prior();
         let owner = hidden_piece_in_frames(self.vision, self.c, &raw, &visible, |[l, t, r, b]| {
-            w.covering_pid([wx + l, wy + t, wx + r, wy + b])
+            w.overlap([wx + l, wy + t, wx + r, wy + b])
         });
         self.vision.reset_prior();
         let owner = owner?;
-        (w.still_current().ok()? && w.is_foreground()).then(|| {
-            format!("游戏画面持续无法识别人物，人物所在区域被悬浮窗遮挡（PID {owner}），已停止")
-        })
+        (w.still_current().ok()? && w.is_foreground()).then_some(owner)
     }
 
     fn jump(&self, w: &Window, g: u64, duration: f64) -> Result<PressOutcome> {
         let point = (self.c.at("press_point", 0), self.c.at("press_point", 1));
-        // Jump holds can start anywhere on the board. Menu buttons and probe
-        // clicks stay at their exact coordinates. Every attempt checks its owner.
-        for p in [point, (0.25, 0.72), (0.75, 0.72)] {
-            match self.press(w, g, p, duration)? {
-                PressOutcome::WindowChanged
-                    if !self.o.background && w.is_foreground() && w.still_current()? => {}
-                outcome => return Ok(outcome),
-            }
-        }
-        Ok(PressOutcome::WindowChanged)
+        w.jump_with(point, self.o.background, |p| self.press(w, g, p, duration))
     }
 
     fn press(&self, w: &Window, g: u64, p: (f64, f64), duration: f64) -> Result<PressOutcome> {
@@ -477,13 +466,17 @@ impl Default for Landing {
     }
 }
 
+fn occlusion_message(id: u32) -> String {
+    format!("游戏画面持续无法识别人物，人物所在区域被悬浮窗遮挡（PID {id}），已停止")
+}
+
 fn hidden_piece_in_frames(
     vision: &mut Vision,
     cfg: &Config,
     game: &Frame,
     visible: &Frame,
-    covering: impl FnOnce([i32; 4]) -> Option<u32>,
-) -> Option<u32> {
+    covering: impl FnOnce([i32; 4]) -> Option<Overlay>,
+) -> Option<Overlay> {
     if (game.width, game.height) != (visible.width, visible.height) {
         return None;
     }
@@ -704,7 +697,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut previous_aim = None;
     let mut attempts = 0;
     let mut rejects = 0;
-    let mut missing_under_overlay = 0;
+    let mut missing_under_overlay = None;
     // Only a measured jump that landed can supply a fallback duration.
     let mut blind: Option<(f64, i64)> = None;
     let adaptive = !o.calibrate && cfg.f("gamma") > 0.;
@@ -740,7 +733,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
         };
         if interrupted || !valid_current {
-            missing_under_overlay = 0;
+            missing_under_overlay = None;
             baseline = true;
             previous_aim = None;
             attempts = 0;
@@ -776,7 +769,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             Ok(Some(frame)) => frame,
             Ok(None) => continue,
             Err(reason) => {
-                missing_under_overlay = 0;
+                missing_under_overlay = None;
                 game.report(
                     "capture_blocked",
                     json!({"game_state":"capture_blocked","stop_reason":reason}),
@@ -797,7 +790,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         let session = (w.hwnd, w.pid, g);
         let state = game.screen.state(&f, cfg)?;
         if let ScreenState::Start(p) | ScreenState::Restart(p) = state {
-            missing_under_overlay = 0;
+            missing_under_overlay = None;
             let dead = state.is_result();
             game.report(
                 "acquiring",
@@ -842,17 +835,21 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if matches!(overlay, Overlay::Other(_))
                 && detection.as_ref().is_some_and(|d| d.piece.is_none())
             {
-                missing_under_overlay += 1;
-            } else {
-                missing_under_overlay = 0;
-            }
-            if missing_under_overlay >= cfg.i("detect_retry_limit") {
-                if let Some(reason) = game.hidden_piece_reason(&w) {
-                    if game.ctl.guard(g, true).is_ok() {
-                        return Err(reason);
+                let (since, tries) = missing_under_overlay.get_or_insert((Instant::now(), 0_i64));
+                let limit = cfg.i("detect_retry_limit");
+                *tries = (*tries + 1).min(limit);
+                if *tries >= limit {
+                    if let Some(Overlay::Other(id)) = game.hidden_piece_overlay(&w, *since) {
+                        if game.ctl.guard(g, true).is_ok() {
+                            return Err(occlusion_message(id));
+                        }
+                    }
+                    if !game.capturer.awaiting_reference(*since) {
+                        missing_under_overlay = None;
                     }
                 }
-                missing_under_overlay = 0;
+            } else {
+                missing_under_overlay = None;
             }
             previous_aim = None;
             attempts = 0;
@@ -868,7 +865,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             window = Some((w, g));
             continue;
         }
-        missing_under_overlay = 0;
+        missing_under_overlay = None;
         let detection = detection.filter(|d| state.playable(&f, cfg, game.screen, d));
         let Some(d) = detection else {
             let (phase, reason) = match state {
@@ -1009,7 +1006,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         let land_start = Instant::now();
         let mut observation = game.settle(&w, g, &records, &f);
         let mut hidden = None;
-        let mut rechecked = false;
+        let mut previous_cover = None;
+        let mut waited_for_reference = false;
         while let Ok(Some(landing)) = &mut observation {
             if landing.result != "unknown"
                 || game.mode != CaptureMode::Screen
@@ -1019,26 +1017,23 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             {
                 break;
             }
-            match w.overlap(w.client_rect) {
+            match game.hidden_piece_overlay(&w, land_start) {
                 Some(Overlay::Allowed) => {
-                    // A trusted overlay may hide a landing temporarily. Keep the
-                    // outstanding press under observation and never press it again.
-                    let Some(frame) = &landing.frame else { break };
-                    if game.vision.detect_piece_only(frame)?.piece.is_some() {
-                        break;
-                    }
-                    rechecked = false;
+                    previous_cover = None;
+                    waited_for_reference = false;
                 }
-                Some(Overlay::Other(_)) => {
-                    let Some(reason) = game.hidden_piece_reason(&w) else {
-                        break;
-                    };
-                    if rechecked {
-                        landing.error = Some(reason.clone());
-                        hidden = Some(reason);
-                        break;
-                    }
-                    rechecked = true;
+                Some(Overlay::Other(id)) if previous_cover == Some(id) => {
+                    let reason = occlusion_message(id);
+                    landing.error = Some(reason.clone());
+                    hidden = Some(reason);
+                    break;
+                }
+                Some(Overlay::Other(id)) => {
+                    previous_cover = Some(id);
+                    waited_for_reference = false;
+                }
+                None if !waited_for_reference && game.capturer.awaiting_reference(land_start) => {
+                    waited_for_reference = true
                 }
                 None => break,
             }
@@ -1328,16 +1323,23 @@ mod tests {
                 pid
             })
         };
-        assert_eq!(check(&visible, Some(7)), None); // transparent shared-screen overlay
+        assert_eq!(check(&visible, Some(Overlay::Other(7))), None); // transparent shared-screen overlay
         visible.bgr[(y as usize * game.width + x as usize) * 3] ^= 1;
-        assert_eq!(check(&visible, Some(7)), None); // different pixels, pawn still recognizable
+        assert_eq!(check(&visible, Some(Overlay::Other(7))), None); // different pixels, pawn still recognizable
         for row in y - 8..y + h + 8 {
             let lo = (row as usize * game.width + (x - 8) as usize) * 3;
             visible.bgr[lo..lo + (w + 16) as usize * 3].fill(251);
         }
+        assert_eq!(
+            check(&visible, Some(Overlay::Allowed)),
+            Some(Overlay::Allowed)
+        );
         assert_eq!(check(&visible, None), None); // no external window over the missing pawn
-        assert_eq!(check(&visible, Some(7)), Some(7));
-        assert_eq!(check(&game, Some(7)), None); // restored before final confirmation
+        assert_eq!(
+            check(&visible, Some(Overlay::Other(7))),
+            Some(Overlay::Other(7))
+        );
+        assert_eq!(check(&game, Some(Overlay::Other(7))), None); // restored before final confirmation
     }
     #[test]
     fn stalled_and_unconfirmed_jumps_are_recorded_before_requesting_pause() -> Result<()> {
