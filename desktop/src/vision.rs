@@ -1303,7 +1303,7 @@ mod tests {
             bgr: vec![125; 24 * 48 * 3],
         };
         for (x, y) in [(2, 15), (13, 21)] {
-            for (row, src) in tpl.bgr.chunks_exact(12).enumerate() {
+            for (row, src) in tpl.bgr.as_chunks::<12>().0.iter().enumerate() {
                 let start = ((y + row) * frame.width + x) * 3;
                 frame.bgr[start..start + 12].copy_from_slice(src);
             }
