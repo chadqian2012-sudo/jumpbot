@@ -299,8 +299,16 @@ mod tests {
                 let original: Value = serde_json::from_str(line).unwrap();
                 let name = original["file"].as_str().unwrap();
                 let mut target = original["target"].clone();
-                // Midpoints and pixel counts of the marked regions in the retained PNGs.
+                // Independently measured bounding-box midpoints and ink areas in the retained PNGs.
                 let mark = match name {
+                    "purple-cylinder-stall.png" => Some((313.5, 549.5, 180)),
+                    "skin-gold-cardboard-bonus.png" => Some((377.5, 513.5, 145)),
+                    "skin-gold-cardboard.png" => Some((183.5, 504.5, 181)),
+                    "skin-gold-red-platform.png" => Some((227.5, 530.5, 149)),
+                    "skin-gold-round-platform.png" => Some((345.5, 532.0, 148)),
+                    "skin-gold-tan-background.png" => Some((403.5, 499.0, 150)),
+                    "skin-gold-yellow-badge.png" => Some((209.5, 520.0, 178)),
+                    "skin-gold-yellow-platform.png" => Some((223.5, 528.0, 149)),
                     "skin-gold-cardboard-seam.png" => Some((231.5, 532.5, 183)), // (222,527)..=(241,538)
                     "skin-gold-white-book.png" => Some((421.0, 489.0, 157)), // (412,484)..=(430,494)
                     _ => None,

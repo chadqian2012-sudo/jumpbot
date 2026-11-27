@@ -824,14 +824,14 @@ fn find_target(
                 scratch.region,
                 scratch.dot_mask,
                 valid,
-            )?,
+            )?
+            // Small corrections from an unverified bright patch can be raster noise.
+            .filter(|(x, y, _)| (x - chosen.x).abs() > 3.0 || (y - chosen.y).abs() > 3.0),
         };
         if let Some(dot) = dot {
-            if (dot.0 - chosen.x).abs() > 3.0 || (dot.1 - chosen.y).abs() > 3.0 {
-                chosen.x = dot.0;
-                chosen.y = dot.1;
-                chosen.dot = Some(dot);
-            }
+            chosen.x = dot.0;
+            chosen.y = dot.1;
+            chosen.dot = Some(dot);
         }
     }
     Ok(TargetSelection::Found(chosen))
@@ -1284,6 +1284,25 @@ mod dark_board_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearby_highlight_does_not_override_the_face_center() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/skin-gold-red-platform.png");
+        let mut frame = Frame::read(&path).unwrap();
+        // Same footprint and contrast, but without the marker's verified ink.
+        for y in 526..536 {
+            let start = (y * frame.width + 219) * 3;
+            for pixel in frame.bgr[start..start + 18 * 3].as_chunks_mut::<3>().0 {
+                if *pixel == [245; 3] {
+                    *pixel = [244; 3];
+                }
+            }
+        }
+        let mut vision = Vision::new(&Config::default(), "cpu").unwrap();
+        let target = vision.detect(&frame).unwrap().target.unwrap();
+        assert_eq!((target.x, target.y, target.dot), (227.5, 529., None));
+    }
 
     #[test]
     fn bottle_shadow_requires_a_supported_top() {
