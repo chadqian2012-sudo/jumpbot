@@ -19,7 +19,16 @@ $null = New-Item -ItemType Directory -Path $proof
 function Check($ok, [string]$message) {
     if (!$ok) { throw $message }
 }
-function Hash([string]$file) { (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash }
+function Hash([string]$file) {
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($file)
+    $stream = [IO.File]::OpenRead($path)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+        } finally { $sha256.Dispose() }
+    } finally { $stream.Dispose() }
+}
 function Setup([string]$components, [bool]$shortcut, [string]$directory, [string]$label, [string]$openCv) {
     $task = if ($shortcut) {'desktopicon'} else {'!desktopicon'}
     $params = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',
