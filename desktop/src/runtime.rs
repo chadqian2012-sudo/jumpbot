@@ -75,7 +75,7 @@ pub fn run() -> Result<()> {
             }
             for path in files {
                 let capture = Frame::read(&path)?;
-                let normalized = capture.resized_for_recognition(&cfg)?;
+                let (normalized, rows) = capture.resized_for_recognition(&cfg)?;
                 let f = normalized.as_ref().unwrap_or(&capture);
                 vision.reset_prior();
                 let mut d = vision.detect(f)?;
@@ -89,11 +89,7 @@ pub fn run() -> Result<()> {
                 let mut row = detection(&d, &cfg);
                 row["calibrated_dist_px"] = row["dist_px"].clone();
                 if normalized.is_some() {
-                    map_detection_to_capture(
-                        &mut d,
-                        capture.width as f64 / f.width as f64,
-                        capture.height as f64 / f.height as f64,
-                    );
+                    map_detection_to_capture(&mut d, capture.width as f64 / f.width as f64, rows);
                     row["piece"] = json!(d.piece);
                     row["target"] = json!(d.target);
                     row["dist_px"] = json!(distance_px(&d, &cfg));
@@ -121,32 +117,33 @@ pub fn run() -> Result<()> {
     crate::play::run(&o, &cfg, &screen, &mut vision, &path)
 }
 // The public image result and its annotation use the caller's pixel coordinates.
-fn map_detection_to_capture(d: &mut Detection, sx: f64, sy: f64) {
+fn map_detection_to_capture(d: &mut Detection, sx: f64, rows: crate::screen::CaptureRows) {
+    let sy = rows.board_scale();
     let area = |n: i32| (f64::from(n) * sx * sy).round() as i32;
     let bbox = |[x, y, w, h]: [i32; 4]| {
         let left = (f64::from(x) * sx).round() as i32;
-        let top = (f64::from(y) * sy).round() as i32;
+        let top = rows.capture_y(f64::from(y)).round() as i32;
         [
             left,
             top,
             (f64::from(x + w) * sx).round() as i32 - left,
-            (f64::from(y + h) * sy).round() as i32 - top,
+            rows.capture_y(f64::from(y + h)).round() as i32 - top,
         ]
     };
     if let Some(p) = &mut d.piece {
         p.x *= sx;
-        p.y *= sy;
+        p.y = rows.capture_y(p.y);
         p.bbox = bbox(p.bbox);
         p.area = area(p.area);
     }
     if let Some(t) = &mut d.target {
         t.x *= sx;
-        t.y *= sy;
+        t.y = rows.capture_y(t.y);
         t.bbox = bbox(t.bbox);
         t.area = area(t.area);
-        t.top_y *= sy;
+        t.top_y = rows.capture_y(t.top_y);
         t.top_width *= sx;
-        t.dot = t.dot.map(|(x, y, n)| (x * sx, y * sy, area(n)));
+        t.dot = t.dot.map(|(x, y, n)| (x * sx, rows.capture_y(y), area(n)));
     }
 }
 
@@ -227,10 +224,12 @@ mod tests {
             .unwrap()
             .join("tests/fixtures");
         let mut vision = Vision::new(&cfg, "cpu").unwrap();
-        for (name, width, height) in [
-            ("skin-gold-cardboard.png", 830, 1575),
-            ("purple-cup-before-death.png", 415, 788),
-            ("purple-horizontal-fall.png", 720, 900),
+        for (name, width, height, fixed_bar) in [
+            ("skin-gold-cardboard.png", 830, 1575, 0),
+            ("purple-cup-before-death.png", 415, 788, 0),
+            ("purple-horizontal-fall.png", 720, 900, 0),
+            ("purple-cup-before-death.png", 415, 788, 66),
+            ("skin-gold-cardboard.png", 830, 1575, 66),
         ] {
             let reference = Frame::read(&root.join(name)).unwrap();
             vision.reset_prior();
@@ -238,10 +237,14 @@ mod tests {
             // Synthesize a different client resolution without the production resizer.
             let mut pixels = Vec::with_capacity(width * height * 3);
             for y in 0..height {
+                let source_y = if y < fixed_bar {
+                    y
+                } else {
+                    fixed_bar
+                        + (y - fixed_bar) * (reference.height - fixed_bar) / (height - fixed_bar)
+                };
                 for x in 0..width {
-                    let offset = 3
-                        * ((y * reference.height / height) * reference.width
-                            + x * reference.width / width);
+                    let offset = 3 * (source_y * reference.width + x * reference.width / width);
                     pixels.extend_from_slice(&reference.bgr[offset..offset + 3]);
                 }
             }
@@ -250,8 +253,20 @@ mod tests {
                 height,
                 bgr: pixels,
             };
-            let normalized = capture.for_recognition(&cfg).unwrap();
+            let (normalized, rows) = capture.mapped_for_recognition(&cfg).unwrap();
             assert_eq!((normalized.width, normalized.height), (553, 1050));
+            for y in [0., 32., 66., 500., 910., 1050.] {
+                let bar = fixed_bar as f64;
+                let capture_y = if y < bar {
+                    y
+                } else {
+                    bar + (y - bar) * (height as f64 - bar) / (1050. - bar)
+                };
+                assert!(
+                    (rows.fraction(y) * height as f64 - capture_y).abs() < 1e-6,
+                    "{name} at {width}x{height}, y={y}, fixed={fixed_bar}"
+                );
+            }
             vision.reset_prior();
             let mut d = vision.detect(&normalized).unwrap();
             let actual = detection(&d, &cfg);
@@ -260,7 +275,7 @@ mod tests {
                     (actual["hold_ms"].as_f64().unwrap() - ms).abs() < 8.0,
                     "{name}: {actual}"
                 );
-                map_detection_to_capture(&mut d, width as f64 / 553., height as f64 / 1050.);
+                map_detection_to_capture(&mut d, width as f64 / 553., rows);
                 let target = d.target.unwrap();
                 assert!(
                     (target.x * 553. / width as f64 - expected["target"]["x"].as_f64().unwrap())

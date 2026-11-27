@@ -6,7 +6,7 @@ use crate::{
     platform::{CaptureMode, PressOutcome, Window},
     records::{same_game_score, Records},
     runtime::{annotated, detection},
-    screen::{Screen, ScreenState},
+    screen::{CaptureRows, Screen, ScreenState},
     vision::{axis_components, points_close, Detection, Vision},
     Config, Frame, Result,
 };
@@ -143,10 +143,10 @@ impl Game<'_> {
             self.ctl.sleep(g, poll);
         }
     }
-    fn recognition_frame(&mut self, w: &Window) -> Result<Option<Frame>> {
+    fn recognition_frame(&mut self, w: &Window) -> Result<Option<(Frame, CaptureRows)>> {
         self.capturer
             .capture(w, self.mode)?
-            .map(|raw| raw.for_recognition(self.c))
+            .map(|raw| raw.mapped_for_recognition(self.c))
             .transpose()
     }
     fn press(&self, w: &Window, g: u64, p: (f64, f64), duration: f64) -> Result<PressOutcome> {
@@ -241,7 +241,7 @@ impl Game<'_> {
                     return Ok(Some(outcome));
                 }
             }
-            let frame = match self.recognition_frame(w) {
+            let (frame, _) = match self.recognition_frame(w) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => return Ok(None),
                 Err(reason) => {
@@ -327,7 +327,7 @@ impl Game<'_> {
                     break;
                 }
                 // The landing is already confirmed. A missing HUD sample cannot undo it.
-                let f = match self.recognition_frame(w) {
+                let (f, _) = match self.recognition_frame(w) {
                     Ok(Some(f)) => f,
                     _ => break,
                 };
@@ -665,7 +665,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             attempts = 0;
             rejects = 0;
             ema = 0.;
-            pressed_button = None;
             last_error = None;
             let timeout = if interrupted {
                 let t = cfg.f("startup_wait_s");
@@ -697,7 +696,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             eprintln!("已有 90 秒未完成一跳，请检查窗口");
             warned = true;
         }
-        let f = match game.recognition_frame(&w) {
+        let (f, rows) = match game.recognition_frame(&w) {
             Ok(Some(frame)) => frame,
             Ok(None) => continue,
             Err(reason) => {
@@ -718,6 +717,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             window = Some((w, g));
             continue;
         }
+        let session = (w.hwnd, w.pid, g);
         let state = game.screen.state(&f, cfg)?;
         if let ScreenState::Start(p) | ScreenState::Restart(p) = state {
             let dead = state.is_result();
@@ -725,10 +725,11 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 "acquiring",
                 json!({"game_state":if dead{"game_over"}else{"start_page"}}),
             );
-            if pressed_button != Some(dead) {
-                match game.press(&w, g, (p[0] / f.width as f64, p[1] / f.height as f64), 60.)? {
+            let button = (session, dead);
+            if pressed_button != Some(button) {
+                match game.press(&w, g, (p[0] / f.width as f64, rows.fraction(p[1])), 60.)? {
                     PressOutcome::Sent => {
-                        pressed_button = Some(dead);
+                        pressed_button = Some(button);
                         score_window = None;
                     }
                     PressOutcome::WindowChanged => continue,
@@ -782,7 +783,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         pressed_button = None;
         if baseline {
             blind = None;
-            let session = (w.hwnd, w.pid, g);
             let score = game.screen.score(&f, cfg);
             if score_window.replace(session) == Some(session) {
                 records.resync_same_game(score);

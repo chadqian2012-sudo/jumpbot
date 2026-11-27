@@ -412,14 +412,30 @@ fn find_dot_if(
             {
                 continue;
             }
-            let ellipse = (y..y + bh).all(|yy| {
-                let dy_n = (f64::from(yy) - my) / ry;
-                (x..x + bw).all(|xx| {
-                    let radial = ((f64::from(xx) - mx) / rx).hypot(dy_n);
-                    let filled = labels[yy as usize * w + xx as usize] == id as i32;
-                    filled == (radial <= 1.) || (radial - 1.).abs() * ry <= 1.
+            let ellipse = |mx: f64, my: f64| {
+                (y..y + bh).all(|yy| {
+                    let dy_n = (f64::from(yy) - my) / ry;
+                    (x..x + bw).all(|xx| {
+                        let radial = ((f64::from(xx) - mx) / rx).hypot(dy_n);
+                        let filled = labels[yy as usize * w + xx as usize] == id as i32;
+                        filled == (radial <= 1.) || (radial - 1.).abs() * ry <= 1.
+                    })
                 })
-            });
+            };
+            // Resampling can move one extremal pixel. Use the ink centroid to fit
+            // the same ellipse when its bounding-box midpoint misses the raster.
+            let ellipse = ellipse(mx, my) || {
+                let (mut sx, mut sy) = (0_i64, 0_i64);
+                for yy in y..y + bh {
+                    for xx in x..x + bw {
+                        if labels[yy as usize * w + xx as usize] == id as i32 {
+                            sx += i64::from(xx);
+                            sy += i64::from(yy);
+                        }
+                    }
+                }
+                ellipse(sx as f64 / f64::from(area), sy as f64 / f64::from(area))
+            };
             if ellipse {
                 if nearest.is_some() {
                     return Ok(None);
