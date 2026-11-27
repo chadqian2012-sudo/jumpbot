@@ -46,18 +46,98 @@ fn decode_mat(bytes: &[u8], mode: i32) -> Result<Mat> {
     Ok(decoded)
 }
 
+/// Maps recognition rows back to the captured client. WeChat's toolbar and the
+/// game canvas can resize independently. Both intervals use pixel-edge coordinates.
+#[derive(Clone, Copy)]
+pub(crate) struct CaptureRows {
+    source: usize,
+    destination: usize,
+    source_top: usize,
+    destination_top: usize,
+}
+
+impl CaptureRows {
+    pub(crate) fn board_scale(self) -> f64 {
+        (self.source - self.source_top) as f64 / (self.destination - self.destination_top) as f64
+    }
+
+    pub(crate) fn capture_y(self, y: f64) -> f64 {
+        if y < self.destination_top as f64 && self.destination_top > 0 {
+            return y * self.source_top as f64 / self.destination_top as f64;
+        }
+        self.source_top as f64 + (y - self.destination_top as f64) * self.board_scale()
+    }
+
+    pub(crate) fn fraction(self, y: f64) -> f64 {
+        self.capture_y(y) / self.source as f64
+    }
+}
+
 impl Frame {
-    pub(crate) fn resized_for_recognition(&self, cfg: &Config) -> Result<Option<Self>> {
+    fn toolbar_end(&self) -> Option<usize> {
+        // The left-middle of the white WeChat toolbar is clear of its title and buttons.
+        // Require both the white band and a common transition into the canvas.
+        let probes = [15, 22, 29, 36].map(|percent| self.width * percent / 100);
+        let band = |y: usize, white: bool| {
+            probes.iter().all(|&x| {
+                let i = (y * self.width + x) * 3;
+                self.bgr[i..i + 3].iter().all(|&v| v >= 250) == white
+            })
+        };
+        let start = (1..self.height / 20).find(|&y| band(y, true))?;
+        let end = (start + 1..self.height / 4).find(|&y| !band(y, true))?;
+        if end - start < 8 || !(end..end + 3).all(|y| band(y, false)) {
+            return None;
+        }
+        // A white sky alone is not window chrome. Look for the dark title/controls.
+        (start + (end - start) / 4..end - (end - start) / 4)
+            .any(|y| {
+                let row =
+                    &self.bgr[(y * self.width + self.width / 2) * 3..(y + 1) * self.width * 3];
+                row.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .any(|p| p.iter().all(|&v| v < 90))
+            })
+            .then_some(end)
+    }
+
+    pub(crate) fn resized_for_recognition(
+        &self,
+        cfg: &Config,
+    ) -> Result<(Option<Self>, CaptureRows)> {
         let (width, height) = (
             cfg.i("window_ref_width") as usize,
             cfg.i("window_ref_height") as usize,
         );
-        let tolerance = cfg.i("window_size_tol_px") as usize;
-        if self.width.abs_diff(width) <= tolerance && self.height.abs_diff(height) <= tolerance {
-            return Ok(None);
-        }
         if !self.valid() || width == 0 || height == 0 {
             return Err("截图像素无效".into());
+        }
+        let tolerance = cfg.i("window_size_tol_px") as usize;
+        let mut rows = CaptureRows {
+            source: self.height,
+            destination: self.height,
+            source_top: 0,
+            destination_top: 0,
+        };
+        if self.width.abs_diff(width) <= tolerance && self.height.abs_diff(height) <= tolerance {
+            return Ok((None, rows));
+        }
+        rows.destination = height;
+        // In the retained 553 × 1050 clients the first canvas row is 64–66.
+        // Keep a proportional capture intact when its boundary fits that range.
+        let unit = height as f64 / 1050.;
+        let scaled_y = height as f64 / self.height as f64;
+        if let Some(top) = self.toolbar_end() {
+            let projected = top as f64 * scaled_y;
+            let reference = projected.clamp(64. * unit, 66. * unit);
+            if (projected - reference).abs() > scaled_y.max(1.) {
+                let boundary = (top as f64).clamp(64. * unit, 66. * unit).round() as usize;
+                if (1..height).contains(&boundary) {
+                    rows.source_top = top;
+                    rows.destination_top = boundary;
+                }
+            }
         }
         let mut bgr = vec![
             0;
@@ -66,28 +146,52 @@ impl Frame {
                 .and_then(|n| n.checked_mul(3))
                 .ok_or("目标尺寸过大")?
         ];
-        let interp = if width <= self.width && height <= self.height {
-            imgproc::INTER_AREA
-        } else {
-            imgproc::INTER_LINEAR
+        let mut resize = || -> opencv::Result<()> {
+            let src = crate::template::bgr(self)?;
+            let mut dst =
+                Mat::new_rows_cols_with_bytes_mut::<Vec3b>(height as i32, width as i32, &mut bgr)?;
+            for (sy, sh, dy, dh) in [
+                (0, rows.source_top, 0, rows.destination_top),
+                (
+                    rows.source_top,
+                    self.height - rows.source_top,
+                    rows.destination_top,
+                    height - rows.destination_top,
+                ),
+            ] {
+                if dh == 0 {
+                    continue;
+                }
+                let from = Mat::roi(&src, Rect::new(0, sy as i32, self.width as i32, sh as i32))?;
+                let mut to =
+                    Mat::roi_mut(&mut dst, Rect::new(0, dy as i32, width as i32, dh as i32))?;
+                let interp = if width <= self.width && dh <= sh {
+                    imgproc::INTER_AREA
+                } else {
+                    imgproc::INTER_LINEAR
+                };
+                imgproc::resize(
+                    &from,
+                    &mut to,
+                    Size::new(width as i32, dh as i32),
+                    0.,
+                    0.,
+                    interp,
+                )?;
+            }
+            Ok(())
         };
-        let src = crate::template::bgr(self).map_err(|e| e.to_string())?;
-        let mut dst =
-            Mat::new_rows_cols_with_bytes_mut::<Vec3b>(height as i32, width as i32, &mut bgr)
-                .map_err(|e| e.to_string())?;
-        imgproc::resize(
-            &src,
-            &mut dst,
-            Size::new(width as i32, height as i32),
-            0.,
-            0.,
-            interp,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(Some(Self { width, height, bgr }))
+        resize().map_err(|e| e.to_string())?;
+        Ok((Some(Self { width, height, bgr }), rows))
     }
+
+    pub(crate) fn mapped_for_recognition(self, cfg: &Config) -> Result<(Self, CaptureRows)> {
+        let (resized, rows) = self.resized_for_recognition(cfg)?;
+        Ok((resized.unwrap_or(self), rows))
+    }
+
     pub(crate) fn for_recognition(self, cfg: &Config) -> Result<Self> {
-        Ok(self.resized_for_recognition(cfg)?.unwrap_or(self))
+        Ok(self.mapped_for_recognition(cfg)?.0)
     }
     pub fn read(path: &Path) -> Result<Self> {
         let fail = |e: String| format!("{}: {e}", path.display());
