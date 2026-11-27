@@ -42,12 +42,13 @@ VersionInfoVersion={#AppVersionInfo}
 VersionInfoDescription={#AppTitle} 安装程序
 DefaultDirName={localappdata}\Programs\{#AppSubdir}
 DefaultGroupName={#AppTitle}
-DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 #if AppFlavor == "offline"
+DisableProgramGroupPage=no
 DisableDirPage=no
 DisableWelcomePage=no
 #else
+DisableProgramGroupPage=yes
 PrivilegesRequiredOverridesAllowed=dialog
 #endif
 OutputDir={#OutputDir}
@@ -174,7 +175,7 @@ end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
-  Result := (PageID = CvFile.ID) and not UseLocalOpenCV;
+  Result := (PageID = wpSelectProgramGroup) or ((PageID = CvFile.ID) and not UseLocalOpenCV);
 end;
 
 function CheckLocalOpenCV(MakeSnapshot: Boolean): String;
