@@ -29,6 +29,60 @@ function Hash([string]$file) {
         } finally { $sha256.Dispose() }
     } finally { $stream.Dispose() }
 }
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class ShortcutFileIdentity
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileIdInfo
+    {
+        public ulong VolumeSerialNumber, IdLow, IdHigh;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,
+        int infoClass, out FileIdInfo info, uint size);
+
+    public static string Read(string path)
+    {
+        using (var file = File.OpenRead(path))
+        {
+            FileIdInfo id;
+            const int FileIdInfoClass = 18;
+            if (!GetFileInformationByHandleEx(file.SafeFileHandle, FileIdInfoClass, out id,
+                    (uint)Marshal.SizeOf(typeof(FileIdInfo))))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return String.Format("{0:X16}:{1:X16}{2:X16}", id.VolumeSerialNumber, id.IdHigh, id.IdLow);
+        }
+    }
+}
+'@
+$shell = New-Object -ComObject Shell.Application
+function CheckShortcut([string]$lnk, [bool]$selected, [string]$target, [string]$arguments) {
+    $exists = Test-Path -LiteralPath $lnk -PathType Leaf
+    Check ($exists -eq $selected) "快捷方式存在性错误 [$lnk] 实际=[$exists] 期望=[$selected]"
+    if (!$selected) { return }
+
+    $actualTarget = $actualArgs = $actualId = $expectedId = '<未读取>'
+    try {
+        $item = $shell.NameSpace([IO.Path]::GetDirectoryName($lnk)).ParseName([IO.Path]::GetFileName($lnk))
+        $link = $item.GetLink
+        if ($null -eq $link) { throw 'Shell 无法读取快捷方式' }
+        $actualTarget = [string]$link.Path
+        $actualArgs = [string]$link.Arguments
+        $expectedId = [ShortcutFileIdentity]::Read($target)
+        $actualId = [ShortcutFileIdentity]::Read($actualTarget)
+        Check ($actualId -ceq $expectedId -and [string]::Equals($actualArgs, $arguments, [StringComparison]::Ordinal)) '目标文件或参数不同'
+    } catch {
+        Copy-Item -LiteralPath $lnk -Destination $proof -Force
+        throw "快捷方式校验失败 [$lnk] $($_.Exception.Message)`n实际目标=[$actualTarget] 参数=[$actualArgs] 文件标识=[$actualId]`n期望目标=[$target] 参数=[$arguments] 文件标识=[$expectedId]`n快捷方式副本位于 [$proof]"
+    }
+}
 function Setup([string]$components, [bool]$shortcut, [string]$directory, [string]$label, [string]$openCv) {
     $task = if ($shortcut) {'desktopicon'} else {'!desktopicon'}
     $params = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',
@@ -111,16 +165,9 @@ try {
             Check ((Setup 'core,cuda' $false $app 'bad-cv' $bad) -ne 0) '相同长度但哈希不同的 DLL 被接受'
             Check ((Hash (Join-Path $app 'jumpbot.exe')) -eq $actualHash -and (Hash $cv[0].FullName) -eq (Hash $localCv)) '拒绝错误来源时改变了已安装程序'
         }
-        Check ((Test-Path -LiteralPath $desktopLink) -eq $cuda) '桌面快捷方式不符合选择'
-        $shell = New-Object -ComObject WScript.Shell
-        if ($cuda) {Check ($shell.CreateShortcut($desktopLink).TargetPath -eq (Join-Path $app 'jumpbot-desktop.exe')) '桌面快捷方式目标错误'}
+        CheckShortcut $desktopLink $cuda (Join-Path $app 'jumpbot-desktop.exe') ''
         foreach ($link in @(@('NVIDIA CUDA 模式','cuda',$cuda),@('OpenCL 模式','opencl',$cl))) {
-            $lnk = Join-Path $group ($link[0]+'.lnk')
-            Check ((Test-Path -LiteralPath $lnk) -eq $link[2]) "开始菜单快捷方式不符合选择 $lnk"
-            if ($link[2]) {
-                $sc = $shell.CreateShortcut($lnk)
-                Check ($sc.TargetPath -eq (Join-Path $app 'jumpbot.exe') -and $sc.Arguments -like "*--backend $($link[1])*") '快捷方式目标或参数错误'
-            }
+            CheckShortcut (Join-Path $group ($link[0]+'.lnk')) $link[2] (Join-Path $app 'jumpbot.exe') "--backend $($link[1]) --max-jumps 0 --daemon"
         }
         if ($null -eq $reference) {
             $reference = Detect 'cpu'
