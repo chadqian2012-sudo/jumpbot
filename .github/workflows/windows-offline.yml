@@ -56,3 +56,10 @@ jobs:
         env:
           JUMPBOT_TEST_GUI: '1'
         run: cargo run --manifest-path desktop/Cargo.toml --locked -p jumpbot-dist -- --version 0.0.0-ci --output build/ci-package --verify --install
+      - name: Install and verify each offline component selection
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: |
+          cargo run --manifest-path desktop/Cargo.toml --locked -p jumpbot-dist -- --candidate --offline-installer --version 0.0.0-ci --output build/ci-offline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo run --manifest-path desktop/Cargo.toml --locked -p jumpbot-dist -- --offline-installer --version 0.0.0-ci --output build/ci-offline --verify --install
