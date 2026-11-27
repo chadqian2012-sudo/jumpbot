@@ -169,7 +169,6 @@ impl Game<'_> {
         if self.mode != CaptureMode::Screen || !w.is_foreground() {
             return None;
         }
-        w.overlap(w.client_rect)?;
         let raw = self.capturer.reference_frame(w, since)?;
         // Read the desktop again after PrintWindow; the overlay may have moved.
         let visible = self.capturer.capture(w, CaptureMode::Screen).ok()??;
@@ -254,6 +253,7 @@ impl Game<'_> {
         g: u64,
         scores: &Records,
         before: &Frame,
+        reference_deadline: Option<Instant>,
     ) -> Result<Option<Landing>> {
         let previous = scores.prev;
         let reference = before.motion_sample(self.c)?;
@@ -264,7 +264,12 @@ impl Game<'_> {
         let mut outcome = Landing::default();
         let start = Instant::now();
         let timeout = sec(self.c.f("settle_timeout_s"));
-        let deadline = timeout.saturating_mul(2);
+        let mut deadline = timeout.saturating_mul(2);
+        if let Some(until) = reference_deadline {
+            deadline = deadline
+                .max(self.frame_period)
+                .min(until.saturating_duration_since(start));
+        }
         let mut last_score = None;
         while start.elapsed() < deadline {
             let retry = start.elapsed() >= timeout;
@@ -276,7 +281,7 @@ impl Game<'_> {
                 if self.status["state"] != "pausing" {
                     self.report("pausing", json!({}))
                 }
-                if retry || !w.is_foreground() {
+                if reference_deadline.is_some() || retry || !w.is_foreground() {
                     return Ok(Some(outcome));
                 }
             }
@@ -434,6 +439,24 @@ struct Landing {
     score_ms: f64,
 }
 impl Landing {
+    // The deadline belongs to one in-flight PrintWindow call, across settle passes.
+    fn wait_for_reference(
+        &mut self,
+        pending: bool,
+        deadline: &mut Option<Instant>,
+        now: Instant,
+    ) -> bool {
+        if !pending {
+            return false;
+        }
+        let until = deadline.get_or_insert_with(|| now + Duration::from_secs(15));
+        if now < *until {
+            return true;
+        }
+        self.error = Some("等待本跳的窗口参考截图超过 15 秒".into());
+        false
+    }
+
     fn pause_reason(&self, stalled: i32) -> Option<&str> {
         match self.result {
             "unknown" => Some(
@@ -1004,23 +1027,24 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         previous_aim = None;
         game.report("landing", json!({"last_hold_ms":hold,"last_dist_px":dist}));
         let land_start = Instant::now();
-        let mut observation = game.settle(&w, g, &records, &f);
+        let mut observation = game.settle(&w, g, &records, &f, None);
         let mut hidden = None;
         let mut previous_cover = None;
-        let mut waited_for_reference = false;
+        let mut reference_deadline = None;
         while let Ok(Some(landing)) = &mut observation {
             if landing.result != "unknown"
                 || game.mode != CaptureMode::Screen
                 || game.ctl.guard(g, true).is_err()
                 || !w.is_foreground()
                 || time_is_up(game.ctl.clock())
+                || w.overlap(w.client_rect).is_none()
             {
                 break;
             }
             match game.hidden_piece_overlay(&w, land_start) {
                 Some(Overlay::Allowed) => {
                     previous_cover = None;
-                    waited_for_reference = false;
+                    reference_deadline = None;
                 }
                 Some(Overlay::Other(id)) if previous_cover == Some(id) => {
                     let reason = occlusion_message(id);
@@ -1030,14 +1054,19 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 }
                 Some(Overlay::Other(id)) => {
                     previous_cover = Some(id);
-                    waited_for_reference = false;
+                    reference_deadline = None;
                 }
-                None if !waited_for_reference && game.capturer.awaiting_reference(land_start) => {
-                    waited_for_reference = true
+                None => {
+                    if !landing.wait_for_reference(
+                        game.capturer.awaiting_reference(land_start),
+                        &mut reference_deadline,
+                        Instant::now(),
+                    ) {
+                        break;
+                    }
                 }
-                None => break,
             }
-            observation = game.settle(&w, g, &records, &f);
+            observation = game.settle(&w, g, &records, &f, reference_deadline);
         }
         let changed = matches!(observation, Ok(None));
         let mut landed = Landing::after_input(
@@ -1305,6 +1334,27 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_landing_reference_survives_multiple_observations_but_has_a_deadline() {
+        let mut landing = Landing::default();
+        let mut deadline = None;
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+
+        for elapsed in [0, 5200, 8000, 10400] {
+            assert!(landing.wait_for_reference(true, &mut deadline, at(elapsed)));
+            assert_eq!(deadline, Some(at(15000)));
+        }
+        // A completed read without evidence of a covered pawn ends observation.
+        assert!(!landing.wait_for_reference(false, &mut deadline, at(10401)));
+        assert!(landing.error.is_none());
+        assert!(!landing.wait_for_reference(true, &mut deadline, at(15000)));
+        assert_eq!(
+            landing.pause_reason(0),
+            Some("等待本跳的窗口参考截图超过 15 秒")
+        );
+    }
+
     #[test]
     fn overlay_requires_a_missing_visible_pawn_and_changed_pixels_under_the_cover() {
         let cfg = Config::default();
