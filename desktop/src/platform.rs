@@ -288,11 +288,29 @@ impl Window {
         if !self.is_foreground() {
             return Err("游戏窗口不在前台".into());
         }
-        let [l, t, r, b] = self.client_rect;
-        for (x, y) in [(l, t), (r - 1, t), (l, b - 1), (r - 1, b - 1)] {
-            if unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) }.is_null() {
-                return Err("游戏窗口部分位于屏幕外".into());
+        let [left, top, right, bottom] = self.client_rect;
+        let mut y = top;
+        while y < bottom {
+            let mut x = left;
+            let mut next_y = bottom;
+            while x < right {
+                let point = POINT { x, y };
+                let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+                let mut info = MONITORINFO {
+                    cbSize: mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+                    return Err(os_error("GetMonitorInfoW"));
+                }
+                if unsafe { PtInRect(&info.rcMonitor, point) } == 0 {
+                    return Err("游戏窗口部分位于屏幕外".into());
+                }
+                x = info.rcMonitor.right;
+                // The whole strip is covered down to the first monitor's bottom edge.
+                next_y = next_y.min(info.rcMonitor.bottom);
             }
+            y = next_y;
         }
         self.check_occlusion()
     }
@@ -339,37 +357,42 @@ impl Window {
         }
         let width = self.width() as i32;
         let height = self.height() as i32;
-        let frame = match mode {
-            CaptureMode::Screen => {
-                render(width, height, false, &mut |dc| unsafe {
-                    let screen = GetDC(null_mut());
-                    if screen.is_null() {
-                        return Err(os_error("GetDC"));
-                    }
-                    let ok = BitBlt(
-                        dc,
-                        0,
-                        0,
-                        width,
-                        height,
-                        screen,
-                        self.client_rect[0],
-                        self.client_rect[1],
-                        SRCCOPY | CAPTUREBLT,
-                    );
-                    let result = if ok != 0 {
-                        Ok(())
-                    } else {
-                        Err(os_error("BitBlt"))
-                    };
-                    ReleaseDC(null_mut(), screen);
-                    result
-                })
+        let mut capture = |clear, draw: &mut dyn FnMut(HDC) -> Result<()>| {
+            let frame = render(width, height, clear, draw)?;
+            if frame.is_solid_color() {
+                return Err("截图只有单一颜色，等待窗口显示内容".into());
             }
+            Ok(frame)
+        };
+        let frame = match mode {
+            CaptureMode::Screen => capture(false, &mut |dc| unsafe {
+                let screen = GetDC(null_mut());
+                if screen.is_null() {
+                    return Err(os_error("GetDC"));
+                }
+                let ok = BitBlt(
+                    dc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    screen,
+                    self.client_rect[0],
+                    self.client_rect[1],
+                    SRCCOPY | CAPTUREBLT,
+                );
+                let result = if ok != 0 {
+                    Ok(())
+                } else {
+                    Err(os_error("BitBlt"))
+                };
+                ReleaseDC(null_mut(), screen);
+                result
+            }),
             CaptureMode::PrintWindow => {
                 const PW_RENDERFULLCONTENT: u32 = 2;
                 let mut print = |flags| {
-                    render(width, height, true, &mut |dc| {
+                    capture(true, &mut |dc| {
                         if unsafe { PrintWindow(self.handle(), dc, flags) } != 0 {
                             Ok(())
                         } else {
@@ -377,12 +400,7 @@ impl Window {
                         }
                     })
                 };
-                // Some Windows desktops report success for full-content rendering
-                // while returning a black surface. Request the plain client DC there.
-                match print(PW_CLIENTONLY | PW_RENDERFULLCONTENT) {
-                    Ok(frame) if frame.bgr.iter().any(|&byte| byte != 0) => Ok(frame),
-                    _ => print(PW_CLIENTONLY),
-                }
+                print(PW_CLIENTONLY | PW_RENDERFULLCONTENT).or_else(|_| print(PW_CLIENTONLY))
             }
         };
         if !self.still_current()? {
@@ -1042,6 +1060,29 @@ mod tests {
                 0
             );
             assert_eq!(window.still_current(), Ok(true));
+            // A non-black solid first pass must retry. One changed channel in the
+            // final pixel of the fallback is enough to preserve a low-contrast frame.
+            for detail in [false, true] {
+                let mut attempts = 0;
+                let frame = window.capture_with(CaptureMode::PrintWindow, |w, h, _, _| {
+                    attempts += 1;
+                    let mut bgr = [8, 5, 3].repeat((w * h) as usize);
+                    if detail && attempts == 2 {
+                        *bgr.last_mut().unwrap() += 1;
+                    }
+                    Ok(Frame {
+                        width: w as usize,
+                        height: h as usize,
+                        bgr,
+                    })
+                });
+                assert_eq!(attempts, 2);
+                if detail {
+                    assert!(frame.unwrap().is_some());
+                } else {
+                    assert!(frame.err().unwrap().contains("单一颜色"));
+                }
+            }
             window.check_occlusion().unwrap();
             let overlay = make_window(
                 "Click-through overlay",

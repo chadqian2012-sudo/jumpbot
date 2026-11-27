@@ -325,29 +325,39 @@ mod tests {
             height: 23,
             bgr: (0..w * 23 * 3).map(|i| (i * 43 + i / 13) as u8).collect(),
         };
-        let adapters = candidates("").unwrap();
-        assert!(!adapters.is_empty());
-        for adapter in adapters {
-            let mut masks = Masks::new(&cfg, "opencl");
-            let name = adapter.name.clone();
-            let cl = adapter.open(&masks.table).unwrap();
-            // Unit test executables cannot serve as the CLI preflight child.
-            // Install this actual device, then use the normal frame entry point.
-            masks.gpu.devices = Some(vec![Device {
-                runtime: Runtime::Opencl(cl),
-                name: name.clone(),
-                ms: 0.,
-            }]);
-            masks.gpu.chosen = Some(0);
-            let small = frame(37);
+        let mut adapters = candidates("").unwrap();
+        // Two independent contexts exercise failover even on a single-GPU host.
+        if adapters.len() == 1 {
+            adapters.extend(candidates("").unwrap());
+        }
+        let count = adapters.len();
+        assert!(count >= 2);
+        let mut masks = Masks::new(&cfg, "opencl");
+        let small = frame(37);
+        let large = frame(71);
+        // The unit-test binary cannot serve as the CLI preflight child.
+        masks.gpu.devices = Some(
+            adapters
+                .into_iter()
+                .map(|adapter| Device {
+                    name: adapter.name.clone(),
+                    runtime: Runtime::Opencl(adapter.open(&masks.table).unwrap()),
+                    ms: 0.,
+                })
+                .collect(),
+        );
+        masks.select(&small, [0, small.height]);
+        assert_eq!(masks.gpu.devices.as_ref().unwrap().len(), count);
+        for remaining in (0..count).rev() {
+            let i = masks.gpu.chosen.expect("a validated OpenCL device remains");
+            let name = masks.gpu.devices.as_ref().unwrap()[i].name.clone();
             assert_eq!(
                 masks.compute(&small).unwrap(),
                 scalar.compute(&small).unwrap()
             );
             assert_eq!(masks.backend(), "opencl", "{name}");
 
-            let large = frame(71);
-            let Runtime::Opencl(cl) = &mut masks.gpu.devices.as_mut().unwrap()[0].runtime else {
+            let Runtime::Opencl(cl) = &mut masks.gpu.devices.as_mut().unwrap()[i].runtime else {
                 unreachable!()
             };
             // A CL_MEM_HOST_NO_ACCESS buffer is valid device memory, but the
@@ -376,7 +386,12 @@ mod tests {
                 "{name}"
             );
             assert!(matches!(masks.backend(), "simd" | "cpu"), "{name}");
-            assert!(masks.gpu.devices.as_ref().unwrap().is_empty());
+            assert_eq!(masks.gpu.devices.as_ref().unwrap().len(), remaining);
         }
+        assert_eq!(
+            masks.compute(&small).unwrap(),
+            scalar.compute(&small).unwrap()
+        );
+        assert!(matches!(masks.backend(), "simd" | "cpu"));
     }
 }

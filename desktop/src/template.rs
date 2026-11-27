@@ -25,15 +25,19 @@ pub(crate) struct PieceTemplate {
 }
 
 impl PieceTemplate {
-    pub(crate) fn new(frame: Frame) -> opencv::Result<Self> {
+    pub(crate) fn new(frame: Frame) -> opencv::Result<Option<Self>> {
+        // TM_CCOEFF_NORMED reports a perfect match everywhere for a spatially flat template.
+        if frame.is_solid_color() {
+            return Ok(None);
+        }
         let b = centered(&Mat::from_slice(&frame.bgr)?.clone_pointee())?;
         let norm = core::norm_def(&b)?;
         let centered_row = b.reshape(1, 1)?.try_clone()?;
-        Ok(Self {
+        Ok(Some(Self {
             frame,
             centered_row,
             norm,
-        })
+        }))
     }
 }
 
