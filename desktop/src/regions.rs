@@ -230,14 +230,63 @@ impl Mask {
         PieceRegions { mask: self, stats }
     }
 
+    fn paint_span(&mut self, y: usize, x: usize, end: usize, fill: bool) {
+        let row = &mut self.bits[y * self.stride..][..self.stride];
+        let last = (end - 1) / 64;
+        for (i, word) in row.iter_mut().enumerate().take(last + 1).skip(x / 64) {
+            let a = x.saturating_sub(i * 64);
+            let b = (end - i * 64).min(64);
+            let mask = (u64::MAX << a) & (u64::MAX >> (64 - b));
+            if fill {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
+        }
+    }
+
     fn prepare_blocks(&mut self, mut piece: Mask, scratch: &mut RegionScratch) {
         piece.grow_with(8, &mut scratch.morph);
         for (dst, pawn) in self.bits.iter_mut().zip(piece.bits) {
             *dst &= !pawn;
         }
-        self.grow_with(4, &mut scratch.morph);
-        self.erode_with(5, &mut scratch.morph);
+        // Closing can join an isolated rectangular strip to a nearby platform.
+        // Its complete perimeter already encloses its final contour. Keep it
+        // separate through closing, then restore it as an ordinary candidate.
+        const CLOSE_RADIUS: usize = 4;
+        let neighbor_distance = 2 * CLOSE_RADIUS + 1;
+        let mut strips = Vec::new();
+        for stats in self.stats_only(true).into_iter().skip(1) {
+            let [x, y, w, h, _] = stats.map(|v| v as usize);
+            if h < 3 || w / h < 3 {
+                continue;
+            }
+            let (right, bottom) = (x + w - 1, y + h - 1);
+            let set = |x: usize, y: usize| self.bits[y * self.stride + x / 64] >> (x % 64) & 1 != 0;
+            if (x..=right).all(|i| set(i, y) && set(i, bottom))
+                && (y + 1..bottom).all(|j| set(x, j) && set(right, j))
+                && (bottom + 1..=(bottom + neighbor_distance).min(self.height - 1)).any(|j| {
+                    (x.saturating_sub(neighbor_distance)
+                        ..=(right + neighbor_distance).min(self.width - 1))
+                        .any(|i| set(i, j))
+                })
+            {
+                strips.push((x, y, w, h));
+            }
+        }
+        for &(x, y, w, h) in &strips {
+            for j in y..y + h {
+                self.paint_span(j, x, x + w, false);
+            }
+        }
+        self.grow_with(CLOSE_RADIUS, &mut scratch.morph);
+        self.erode_with(CLOSE_RADIUS + 1, &mut scratch.morph);
         self.grow_with(1, &mut scratch.morph);
+        for (x, y, w, h) in strips {
+            for j in y..y + h {
+                self.paint_span(j, x, x + w, true);
+            }
+        }
         // An exterior contour includes enclosed holes. The eight-connected
         // foreground has a four-connected background, including at diagonals.
         self.invert();
@@ -253,13 +302,7 @@ impl Mask {
         self.trim();
         for span in &scratch.spans {
             if scratch.exterior[root(&mut scratch.parents, span.id)] {
-                let row = &mut self.bits[span.y * self.stride..][..self.stride];
-                let last = (span.end - 1) / 64;
-                for (i, word) in row.iter_mut().enumerate().take(last + 1).skip(span.x / 64) {
-                    let a = span.x.saturating_sub(i * 64);
-                    let b = (span.end - i * 64).min(64);
-                    *word &= !((u64::MAX << a) & (u64::MAX >> (64 - b)));
-                }
+                self.paint_span(span.y, span.x, span.end, false);
             }
         }
     }
@@ -455,6 +498,35 @@ pub(crate) struct RegionsRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_keeps_a_detached_strip_and_the_platform_below_separate() {
+        let (w, h) = (128, 80);
+        let regions = |pixels: &[u8]| {
+            Mask::from_pixels(pixels, w, h).blocks(Mask::from_pixels(&vec![0; w * h], w, h))
+        };
+        for gap in [1, 7, 8, 9] {
+            let top = 20 + gap;
+            let mut pixels = vec![0; w * h];
+            for dy in 0..36 {
+                let half = dy.min(18);
+                pixels[(top + dy) * w + 90 - half..=(top + dy) * w + 90 + half].fill(1);
+            }
+            let platform = regions(&pixels);
+            for y in 10..20 {
+                pixels[y * w + 42..y * w + 96].fill(1);
+            }
+            pixels[14 * w + 61..14 * w + 72].fill(0); // Ink holes inside the strip.
+            let both = regions(&pixels);
+            assert_eq!(both.stats.len(), 3, "gap={gap}");
+            assert_eq!(both.stats[1], [42, 10, 54, 10, 540]);
+            assert_eq!(both.stats[2], platform.stats[1], "gap={gap}");
+            assert!(both.labels[top * w..]
+                .iter()
+                .zip(&platform.labels[top * w..])
+                .all(|(&a, &b)| (a != 0) == (b != 0)));
+        }
+    }
 
     #[test]
     fn word_boundaries_and_diagonal_holes_match_pixel_neighborhoods() {
