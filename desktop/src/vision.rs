@@ -282,7 +282,10 @@ fn face_center_with_scratch(
     // Invariant: mask is all zeros on entry and cleared back to all zeros on exit.
     for (row, band) in mask[..needed].chunks_exact_mut(w).enumerate() {
         let start = (by + row) * w + bx;
-        for (dst, &label) in band[bx..bx + bw].iter_mut().zip(&labels[start..start + bw]) {
+        for (dst, &label) in band[bx..bx + bw]
+            .iter_mut()
+            .zip(&labels[start..start + bw])
+        {
             *dst = u8::from(label == id as i32);
         }
     }
@@ -585,14 +588,9 @@ fn find_target(
         if !(strict || small) {
             continue;
         }
-        let Some((x, mut y, top_width)) = face_center_with_scratch(
-            parts.width,
-            parts.labels,
-            id,
-            stats,
-            slope,
-            scratch.face_mask,
-        ) else {
+        let Some((x, mut y, top_width)) =
+            face_center_with_scratch(parts.width, parts.labels, id, stats, slope, scratch.face_mask)
+        else {
             continue;
         };
         let top_y = by as f64;
@@ -1518,12 +1516,7 @@ mod tests {
         for (i, (x, y, half_height)) in diamonds.into_iter().enumerate() {
             let id = i + 1;
             let actual = face_center_with_scratch(
-                regions.width,
-                &regions.labels,
-                id,
-                regions.stats[id],
-                0.5774,
-                &mut scratch,
+                regions.width, &regions.labels, id, regions.stats[id], 0.5774, &mut scratch,
             );
             let width = 2. * half_height * (1. / 0.5774);
             assert_eq!(actual, Some((x, y, width)), "component {id}");

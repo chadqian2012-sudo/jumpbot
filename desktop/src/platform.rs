@@ -1343,15 +1343,7 @@ mod tests {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // A visible HWND may temporarily have no drawable client area during a resize.
             assert_ne!(
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    30,
-                    30,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_NOZORDER
-                ),
+                SetWindowPos(hwnd, null_mut(), 30, 30, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER),
                 0
             );
             assert_eq!(window.still_current(), Ok(false));

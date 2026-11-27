@@ -609,12 +609,11 @@ pub(super) fn glyph_feature(glyph: &GrayImage) -> opencv::Result<Vec<f32>> {
         imgproc::INTER_AREA,
     )?;
     let mut out = vec![0.; 24 * 32];
-    for (src, row) in scaled.data_bytes()?.chunks_exact(width).zip(
-        out.as_chunks_mut::<24>()
-            .0
-            .iter_mut()
-            .skip((32 - height) / 2),
-    ) {
+    for (src, row) in scaled
+        .data_bytes()?
+        .chunks_exact(width)
+        .zip(out.as_chunks_mut::<24>().0.iter_mut().skip((32 - height) / 2))
+    {
         for (&p, v) in src.iter().zip(&mut row[(24 - width) / 2..]) {
             *v = f32::from(p) / 255.
         }
@@ -847,11 +846,8 @@ impl<'a> ScanTemplate<'a> {
         let top2 = &self.int_sum2[y * self.stride..];
         let bot2 = &self.int_sum2[(y + th) * self.stride..];
         for x in 0..=self.w - tw {
-            let c_val = f64::from(if self.use_imag {
-                corr_row[x].im
-            } else {
-                corr_row[x].re
-            }) * self.scale;
+            let c_val =
+                f64::from(if self.use_imag { corr_row[x].im } else { corr_row[x].re }) * self.scale;
             if c_val <= 0. {
                 continue;
             }
@@ -1127,8 +1123,7 @@ impl ButtonSpectra {
         // Phase 1B: Fold vertical band totals into integral rows for bands 1..n_threads.
         if n_threads > 1 {
             let y1_0 = (band_range(0, n_threads, n_pairs).end * 2).min(h);
-            self.band_sum_off[..stride]
-                .copy_from_slice(&self.int_sum[y1_0 * stride..(y1_0 + 1) * stride]);
+            self.band_sum_off[..stride].copy_from_slice(&self.int_sum[y1_0 * stride..(y1_0 + 1) * stride]);
             self.band_sum2_off[..stride]
                 .copy_from_slice(&self.int_sum2[y1_0 * stride..(y1_0 + 1) * stride]);
             for b in 2..n_threads {
@@ -1728,10 +1723,8 @@ impl ScreenText {
         }
         Ok((peak >= 0.90).then(|| {
             [
-                bounds.x as f64
-                    + (at.0 as f64 + tw as f64 / 2.) * bounds.width as f64 / a.width as f64,
-                bounds.y as f64
-                    + (at.1 as f64 + th as f64 / 2.) * bounds.height as f64 / a.height as f64,
+                bounds.x as f64 + (at.0 as f64 + tw as f64 / 2.) * bounds.width as f64 / a.width as f64,
+                bounds.y as f64 + (at.1 as f64 + th as f64 / 2.) * bounds.height as f64 / a.height as f64,
             ]
         }))
     }
@@ -2123,8 +2116,8 @@ mod tests {
             for y in f.height / 4..f.height * 65 / 100 {
                 for x in f.width * 15 / 100..f.width * 85 / 100 {
                     let p = &f.bgr[(y * f.width + x) * 3..];
-                    let g =
-                        (1868 * p[0] as i32 + 9617 * p[1] as i32 + 4899 * p[2] as i32 + 8192) >> 14;
+                    let g = (1868 * p[0] as i32 + 9617 * p[1] as i32 + 4899 * p[2] as i32 + 8192)
+                        >> 14;
                     dark += usize::from(g < threshold);
                     count += 1;
                 }
@@ -2208,10 +2201,7 @@ mod tests {
                 .unwrap(),
             Some((
                 false,
-                [
-                    11. + start.width as f64 / 2.,
-                    17. + start.height as f64 / 2.
-                ]
+                [11. + start.width as f64 / 2., 17. + start.height as f64 / 2.]
             ))
         );
         assert_eq!(
@@ -2234,10 +2224,7 @@ mod tests {
                 .unwrap(),
             Some((
                 false,
-                [
-                    19. + start.width as f64 / 2.,
-                    25. + start.height as f64 / 2.
-                ]
+                [19. + start.width as f64 / 2., 25. + start.height as f64 / 2.]
             ))
         );
     }
@@ -2297,13 +2284,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let frame_gray: Vec<u8> = frame
-            .bgr
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|p| gray(p))
-            .collect();
+        let frame_gray: Vec<u8> = frame.bgr.as_chunks::<3>().0.iter().map(|p| gray(p)).collect();
         let mut expected = None;
         let mut expected_best = 0.70f64;
         for (id, tpl) in screen.buttons.iter().enumerate() {
