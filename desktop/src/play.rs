@@ -5,7 +5,7 @@ use crate::{
     options::Options,
     platform::{CaptureMode, PressOutcome, Window},
     records::{same_game_score, Records},
-    runtime::{annotated, detection},
+    runtime::{annotated, JumpTiming},
     screen::{CaptureRows, Screen, ScreenState},
     vision::{axis_components, points_close, Detection, Vision},
     Config, Frame, Result,
@@ -105,7 +105,9 @@ impl Game<'_> {
             }
             let elapsed = self.ctl.wait_clock().saturating_sub(wait);
             let mut reason = "等待用户打开游戏窗口";
-            if let Some(w) = Window::find(self.c, (1, 1))? {
+            let window = Window::find(self.c, (1, 1))?;
+            let missing = window.is_none();
+            if let Some(w) = window {
                 let Ok(guard) = self.ctl.guard(g, false) else {
                     continue;
                 };
@@ -136,7 +138,14 @@ impl Game<'_> {
             }
             countdown = None;
             if timeout.is_some_and(|t| elapsed >= t) {
-                return Ok(None);
+                if self.ctl.guard(g, false).is_err() {
+                    continue;
+                }
+                return if !initial && self.o.daemon && missing {
+                    Ok(None)
+                } else {
+                    Err("等待游戏窗口超时".into())
+                };
             }
             self.report("waiting_window",json!({"window":null,"countdown_s":null,"waited_s":elapsed.as_secs_f64(),"stop_reason":reason}));
             let poll = timeout.map_or(ms(200.), |t| ms(200.).min(t.saturating_sub(elapsed)));
@@ -495,6 +504,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
         game.ctl.sleep(g, ms(400.));
     }
     let jump = o.jump_test && !o.dry_run;
+    let timing = JumpTiming::initial(cfg, o);
     let count = if jump {
         o.burst.max(1).checked_add(1).ok_or("连拍次数过大")?
     } else {
@@ -511,7 +521,8 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
         if o.dry_run || jump {
             let mut f = raw.for_recognition(cfg)?;
             let mut d = game.vision.detect(&f)?;
-            if i == 0 && jump {
+            let test_press = i == 0 && jump;
+            if test_press {
                 let first = d.aim();
                 if first.is_none()
                     || !game
@@ -534,24 +545,22 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
                 {
                     return Err("无法确认新帧目标，取消试跳".into());
                 }
-                let hold = detection(&d, cfg)["hold_ms"]
-                    .as_f64()
-                    .ok_or("无法确认棋子和目标")?;
-                let duration = if o.hold_ms > 0. { o.hold_ms } else { hold };
+            }
+            let explicit_ms = (test_press && o.hold_ms > 0.).then_some(o.hold_ms);
+            let row = timing.detection(&d, explicit_ms);
+            if test_press {
+                let duration = row["hold_ms"].as_f64().ok_or("无法确认棋子和目标")?;
                 if game.press(
                     &w,
                     g,
                     (cfg.at("press_point", 0), cfg.at("press_point", 1)),
-                    duration.clamp(
-                        cfg.f("press_duration_min_ms"),
-                        cfg.f("press_duration_max_ms"),
-                    ),
+                    duration,
                 )? != PressOutcome::Sent
                 {
                     return Err("控制请求已取消试跳".into());
                 }
             }
-            println!("{}", detection(&d, cfg));
+            println!("{row}");
             let name = if !jump {
                 format!("dry_{i:03}.png")
             } else if i == 0 {
@@ -603,9 +612,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     );
     game.report("starting", json!({}));
     let mut window = game.gate(true, (wait > 0.).then(|| sec(wait)))?;
-    if window.is_none() && !game.ctl.state().stopped {
-        return Err("等待游戏窗口超时".into());
-    }
     let active_start = game.ctl.clock();
     if window.is_some() {
         game.round_start = Some(active_start)
@@ -655,11 +661,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
         };
         if interrupted || !valid_current {
-            let missing = if interrupted {
-                false
-            } else {
-                Window::find(cfg, (1, 1))?.is_none()
-            };
             baseline = true;
             previous_aim = None;
             attempts = 0;
@@ -674,10 +675,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             };
             window = game.gate(false, timeout)?;
             if window.is_none() && !game.ctl.state().stopped {
-                if o.daemon && missing {
-                    break End::WindowGone;
-                }
-                return Err("等待游戏窗口超时".into());
+                break End::WindowGone;
             }
             acquisition = Instant::now();
             last_progress = game.ctl.clock();
@@ -792,9 +790,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             baseline = false
         }
         game.report("acquiring",json!({"piece_source":d.piece.as_ref().map(|p|p.source),"piece_shape_score":d.piece.as_ref().map(|p|p.shape_score),"game_state":"playing","stop_reason":"","score":records.prev}));
-        if o.calibrate {
-            k = base * o.calib_k_scales[band]
-        }
+        let timing = JumpTiming::new(cfg, o, k, band, records.index);
+        k = timing.k;
         let k_before = k;
         let pair = d.aim().zip(d.target.as_ref());
         let (dist, axis, hold, bias) = if let Some((aim, t)) = pair {
@@ -809,7 +806,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 continue;
             }
             attempts = 0;
-            let (axis, mut dist, cross) =
+            let (axis, dist, cross) =
                 axis_components(t.x - aim.piece.0, t.y - aim.piece.1, cfg.f("axis_slope"));
             if dist <= 0.
                 || dist < cfg.f("min_jump_dist_ratio") * f.width as f64 * 0.4
@@ -828,34 +825,8 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                 continue;
             }
             rejects = 0;
-            if cfg.f("low_ratio_trim_ratio") > 0.
-                && t.top_width < cfg.f("low_ratio_gate") * t.bbox[2] as f64
-            {
-                dist *= 1. - cfg.f("low_ratio_trim_ratio")
-            }
-            let bias = if o.bias_sweep {
-                o.bias_levels
-                    [records.index as usize / o.bias_per_level.max(1) % o.bias_levels.len()]
-            } else {
-                0.
-            };
-            dist *= 1. + bias / 100.;
-
-            let mut hold = if !o.calibrate && cfg.f("transfer_a") > 0.01 {
-                (dist - cfg.f("transfer_c")) / cfg.f("transfer_a")
-            } else {
-                k * dist + cfg.f("b")
-            };
-            hold *= 1. + cfg.f("press_bias_ratio");
-            if adaptive {
-                let trim = cfg.f("residual_trim_ratio");
-                hold *= 1. + (-0.3_f64 * ema).clamp(-trim, trim)
-            }
-            hold = hold.clamp(
-                cfg.f("press_duration_min_ms"),
-                cfg.f("press_duration_max_ms"),
-            );
-            (Some(dist), axis, hold, bias)
+            let (timed_dist, hold) = timing.distance_and_hold(t, dist, ema);
+            (Some(timed_dist), axis, hold, timing.bias_pct)
         } else {
             previous_aim = None;
             if d.unresolved_target_shadow {
@@ -1120,15 +1091,6 @@ pub(crate) fn run(
     vision: &mut Vision,
     path: &Path,
 ) -> Result<()> {
-    if (o.calibrate
-        && (o.calib_k_scales.is_empty()
-            || o.calib_k_scales.iter().any(|v| !v.is_finite() || *v <= 0.)))
-        || (o.bias_sweep
-            && (o.bias_levels.is_empty()
-                || o.bias_levels.iter().any(|v| !v.is_finite() || *v <= -100.)))
-    {
-        return Err("标定比例或扫描档位无效".into());
-    }
     let ctl = Controls::start(cfg.s("pause_hotkey"), o.worker)?;
     let mode = if o.capture == "printwindow" {
         CaptureMode::PrintWindow

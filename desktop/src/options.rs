@@ -1,7 +1,7 @@
 use crate::{Config, Result};
 use clap::Parser;
 use serde_json::json;
-use std::path::PathBuf;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 #[derive(Parser)]
 #[command(name = "JumpBot", about = "Windows 跳一跳控制与离线识别")]
@@ -36,8 +36,9 @@ pub(crate) struct Options {
     pub selftest: bool,
     #[arg(long)]
     pub image: Vec<String>,
-    #[arg(long, default_value_t = 1)]
-    pub bench_repeat: usize,
+    /// Warm up once, then time this many detections per image.
+    #[arg(long)]
+    pub bench_repeat: Option<NonZeroUsize>,
     #[arg(long)]
     pub dry_run: bool,
     #[arg(long)]
@@ -160,7 +161,8 @@ impl Options {
                 .any(|v| !v.is_finite() || *v <= 0.)
             || self.bias_levels.iter().any(|v| !v.is_finite())
             || (self.calibrate && self.calib_k_scales.is_empty())
-            || (self.bias_sweep && self.bias_levels.is_empty())
+            || (self.bias_sweep
+                && (self.bias_levels.is_empty() || self.bias_levels.iter().any(|v| *v <= -100.)))
         {
             return Err("采样数量或标定档位无效".into());
         }

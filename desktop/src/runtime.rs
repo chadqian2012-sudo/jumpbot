@@ -3,13 +3,14 @@ use crate::{
     masks::Masks,
     options::Options,
     screen::Screen,
-    vision::{axis_components, Detection, Vision},
+    vision::{axis_components, Block, Detection, Vision},
     Config, Frame, Result,
 };
 use clap::Parser;
 use serde_json::{json, Value};
 use std::{
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -58,9 +59,7 @@ pub fn run() -> Result<()> {
         return selftest(&cfg, &mut vision);
     }
     if !o.image.is_empty() {
-        if o.bench_repeat == 0 {
-            return Err("bench-repeat 必须大于零".into());
-        }
+        let timing = JumpTiming::initial(&cfg, &o);
         for pattern in &o.image {
             let files: Vec<PathBuf> = if Path::new(pattern).is_file() {
                 vec![PathBuf::from(pattern)]
@@ -77,16 +76,13 @@ pub fn run() -> Result<()> {
                 let capture = Frame::read(&path)?;
                 let (normalized, rows) = capture.resized_for_recognition(&cfg)?;
                 let f = normalized.as_ref().unwrap_or(&capture);
-                vision.reset_prior();
-                let mut d = vision.detect(f)?;
-                let mut times = Vec::new();
-                for _ in 0..o.bench_repeat {
+                let (mut d, times) = measure_image(o.bench_repeat, || {
                     vision.reset_prior();
                     let t = Instant::now();
-                    d = vision.detect(f)?;
-                    times.push(t.elapsed().as_secs_f64() * 1e6);
-                }
-                let mut row = detection(&d, &cfg);
+                    let d = vision.detect(f)?;
+                    Ok((d, t.elapsed().as_secs_f64() * 1e6))
+                })?;
+                let mut row = timing.detection(&d, None);
                 row["calibrated_dist_px"] = row["dist_px"].clone();
                 if normalized.is_some() {
                     map_detection_to_capture(&mut d, capture.width as f64 / f.width as f64, rows);
@@ -116,6 +112,25 @@ pub fn run() -> Result<()> {
     }
     crate::play::run(&o, &cfg, &screen, &mut vision, &path)
 }
+
+// An ordinary image keeps its first sample. An explicit benchmark discards it as warm-up.
+fn measure_image<T>(
+    repeat: Option<NonZeroUsize>,
+    mut detect: impl FnMut() -> Result<(T, f64)>,
+) -> Result<(T, Vec<f64>)> {
+    let (mut detection, first_us) = detect()?;
+    let Some(repeat) = repeat else {
+        return Ok((detection, vec![first_us]));
+    };
+    let mut times = Vec::new();
+    for _ in 0..repeat.get() {
+        let (next, us) = detect()?;
+        detection = next;
+        times.push(us);
+    }
+    Ok((detection, times))
+}
+
 // The public image result and its annotation use the caller's pixel coordinates.
 fn map_detection_to_capture(d: &mut Detection, sx: f64, rows: crate::screen::CaptureRows) {
     let sy = rows.board_scale();
@@ -153,10 +168,76 @@ fn distance_px(d: &Detection, c: &Config) -> Option<f64> {
         .zip(d.target.as_ref())
         .map(|(p, t)| axis_components(t.x - p.x, t.y - p.y, c.f("axis_slope")).1)
 }
-pub(crate) fn detection(d: &Detection, c: &Config) -> Value {
-    let dist = distance_px(d, c);
-    json!({"piece":d.piece,"target":d.target,"dist_px":dist,"hold_ms":dist.map(|v|v*c.f("k")+c.f("b"))})
+
+pub(crate) struct JumpTiming<'a> {
+    cfg: &'a Config,
+    calibrate: bool,
+    pub k: f64,
+    pub bias_pct: f64,
 }
+
+impl<'a> JumpTiming<'a> {
+    pub(crate) fn initial(cfg: &'a Config, o: &Options) -> Self {
+        Self::new(cfg, o, cfg.f("k"), 0, 0)
+    }
+
+    pub(crate) fn new(cfg: &'a Config, o: &Options, k: f64, band: usize, jump_index: u64) -> Self {
+        Self {
+            cfg,
+            calibrate: o.calibrate,
+            k: if o.calibrate {
+                cfg.f("k") * o.calib_k_scales[band]
+            } else {
+                k
+            },
+            bias_pct: if o.bias_sweep {
+                o.bias_levels[jump_index as usize / o.bias_per_level.max(1) % o.bias_levels.len()]
+            } else {
+                0.
+            },
+        }
+    }
+
+    fn clamp_ms(&self, ms: f64) -> f64 {
+        ms.clamp(
+            self.cfg.f("press_duration_min_ms"),
+            self.cfg.f("press_duration_max_ms"),
+        )
+    }
+
+    pub(crate) fn distance_and_hold(&self, t: &Block, mut distance: f64, ema: f64) -> (f64, f64) {
+        let cfg = self.cfg;
+        if cfg.f("low_ratio_trim_ratio") > 0.
+            && t.top_width < cfg.f("low_ratio_gate") * f64::from(t.bbox[2])
+        {
+            distance *= 1. - cfg.f("low_ratio_trim_ratio");
+        }
+        distance *= 1. + self.bias_pct / 100.;
+        let mut hold = if !self.calibrate && cfg.f("transfer_a") > 0.01 {
+            (distance - cfg.f("transfer_c")) / cfg.f("transfer_a")
+        } else {
+            self.k * distance + cfg.f("b")
+        };
+        hold *= 1. + cfg.f("press_bias_ratio");
+        if !self.calibrate && cfg.f("gamma") > 0. {
+            let trim = cfg.f("residual_trim_ratio");
+            hold *= 1. + (-0.3 * ema).clamp(-trim, trim);
+        }
+        (distance, self.clamp_ms(hold))
+    }
+
+    pub(crate) fn detection(&self, d: &Detection, explicit_ms: Option<f64>) -> Value {
+        let dist = distance_px(d, self.cfg);
+        let hold = dist
+            .zip(d.target.as_ref())
+            .map(|(distance, target)| match explicit_ms {
+                Some(ms) => self.clamp_ms(ms),
+                None => self.distance_and_hold(target, distance, 0.).1,
+            });
+        json!({"piece":d.piece,"target":d.target,"dist_px":dist,"hold_ms":hold})
+    }
+}
+
 pub(crate) fn annotated(f: &Frame, d: &Detection) -> Frame {
     let mut image = f.clone();
     let mut mark = |x: i32, y: i32, color: [u8; 3]| {
@@ -217,8 +298,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_benchmarks_discard_only_the_explicit_warmup() {
+        for (args, samples) in [
+            (vec!["jumpbot"], vec![1.]),
+            (vec!["jumpbot", "--bench-repeat", "1"], vec![2.]),
+            (vec!["jumpbot", "--bench-repeat", "3"], vec![2., 3., 4.]),
+        ] {
+            let repeat = Options::parse_from(args).bench_repeat;
+            let mut calls = 0;
+            let (last, times) = measure_image(repeat, || {
+                calls += 1;
+                Ok((calls, f64::from(calls)))
+            })
+            .unwrap();
+            assert_eq!(times, samples);
+            assert_eq!(f64::from(calls), *samples.last().unwrap());
+            assert_eq!(last, calls);
+        }
+        assert!(Options::try_parse_from(["jumpbot", "--bench-repeat", "0"]).is_err());
+    }
+
+    #[test]
+    fn live_uses_adjusted_distance_and_image_reports_geometry() {
+        let mut cfg = Config::default();
+        let mut o = Options::parse_from([
+            "jumpbot",
+            "--bias-sweep",
+            "--bias-levels=25,0",
+            "--bias-per-level=1",
+            "--calib-k-scales=0.5,2",
+            "--k=2",
+            "--gamma=1",
+        ]);
+        o.apply(&mut cfg).unwrap();
+        cfg.0["low_ratio_trim_ratio"] = json!(0.25);
+        cfg.0["press_bias_ratio"] = json!(0.25);
+        cfg.0["transfer_a"] = json!(0.5);
+        cfg.0["transfer_c"] = json!(7.5);
+        cfg.0["residual_trim_ratio"] = json!(0.125);
+        cfg.0["b"] = json!(4.);
+        cfg.0["axis_slope"] = json!(0.);
+        let d = Detection {
+            piece: Some(crate::vision::Piece {
+                x: 100.,
+                y: 500.,
+                bbox: [80, 460, 40, 40],
+                area: 800,
+                tpl_score: 1.,
+                source: "legacy",
+                shape_score: 1.,
+            }),
+            target: Some(Block {
+                x: 300.,
+                y: 500.,
+                bbox: [250, 490, 100, 40],
+                area: 2000,
+                top_y: 490.,
+                top_width: 20.,
+                dot: None,
+            }),
+            unresolved_target_shadow: false,
+            piece_mask: vec![],
+            block_mask: vec![],
+        };
+        let target = d.target.as_ref().unwrap();
+        let timing = JumpTiming::initial(&cfg, &o);
+        let row = timing.detection(&d, None);
+        assert_eq!(row["dist_px"], 200.);
+        // 200 * 0.75 * 1.25 = 187.5 timing pixels. Transfer and press bias give 450 ms.
+        assert_eq!(row["hold_ms"], 450.);
+        assert_eq!(timing.distance_and_hold(target, 200., 0.), (187.5, 450.));
+        assert_eq!(timing.distance_and_hold(target, 200., 1.), (187.5, 393.75));
+        assert_eq!(timing.distance_and_hold(target, 0., 0.).1, 60.);
+        assert_eq!(timing.distance_and_hold(target, 10000., 0.).1, 1500.);
+        for (manual, expected) in [(5., 60.), (123., 123.), (3000., 1500.)] {
+            assert_eq!(timing.detection(&d, Some(manual))["hold_ms"], expected);
+        }
+
+        o.no_adaptive = true;
+        o.apply(&mut cfg).unwrap();
+        let fixed = JumpTiming::initial(&cfg, &o);
+        assert_eq!(fixed.distance_and_hold(target, 200., 1.), (187.5, 450.));
+        o.no_adaptive = false;
+        o.calibrate = true;
+        o.apply(&mut cfg).unwrap();
+        assert_eq!(
+            JumpTiming::initial(&cfg, &o).detection(&d, None)["hold_ms"],
+            239.375
+        );
+        let second = JumpTiming::new(&cfg, &o, 1., 1, 1);
+        // Second calibration band uses k=4 and zero sweep bias, bypassing transfer and residual.
+        assert_eq!(second.distance_and_hold(target, 200., 1.), (150., 755.));
+    }
+
+    #[test]
     fn same_board_keeps_its_hold_after_window_scaling() {
         let cfg = Config::default();
+        let timing = JumpTiming::initial(&cfg, &Options::parse_from(["jumpbot"]));
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -233,7 +409,7 @@ mod tests {
         ] {
             let reference = Frame::read(&root.join(name)).unwrap();
             vision.reset_prior();
-            let expected = detection(&vision.detect(&reference).unwrap(), &cfg);
+            let expected = timing.detection(&vision.detect(&reference).unwrap(), None);
             // Synthesize a different client resolution without the production resizer.
             let mut pixels = Vec::with_capacity(width * height * 3);
             for y in 0..height {
@@ -269,7 +445,7 @@ mod tests {
             }
             vision.reset_prior();
             let mut d = vision.detect(&normalized).unwrap();
-            let actual = detection(&d, &cfg);
+            let actual = timing.detection(&d, None);
             if let Some(ms) = expected["hold_ms"].as_f64() {
                 assert!(
                     (actual["hold_ms"].as_f64().unwrap() - ms).abs() < 8.0,
@@ -291,6 +467,7 @@ mod tests {
     #[test]
     fn release_frames_match_center_decisions() {
         let cfg = Config::default();
+        let timing = JumpTiming::initial(&cfg, &Options::parse_from(["jumpbot"]));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let screen = Screen::new(&root.join("templates"), &cfg).unwrap();
         for backend in ["cpu", "simd"] {
@@ -321,7 +498,7 @@ mod tests {
                 let frame = Frame::read(&root.join("tests/fixtures").join(name)).unwrap();
                 vision.reset_prior();
                 let d = vision.detect(&frame).unwrap();
-                let actual = detection(&d, &cfg);
+                let actual = timing.detection(&d, None);
                 for (kind, label) in [("piece", &original["piece"]), ("target", &target)] {
                     assert_eq!(
                         actual[kind].is_null(),

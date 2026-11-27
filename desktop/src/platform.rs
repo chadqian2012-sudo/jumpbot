@@ -394,6 +394,46 @@ impl Window {
         frame.map(Some)
     }
 
+    fn press_target(&self, point: (f64, f64), background: bool) -> Result<Option<ButtonTarget>> {
+        let cx = (point.0 * self.width() as f64) as i32;
+        let cy = (point.1 * self.height() as f64) as i32;
+        let target = if background {
+            if cx > i16::MAX as i32 || cy > i16::MAX as i32 {
+                return Err("后台按压点超出 Windows 消息范围".into());
+            }
+            ButtonTarget::Client(self.handle(), ((cy << 16) | cx) as LPARAM)
+        } else {
+            let x = self.client_rect[0] + cx;
+            let y = self.client_rect[1] + cy;
+            let absolute = |p: i32, origin, extent| {
+                let start = unsafe { GetSystemMetrics(origin) };
+                let size = i64::from(unsafe { GetSystemMetrics(extent) });
+                let offset = i64::from(p) - i64::from(start);
+                if !(0..size).contains(&offset) {
+                    return Err("按压点位于屏幕外");
+                }
+                Ok(((2 * offset + 1) * 32768 / size) as i32)
+            };
+            ButtonTarget::Desktop(
+                absolute(x, SM_XVIRTUALSCREEN, SM_CXVIRTUALSCREEN)?,
+                absolute(y, SM_YVIRTUALSCREEN, SM_CYVIRTUALSCREEN)?,
+            )
+        };
+        let visible = background
+            || (self.is_foreground()
+                && point_is_target(
+                    self.handle(),
+                    POINT {
+                        x: self.client_rect[0] + cx,
+                        y: self.client_rect[1] + cy,
+                    },
+                ));
+        if !visible || !self.still_current()? {
+            return Ok(None);
+        }
+        Ok(Some(target))
+    }
+
     /// The admission callback returns the parent's locked control guard after
     /// checking pause, stop and the generation of the recognized frame. DOWN
     /// executes under that guard. Hold and UP happen after unlocking. The
@@ -418,49 +458,11 @@ impl Window {
                 if no_input() {
                     return Err("JUMPBOT_NO_INPUT 已禁止按压".into());
                 }
-                let cx = (point.0 * self.width() as f64) as i32;
-                let cy = (point.1 * self.height() as f64) as i32;
-                let target = if background {
-                    if cx > i16::MAX as i32 || cy > i16::MAX as i32 {
-                        return Err("后台按压点超出 Windows 消息范围".into());
-                    }
-                    ButtonTarget::Client(self.handle(), ((cy << 16) | cx) as LPARAM)
-                } else {
-                    let x = self.client_rect[0] + cx;
-                    let y = self.client_rect[1] + cy;
-                    let absolute = |p: i32, origin, extent| {
-                        let start = unsafe { GetSystemMetrics(origin) };
-                        let size = i64::from(unsafe { GetSystemMetrics(extent) });
-                        let offset = i64::from(p) - i64::from(start);
-                        if !(0..size).contains(&offset) {
-                            return Err("按压点位于屏幕外");
-                        }
-                        Ok(((2 * offset + 1) * 32768 / size) as i32)
-                    };
-                    ButtonTarget::Desktop(
-                        absolute(x, SM_XVIRTUALSCREEN, SM_CXVIRTUALSCREEN)?,
-                        absolute(y, SM_YVIRTUALSCREEN, SM_CYVIRTUALSCREEN)?,
-                    )
-                };
-                let visible = background
-                    || (self.is_foreground()
-                        && point_is_target(
-                            self.handle(),
-                            POINT {
-                                x: self.client_rect[0] + cx,
-                                y: self.client_rect[1] + cy,
-                            },
-                        ));
-                if !self.still_current()? {
-                    return Ok(None);
+                let target = self.press_target(point, background)?;
+                if let Some(client @ ButtonTarget::Client(..)) = &target {
+                    client.post(WM_MOUSEMOVE, 0)?;
                 }
-                if !visible {
-                    return Err("游戏窗口不在前台或按压点被遮挡".into());
-                }
-                if background {
-                    target.post(WM_MOUSEMOVE, 0)?;
-                }
-                Ok(Some(target))
+                Ok(target)
             },
             ButtonTarget::down,
             ButtonTarget::up,
@@ -1068,6 +1070,17 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("前台"));
+
+            // Losing foreground after capture cancels this plan before any input is sent.
+            assert!(window.press_target((0.5, 0.72), true).unwrap().is_some());
+            let skipped = dispatch_press(
+                || Ok(()),
+                || window.press_target((0.5, 0.72), false),
+                |_| panic!("unexpected DOWN"),
+                |_| panic!("unexpected UP"),
+                || panic!("unexpected hold"),
+            );
+            assert_eq!(skipped, Ok(PressOutcome::WindowChanged));
 
             let mut keys = Hotkeys::register("Ctrl+Shift+7").unwrap();
             assert_eq!(
