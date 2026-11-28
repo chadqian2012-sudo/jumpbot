@@ -17,6 +17,9 @@ $proof = Join-Path $repo "build\offline-install-proof-$nonce"
 $app = Join-Path $proof '中文 自选目录'
 $groupName = "JumpBot-Offline-QA-$nonce"
 $group = Join-Path ([Environment]::GetFolderPath('Programs')) $groupName
+if (Test-Path -LiteralPath $group) { throw "测试菜单已存在：$group" }
+$menuConsole = Join-Path $group '跳一跳控制台.lnk'
+$foreignLink = Join-Path $group '用户自建.lnk'
 $frame = Join-Path $repo 'tests\fixtures\skin-gold-play.png'
 $null = New-Item -ItemType Directory -Path $proof
 function Check($ok, [string]$message) {
@@ -86,6 +89,37 @@ function CheckShortcut([string]$lnk, [bool]$selected, [string]$target, [string]$
         throw "快捷方式校验失败 [$lnk] $($_.Exception.Message)`n实际目标=[$actualTarget] 参数=[$actualArgs] 文件标识=[$actualId]`n期望目标=[$target] 参数=[$arguments] 文件标识=[$expectedId]`n快捷方式副本位于 [$proof]"
     }
 }
+# Inno's first process can exit before its second phase. Bound the whole tree.
+function Invoke-Inno([string]$binary, [string[]]$arguments, [string]$label) {
+    $wait = {
+        $ErrorActionPreference = 'Stop'
+        $p = Start-Process -FilePath $env:JUMPBOT_QA_EXE -ArgumentList $env:JUMPBOT_QA_ARGS -Wait -PassThru -WindowStyle Hidden
+        if ($null -eq $p.ExitCode) { throw '退出码不可读' }
+        exit $p.ExitCode
+    }
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $start.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wait.ToString()))
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.EnvironmentVariables['JUMPBOT_QA_EXE'] = $binary
+    $start.EnvironmentVariables['JUMPBOT_QA_ARGS'] = $arguments -join ' '
+    $process = [Diagnostics.Process]::Start($start)
+    try {
+        if (!$process.WaitForExit(90000)) {
+            try {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F | Out-Null
+            } catch {
+                throw [TimeoutException]::new("$label 超过 90 秒，终止测试进程 $($process.Id) 时出错。记录在 $proof", $_.Exception)
+            }
+            if ($LASTEXITCODE -ne 0 -and !$process.HasExited) {
+                throw [TimeoutException]::new("$label 超过 90 秒，测试进程 $($process.Id) 未能终止。记录在 $proof")
+            }
+            throw [TimeoutException]::new("$label 超过 90 秒，进程树未正常退出。记录在 $proof")
+        }
+        $process.ExitCode
+    } finally { $process.Dispose() }
+}
 function Setup([string]$components, [bool]$shortcut, [string]$directory, [string]$label, [string]$openCv, [string]$binary = $installerPath, [string]$menu = $groupName) {
     $task = if ($shortcut) {'desktopicon'} else {'!desktopicon'}
     $params = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',
@@ -93,17 +127,23 @@ function Setup([string]$components, [bool]$shortcut, [string]$directory, [string
                 "/MERGETASKS=$task","/LOG=""$proof\$label.log""")
     if ($menu) { $params += "/GROUP=$menu" }
     if ($openCv) { $params += "/OPENCV=""$openCv""" }
-    (Start-Process -FilePath $binary -ArgumentList $params -Wait -PassThru -WindowStyle Hidden).ExitCode
+    Invoke-Inno $binary $params $label
 }
 function RemovePreview {
     $unins = Join-Path $app 'unins000.exe'
     Check ((Get-ItemProperty -LiteralPath $key).'Inno Setup: App Path' -eq $app) '测试版注册路径与本次目录不同'
-    $exit = (Start-Process -FilePath $unins -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait -PassThru -WindowStyle Hidden).ExitCode
+    $log = Join-Path $proof ("uninstall-" + [guid]::NewGuid().ToString('N') + '.log')
+    $exit = Invoke-Inno $unins @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=""$log""") '卸载'
     Check ($exit -eq 0) '卸载失败'
     $until = [DateTime]::UtcNow.AddSeconds(30)
     while ((Test-Path -LiteralPath $unins) -and [DateTime]::UtcNow -lt $until) {Start-Sleep -Milliseconds 100}
     foreach ($p in @($unins,$key,$desktopLink,(Join-Path $app 'jumpbot.exe'),(Join-Path $app 'jumpbot-desktop.exe'))) {
         Check (!(Test-Path -LiteralPath $p)) "卸载残留 $p"
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $app -Force -File -Recurse) {
+        $name = $file.FullName.Substring($app.Length + 1)
+        Check ($name -in @('config.json','config.jumpbot-preserved.json','.jumpbot-offline-preview.ini') -or
+            $name -match '^templates\\.+\.png$') "卸载残留文件 $name"
     }
 }
 function Detect([string]$backend) {
@@ -128,7 +168,8 @@ $digit = Join-Path $app 'templates\digit_0.png'
 try {
     # A non-empty foreign directory must be rejected even with a silent /DIR override.
     $foreign = New-Item -ItemType Directory (Join-Path $proof 'existing')
-    [IO.File]::WriteAllText((Join-Path $foreign 'keep.txt'),'keep')
+    $foreignTarget = Join-Path $foreign.FullName 'keep.txt'
+    [IO.File]::WriteAllText($foreignTarget,'keep')
     Check ((Setup 'core' $false $foreign.FullName 'foreign') -ne 0) '安装器接受了已有非测试目录'
     Check (@(Get-ChildItem -LiteralPath $foreign -Force).Count -eq 1) '已有目录被写入'
     Check ((Setup 'core' $false $app 'missing-cv' (Join-Path $proof 'missing.dll')) -ne 0) '缺失 DLL 被接受'
@@ -168,6 +209,17 @@ try {
             RemovePreview
         }
     }
+    # A fresh CPU install must leave the user's same-named OpenCL link alone.
+    $openclLink = Join-Path $group 'OpenCL 模式.lnk'
+    $savedLink = Join-Path $proof 'user-owned.lnk'
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($savedLink)
+    $link.TargetPath = $foreignTarget
+    $link.Save()
+    $foreignHash = Hash $savedLink
+    $null = [IO.Directory]::CreateDirectory($group)
+    [IO.File]::Move($savedLink, $openclLink)
+    CheckShortcut $openclLink $true $foreignTarget ''
+
     $localCv = Join-Path $proof '本机 已有.dll'
     foreach ($choice in @('cpu','both','cuda','opencl','cpu-again')) {
         $cuda = $choice -in @('cuda','both')
@@ -175,6 +227,12 @@ try {
         $components = (@('core'; if ($cuda) {'cuda'}; if ($cl) {'opencl'})) -join ','
         $cvChoice = switch ($choice) { 'both' {$localCv} 'cuda' {'installed'} 'opencl' {'bundled'} }
         Check ((Setup $components $cuda $app $choice $cvChoice) -eq 0) "安装失败 $choice"
+        if ($choice -eq 'cpu') {
+            CheckShortcut $menuConsole $true (Join-Path $app 'jumpbot-desktop.exe') ''
+            CheckShortcut $openclLink $true $foreignTarget ''
+            Check ((Hash $openclLink) -eq $foreignHash) '首次 CPU 安装改变了用户已有的 OpenCL 模式快捷方式'
+            [IO.File]::Move($openclLink, $savedLink)
+        }
         Check ((Get-ItemProperty -LiteralPath $key).'Inno Setup: App Path' -eq $app) '注册目录错误'
         $manifest = Get-Content -LiteralPath (Join-Path $app 'build-source.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $workerKey = switch ($choice) {both {'jumpbot.exe'} 'cpu-again' {'workers/cpu/jumpbot.exe'} default {"workers/$choice/jumpbot.exe"}}
@@ -239,14 +297,34 @@ try {
             $env:JUMPBOT_DISABLE_OPENCL='0'
         }
     }
+    $gui = Join-Path $app 'jumpbot-desktop.exe'
+    CheckShortcut $menuConsole $true $gui ''
+    foreach ($name in '跳一跳自动脚本（长跑）','自检（不碰游戏）','纯 CPU 模式','只识别不发输入（安全演示）','配置文件夹','卸载 跳一跳自动脚本') {
+        Check (Test-Path -LiteralPath (Join-Path $group "$name.lnk") -PathType Leaf) "安装器缺少菜单快捷方式 $name"
+    }
+    [IO.File]::Move($savedLink, $foreignLink)
+    CheckShortcut $foreignLink $true $foreignTarget ''
     RemovePreview
+    $remaining = @(Get-ChildItem -LiteralPath $group -Force)
+    Check ($remaining.Count -eq 1 -and $remaining[0].FullName -eq $foreignLink -and (Hash $foreignLink) -eq $foreignHash) '卸载后菜单中应只保留原样的用户快捷方式'
+    Remove-Item -LiteralPath $foreignLink
+    [IO.Directory]::Delete($group)
     Check ((Hash $localCv) -eq $manifest.files_sha256.($cv[0].Name)) '原始 DLL 未获保留'
     Check ((Hash (Join-Path $app 'config.jumpbot-preserved.json')) -eq $userConfig -and (Hash $digit) -eq $userDigit) '卸载丢失配置或模板'
-    Check ((Setup 'core' $false $app 'reinstall') -eq 0) '重新安装失败'
+    Check ((Setup 'core' $true $app 'reinstall') -eq 0) '重新安装失败'
+    CheckShortcut $menuConsole $true $gui ''
+    CheckShortcut $desktopLink $true $gui ''
     Check ((Hash $cfg) -eq $userConfig -and (Hash $digit) -eq $userDigit -and !(Test-Path (Join-Path $app 'config.jumpbot-preserved.json'))) '重装未还原用户数据'
     RemovePreview
+    Check (!(Test-Path -LiteralPath $group)) '卸载后遗留本次专用菜单组'
+    Check ((Hash (Join-Path $app 'config.jumpbot-preserved.json')) -eq $userConfig -and (Hash $digit) -eq $userDigit) '第二次卸载丢失配置或模板'
     $rows | ConvertTo-Json | Set-Content (Join-Path $proof 'backends.json') -Encoding UTF8
     Write-Host "安装、组件切换、回退、卸载、重装验证通过。记录在 $proof"
-} finally {
-    if ((Test-Path -LiteralPath $key) -and ((Get-ItemProperty -LiteralPath $key).'Inno Setup: App Path' -eq $app)) { RemovePreview }
+} catch [TimeoutException] {
+    throw
+} catch {
+    try {
+        if ((Test-Path -LiteralPath $key) -and ((Get-ItemProperty -LiteralPath $key).'Inno Setup: App Path' -eq $app)) { RemovePreview }
+    } catch { Write-Warning "验收失败后清理也失败：$($_.Exception.Message)" }
+    throw
 }

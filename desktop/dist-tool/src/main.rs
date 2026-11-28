@@ -678,7 +678,11 @@ mod tests {
         .unwrap();
         let line = iss
             .lines()
-            .find(|l| l.starts_with(r#"Name: "{autodesktop}\{#AppTitle}""#))
+            .find(|l| {
+                l.contains("{autodesktop}")
+                    && l.contains("AppTitle")
+                    && l.contains("Tasks: desktopicon")
+            })
             .expect("desktop shortcut line");
         assert!(
             line.contains(r#"Filename: "{app}\jumpbot-desktop.exe""#),
