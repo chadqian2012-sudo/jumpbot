@@ -305,7 +305,7 @@ begin
   if OwnedLinks.Count <> 0 then Exit;
   // A 1.7.1 install has only its last registered group, components and tasks.
   if RegQueryStringValue(HKA, Key, 'UninstallString', Cmd) and (Copy(Cmd, 1, 1) = '"') then
-    Cmd := Copy(Cmd, 2, Pos('"', Copy(Cmd, 2, Length(Cmd))) - 1)
+    Cmd := Copy(Cmd, 2, RPos('"', Cmd) - 2)
   else Cmd := '';
   if CompareText(ExtractFileDir(Cmd), AppDir) <> 0 then Cmd := '';
   if RegQueryStringValue(HKA, Key, 'Inno Setup: Icon Group', Group) and
