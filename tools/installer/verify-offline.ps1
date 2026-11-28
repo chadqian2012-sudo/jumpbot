@@ -1,12 +1,15 @@
 ﻿# Validate the standalone preview only, under the current account. No game is started.
-param([Parameter(Mandatory=$true)][string]$Installer)
+param([Parameter(Mandatory=$true)][string]$Installer, [string]$PreviousInstaller)
 $ErrorActionPreference = 'Stop'
 $installerPath = (Resolve-Path -LiteralPath $Installer).Path
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
 $id = '{AA105DEB-419A-4E5B-A840-4F7E2332A61C}_is1'
 $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$id"
-$desktopLink = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) '跳一跳控制台（离线测试版）.lnk'
-if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $desktopLink)) {
+$desktop = [Environment]::GetFolderPath('DesktopDirectory')
+$desktopLink = Join-Path $desktop 'JumpBot 控制台.lnk'
+$oldDesktopLink = Join-Path $desktop '跳一跳控制台（离线测试版）.lnk'
+if ((Test-Path -LiteralPath $key) -or (Test-Path -LiteralPath $desktopLink) -or (Test-Path -LiteralPath $oldDesktopLink) -or
+    (Get-Process -Name jumpbot,jumpbot-desktop -ErrorAction SilentlyContinue)) {
     throw '此账户已有离线测试版或同名快捷方式。请使用空闲测试账户。'
 }
 $nonce = [guid]::NewGuid().ToString('N').Substring(0,10)
@@ -83,13 +86,14 @@ function CheckShortcut([string]$lnk, [bool]$selected, [string]$target, [string]$
         throw "快捷方式校验失败 [$lnk] $($_.Exception.Message)`n实际目标=[$actualTarget] 参数=[$actualArgs] 文件标识=[$actualId]`n期望目标=[$target] 参数=[$arguments] 文件标识=[$expectedId]`n快捷方式副本位于 [$proof]"
     }
 }
-function Setup([string]$components, [bool]$shortcut, [string]$directory, [string]$label, [string]$openCv) {
+function Setup([string]$components, [bool]$shortcut, [string]$directory, [string]$label, [string]$openCv, [string]$binary = $installerPath, [string]$menu = $groupName) {
     $task = if ($shortcut) {'desktopicon'} else {'!desktopicon'}
     $params = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER',
-                "/GROUP=$groupName","/DIR=""$directory""","/COMPONENTS=""$components""",
+                "/DIR=""$directory""","/COMPONENTS=""$components""",
                 "/MERGETASKS=$task","/LOG=""$proof\$label.log""")
+    if ($menu) { $params += "/GROUP=$menu" }
     if ($openCv) { $params += "/OPENCV=""$openCv""" }
-    (Start-Process -FilePath $installerPath -ArgumentList $params -Wait -PassThru -WindowStyle Hidden).ExitCode
+    (Start-Process -FilePath $binary -ArgumentList $params -Wait -PassThru -WindowStyle Hidden).ExitCode
 }
 function RemovePreview {
     $unins = Join-Path $app 'unins000.exe'
@@ -129,6 +133,41 @@ try {
     Check (@(Get-ChildItem -LiteralPath $foreign -Force).Count -eq 1) '已有目录被写入'
     Check ((Setup 'core' $false $app 'missing-cv' (Join-Path $proof 'missing.dll')) -ne 0) '缺失 DLL 被接受'
     Check (!(Test-Path -LiteralPath $key) -and !(Test-Path -LiteralPath (Join-Path $app 'jumpbot.exe'))) '无效的 DLL 来源启动了安装'
+    if ($PreviousInstaller) {
+        $previous = (Resolve-Path -LiteralPath $PreviousInstaller).Path
+        Check ((Get-Item -LiteralPath $previous).VersionInfo.FileDescription.TrimEnd() -ceq '跳一跳控制台（离线测试版） 安装程序') '旧文件与预览安装器不符'
+        $programs = [Environment]::GetFolderPath('Programs')
+        $legacyGroup = Join-Path $programs '跳一跳控制台（离线测试版）'
+        foreach ($dir in @($legacyGroup, (Join-Path $programs 'JumpBot'))) {
+            Check (!(Test-Path -LiteralPath $dir)) "测试菜单已存在，请使用空闲账户：$dir"
+        }
+        $gui = Join-Path $app 'jumpbot-desktop.exe'
+        foreach ($oldMenu in @('', $groupName)) {
+            $expected = if ($oldMenu) {$oldMenu} else {'JumpBot'}
+            Check ((Setup 'core' $true $app "preview-2-$expected" '' $previous $oldMenu) -eq 0) '旧预览安装失败'
+            $reg = Get-ItemProperty -LiteralPath $key
+            Check ($reg.DisplayVersion -match 'preview\.2$' -and $reg.'Inno Setup: App Path' -eq $app) '旧安装器不是预期的 preview.2'
+            CheckShortcut $oldDesktopLink $true $gui ''
+            if (!$oldMenu) {
+                Check ($reg.'Inno Setup: Icon Group' -ceq '跳一跳控制台（离线测试版）') '未使用真实旧默认菜单组'
+                $foreignMenuLink = Join-Path $legacyGroup 'OpenCL 模式.lnk'
+                [IO.File]::Copy((Join-Path $legacyGroup '自检（不碰游戏）.lnk'), $foreignMenuLink, $false)
+            }
+            Check ((Setup 'core' $true $app "upgrade-$expected" '' $installerPath '') -eq 0) '原目录升级失败'
+            $reg = Get-ItemProperty -LiteralPath $key
+            Check ($reg.DisplayName -ceq '跳一跳控制台' -and $reg.'Inno Setup: App Path' -eq $app -and $reg.'Inno Setup: Icon Group' -ceq $expected) '改名后登记或菜单组错误'
+            CheckShortcut $oldDesktopLink $false $gui ''
+            CheckShortcut $desktopLink $true $gui ''
+            CheckShortcut (Join-Path (Join-Path $programs $expected) '跳一跳控制台.lnk') $true $gui ''
+            if (!$oldMenu) {
+                CheckShortcut (Join-Path $legacyGroup '跳一跳控制台.lnk') $false $gui ''
+                CheckShortcut $foreignMenuLink $true (Join-Path $app 'jumpbot.exe') '--selftest'
+                Remove-Item -LiteralPath $foreignMenuLink
+                [IO.Directory]::Delete($legacyGroup)
+            }
+            RemovePreview
+        }
+    }
     $localCv = Join-Path $proof '本机 已有.dll'
     foreach ($choice in @('cpu','both','cuda','opencl','cpu-again')) {
         $cuda = $choice -in @('cuda','both')
