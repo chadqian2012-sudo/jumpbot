@@ -814,10 +814,13 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         let state = game.screen.state(&f, cfg)?;
         if let ScreenState::Start(p) | ScreenState::Restart(p) = state {
             missing_under_overlay = None;
+            previous_aim = None;
+            baseline = true;
+            game.vision.reset_prior();
             let dead = state.is_result();
             game.report(
                 "acquiring",
-                json!({"game_state":if dead{"game_over"}else{"start_page"}}),
+                json!({"game_state":if dead{"game_over"}else{"start_page"},"stop_reason":""}),
             );
             let button = (session, dead);
             if pressed_button != Some(button) {
@@ -826,8 +829,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
                         pressed_button = Some(button);
                         score_window = None;
                     }
-                    PressOutcome::WindowChanged => continue,
-                    PressOutcome::Suppressed => {
+                    PressOutcome::WindowChanged | PressOutcome::Suppressed => {
+                        // Re-read the visible button. Only the outer loop can tell
+                        // whether the game window or its foreground status changed.
+                        game.ctl.sleep(g, ms(250.));
                         window = Some((w, g));
                         continue;
                     }
@@ -837,9 +842,6 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if attempts >= cfg.i("detect_retry_limit") {
                 return Err("开始/重玩按钮持续未消失".into());
             }
-            previous_aim = None;
-            baseline = true;
-            game.vision.reset_prior();
             game.ctl.sleep(g, ms(1400.));
             window = Some((w, g));
             continue;

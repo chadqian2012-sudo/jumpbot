@@ -11,7 +11,7 @@
 静默安装省略 `/OPENCV` 或指定 `/OPENCV=bundled` 使用内置文件。`/OPENCV=installed` 复用原安装目录中的 DLL，也可指定完整本地路径。无效来源会在写入程序目录前报错并返回非零退出码。以下命令在生成安装包后使用。
 
 ```powershell
-$setup = '.\build\offline-delivery\jumpbot-setup-1.6.1-preview.3-offline.exe'
+$setup = '.\build\offline-delivery\jumpbot-setup-1.7-offline.exe'
 $process = Start-Process $setup -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /OPENCV="D:\本机 OpenCV\opencv_world4140.dll" /LOG="opencv-install.log"' -Wait -PassThru
 $process.ExitCode
 ```
@@ -42,17 +42,17 @@ cargo build --offline --locked --release --manifest-path desktop/Cargo.toml -p j
 
 ```powershell
 $dist = Join-Path $env:CARGO_TARGET_DIR 'release/jumpbot-dist.exe'
-& $dist --candidate --offline-installer --version 1.6.1-preview.3 --output build/offline-delivery
+& $dist --offline-installer --version 1.7 --output build/offline-delivery
 ```
 
-生成的安装文件为 `build/offline-delivery/jumpbot-setup-1.6.1-preview.3-offline.exe`。同目录的 `SHA256SUMS.txt` 可用于校验。原有 full 和 portable 发布命令继续使用原来的参数。
+生成的安装文件为 `build/offline-delivery/jumpbot-setup-1.7-offline.exe`。同目录的 `SHA256SUMS.txt` 可用于校验。原有 full 和 portable 发布命令继续使用原来的参数。
 
 ## 在空闲测试账户验证安装、升级和卸载
 
 下面的命令先检查交付文件的 SHA-256，再用生成的 EXE 静默安装到带空格的中文目录。它逐项核对 CPU、CUDA、OpenCL、双加速的实际工作程序、快捷方式和同一张图片的识别结果，并在屏蔽显卡后检查 CPU 回退。随后修改过的配置和模板会经历覆盖安装、卸载及重装。详细日志位于本工作树 `build/offline-install-proof-*`。
 
 ```powershell
-& $dist --offline-installer --verify --install --version 1.6.1-preview.3 --output build/offline-delivery
+& $dist --offline-installer --verify --install --version 1.7 --output build/offline-delivery
 ```
 
 本安装程序采用固定的独立安装身份 `{AA105DEB-419A-4E5B-A840-4F7E2332A61C}`，默认位于 `%LOCALAPPDATA%\Programs\jumpbot-offline-preview`。已用此安装程序安装过控制台时，请换一个空闲账户运行自动实装验证。手动卸载可用 Windows “已安装的应用”里的“跳一跳控制台”。

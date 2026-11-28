@@ -1290,7 +1290,7 @@ mod tests {
             ShowWindow(board, SW_SHOW);
             let activated = SetForegroundWindow(board);
             let window = fixture_window(board);
-            let [left, top, _, _] = window.client_rect;
+            let [left, top, right, bottom] = window.client_rect;
             let press = POINT {
                 x: left + x,
                 y: top + y,
@@ -1395,6 +1395,35 @@ mod tests {
                     );
                 }
             };
+            // The layered host spans the board, but its readout sits entirely above it.
+            let hud_top = top - 24;
+            const HUD_KEY: u32 = 0xff00ff;
+            let hud = pane(
+                "JumpBotCiHudHost",
+                HUD_KEY,
+                style,
+                WS_POPUP | WS_CLIPCHILDREN,
+                null_mut(),
+                [left, hud_top, right - left, bottom - hud_top],
+            );
+            let readout = pane(
+                "JumpBotCiHudReadout",
+                0x0000ff,
+                0,
+                WS_CHILD | WS_VISIBLE,
+                hud,
+                [148, 4, 12, 16],
+            );
+            assert_ne!(SetLayeredWindowAttributes(hud, HUD_KEY, 0, LWA_COLORKEY), 0);
+            assert_eq!(
+                client_rect(hud).unwrap(),
+                Some([left, hud_top, right, bottom])
+            );
+            assert!(client_rect(readout).unwrap().unwrap()[3] <= top);
+            let corner = POINT {
+                x: left + 156,
+                y: hud_top + 12,
+            };
             const WHITE: [u8; 3] = [255; 3];
             const BLACK: [u8; 3] = [0; 3];
             const RED: [u8; 3] = [0, 0, 255]; // Captured BGR.
@@ -1418,6 +1447,7 @@ mod tests {
                     board,
                 ),
                 ("restored", Some((168, 6)), WHITE, BLACK, false, board),
+                ("corner-hud", None, WHITE, BLACK, false, board),
             ] {
                 if let Some((dx, dy)) = at {
                     let ex = if through {
@@ -1439,6 +1469,10 @@ mod tests {
                         0
                     );
                     UpdateWindow(overlay);
+                } else if stage == "corner-hud" {
+                    ShowWindow(hud, SW_SHOWNOACTIVATE);
+                    UpdateWindow(hud);
+                    UpdateWindow(readout);
                 }
                 let expected = [edge, pawn, pawn, pawn, WHITE];
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -1454,7 +1488,22 @@ mod tests {
                         })
                     });
                     let hit = GetAncestor(WindowFromPoint(press), GA_ROOT);
-                    if pixels == Ok(Some(expected))
+                    let hud_ready = stage != "corner-hud" || {
+                        let screen = GetDC(null_mut());
+                        assert!(!screen.is_null());
+                        let sample = capture_bgr(1, 1, |dc| {
+                            let rop = SRCCOPY | CAPTUREBLT;
+                            if BitBlt(dc, 0, 0, 1, 1, screen, corner.x, corner.y, rop) == 0 {
+                                return Err(os_error("BitBlt HUD readout"));
+                            }
+                            Ok(())
+                        });
+                        ReleaseDC(null_mut(), screen);
+                        sample.unwrap().bgr == RED
+                            && GetAncestor(WindowFromPoint(corner), GA_ROOT) == hud
+                    };
+                    if hud_ready
+                        && pixels == Ok(Some(expected))
                         && hit == route
                         && point_is_target(board, press) == (route == board)
                     {
@@ -1465,13 +1514,13 @@ mod tests {
                         break;
                     }
                     assert!(Instant::now() < deadline,
-                        "{stage}: expected {expected:?}, got {pixels:?}; hit={hit:p}, expected={route:p}; foreground={:p}, board={board:p}, SetForegroundWindow={activated}",
+                        "{stage}: expected {expected:?}, got {pixels:?}; hud_ready={hud_ready}, hit={hit:p}, expected={route:p}; foreground={:p}, board={board:p}, SetForegroundWindow={activated}",
                         GetForegroundWindow());
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 if deliver {
                     match stage {
-                        "click-through" => send_case(
+                        "click-through" | "corner-hud" => send_case(
                             stage,
                             board,
                             &[(point, pawn_hwnd)],
@@ -1490,6 +1539,8 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(WindowFromPoint(press), pawn_hwnd);
+            assert_ne!(DestroyWindow(hud), 0);
             let pawn_bounds = [press.x - 8, press.y - 10, press.x + 8, press.y + 10];
             let ime = pane(
                 "SoPY_JumpBotCi",
