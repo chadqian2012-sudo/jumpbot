@@ -211,7 +211,7 @@ try {
     }
     # A fresh CPU install must leave the user's same-named OpenCL link alone.
     $openclLink = Join-Path $group 'OpenCL 模式.lnk'
-    $savedLink = Join-Path $proof '用户自建.lnk'
+    $savedLink = Join-Path $proof 'user-owned.lnk'
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($savedLink)
     $link.TargetPath = $foreignTarget
     $link.Save()
