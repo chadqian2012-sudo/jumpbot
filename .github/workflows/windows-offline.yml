@@ -45,7 +45,7 @@ jobs:
           cargo test --manifest-path desktop/Cargo.toml --locked --release -p jumpbot-desktop --lib platform::tests::foreground_overlay_capture -- --exact --ignored --nocapture | Tee-Object -Variable result
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (!($result -match '^test result: ok\. 1 passed;')) { throw 'Foreground acceptance did not execute exactly one test' }
-          foreach ($case in 'click-through', 'covered', 'all-covered', 'foreground-lost') {
+          foreach ($case in 'click-through', 'corner-hud', 'covered', 'all-covered', 'foreground-lost') {
             if (!($result -match "SendInput ${case}:")) { throw "Missing delivery receipts for $case" }
           }
       - name: Test the CPU-only Rust build
