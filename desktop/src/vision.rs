@@ -978,7 +978,10 @@ impl Vision {
 
     fn detect_frame(&mut self, frame: &Frame, want_target: bool) -> Result<Detection, String> {
         check_frame(frame)?;
-        let (mut piece_mask, mut block_mask) = self.masks.compute(frame)?;
+        // Direct callers also supply native-size frames that never enter the resizer.
+        let cleaned = frame.without_capture_outline();
+        let (mut piece_mask, mut block_mask) =
+            self.masks.compute(cleaned.as_ref().unwrap_or(frame))?;
         let expected = frame.width * frame.height;
         if piece_mask.len() != expected || block_mask.len() != expected {
             return Err("Mask dimensions differ from the BGR frame".into());
@@ -1315,6 +1318,94 @@ mod tests {
         assert_eq!(found.bbox, [13, 21, 4, 4]);
         cfg.0["piece_min_y_ratio"] = serde_json::json!(1.0);
         assert!(template_scan(&frame, &tpl, &cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn thin_capture_edges_leave_the_gold_piece_and_platform_visible() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/skin-gold-play.png");
+        let original = Frame::read(&path).unwrap();
+        let mut vision = Vision::new(&Config::default(), "cpu").unwrap();
+        for (sides, width, color) in [
+            ("LTRB", 3, [115, 204, 24]), // QQ green, BGR
+            ("LRB", 2, [255; 3]),
+            ("L", 1, [0, 0, 255]),
+            ("R", 2, [0; 3]),
+            ("T", 3, [128, 32, 64]),
+            ("B", 3, [128, 32, 64]),
+        ] {
+            let mut frame = original.clone();
+            let (w, h) = (frame.width, frame.height);
+            for (i, pixel) in frame.bgr.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let (x, y) = (i % w, i / w);
+                if sides.contains('L') && x < width
+                    || sides.contains('R') && x >= w - width
+                    || sides.contains('T') && y < width
+                    || sides.contains('B') && y >= h - width
+                {
+                    *pixel = color;
+                }
+            }
+            vision.reset_prior();
+            let d = vision.detect(&frame).unwrap();
+            assert_eq!(
+                d.aim().map(|a| (a.piece, a.target)),
+                Some(((173., 645.), (404., 500.))),
+                "{sides} {width}px {color:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_capture_outline_survives_resizing_and_fixed_toolbars() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/skin-gold-play.png");
+        let source = Frame::read(&path).unwrap();
+        let cfg = Config::default();
+        let mut vision = Vision::new(&cfg, "cpu").unwrap();
+        let mut recognize = |capture: &Frame| {
+            let (frame, rows) = capture.resized_for_recognition(&cfg).unwrap();
+            vision.reset_prior();
+            let aim = vision.detect(&frame.unwrap()).unwrap().aim().unwrap();
+            (aim.piece, aim.target, rows.capture_y(66.))
+        };
+        for (w, h, bar) in [
+            (415, 788, 0),
+            (415, 788, 66),
+            (830, 1575, 0),
+            (830, 1575, 66),
+        ] {
+            let mut capture = Frame {
+                width: w,
+                height: h,
+                bgr: Vec::with_capacity(w * h * 3),
+            };
+            for y in 0..h {
+                let sy = if y < bar {
+                    y
+                } else {
+                    bar + (y - bar) * (source.height - bar) / (h - bar)
+                };
+                for x in 0..w {
+                    let i = (sy * source.width + x * source.width / w) * 3;
+                    capture.bgr.extend_from_slice(&source.bgr[i..i + 3]);
+                }
+            }
+            let expected = recognize(&capture);
+            for width in 1..=3 {
+                for (i, pixel) in capture.bgr.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    let (x, y) = (i % w, i / w);
+                    if x < width || x >= w - width || y < width || y >= h - width {
+                        *pixel = [115, 204, 24];
+                    }
+                }
+                assert_eq!(
+                    recognize(&capture),
+                    expected,
+                    "{w}x{h}, bar={bar}, edge={width}"
+                );
+            }
+        }
     }
 
     #[test]

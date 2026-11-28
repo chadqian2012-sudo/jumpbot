@@ -74,6 +74,50 @@ impl CaptureRows {
 }
 
 impl Frame {
+    // Measure a capture outline in the source grid, before interpolation mixes its color
+    // into the board. Ignore the corners where two differently colored sides can meet.
+    pub(crate) fn without_capture_outline(&self) -> Option<Self> {
+        let (w, h) = (self.width, self.height);
+        let pixels = self.bgr.as_chunks::<3>().0;
+        let edge = |length: usize, depth: usize, index: &dyn Fn(usize, usize) -> usize| {
+            let mid = length / 2;
+            let corner = 3.min((length - 1) / 2);
+            let color = pixels[index(0, mid)];
+            // Reject ordinary image edges without walking their length.
+            if pixels[index(0, corner)] != color || pixels[index(0, length - 1 - corner)] != color {
+                return 0;
+            }
+            (0..depth.min(4))
+                .find(|&i| (corner..length - corner).any(|p| pixels[index(i, p)] != color))
+                .unwrap_or(0)
+        };
+        let left = edge(h, w, &|i, y| y * w + i);
+        let right = edge(h, w, &|i, y| y * w + (w - 1 - i));
+        let top = edge(w, h, &|i, x| i * w + x);
+        let bottom = edge(w, h, &|i, x| (h - 1 - i) * w + x);
+        if left + right + top + bottom == 0 || left + right >= w || top + bottom >= h {
+            return None;
+        }
+        // Extend the nearest visible pixels without moving the canvas or its toolbar.
+        let mut frame = self.clone();
+        let rows = frame.bgr.as_chunks_mut::<3>().0;
+        if left + right > 0 {
+            for row in rows[top * w..(h - bottom) * w].chunks_exact_mut(w) {
+                let (prefix, rest) = row.split_at_mut(left);
+                let (inside, suffix) = rest.split_at_mut(w - left - right);
+                prefix.fill(inside[0]);
+                suffix.fill(inside[inside.len() - 1]);
+            }
+        }
+        for y in 0..top {
+            rows.copy_within(top * w..(top + 1) * w, y * w);
+        }
+        for y in h - bottom..h {
+            rows.copy_within((h - bottom - 1) * w..(h - bottom) * w, y * w);
+        }
+        Some(frame)
+    }
+
     fn toolbar_end(&self) -> Option<usize> {
         // The left-middle of the white WeChat toolbar is clear of its title and buttons.
         // Require both the white band and a common transition into the canvas.
@@ -123,12 +167,14 @@ impl Frame {
         if self.width.abs_diff(width) <= tolerance && self.height.abs_diff(height) <= tolerance {
             return Ok((None, rows));
         }
+        let cleaned = self.without_capture_outline();
+        let source = cleaned.as_ref().unwrap_or(self);
         rows.destination = height;
         // In the retained 553 × 1050 clients the first canvas row is 64–66.
         // Keep a proportional capture intact when its boundary fits that range.
         let unit = height as f64 / 1050.;
         let scaled_y = height as f64 / self.height as f64;
-        if let Some(top) = self.toolbar_end() {
+        if let Some(top) = source.toolbar_end() {
             let projected = top as f64 * scaled_y;
             let reference = projected.clamp(64. * unit, 66. * unit);
             if (projected - reference).abs() > scaled_y.max(1.) {
@@ -147,7 +193,7 @@ impl Frame {
                 .ok_or("目标尺寸过大")?
         ];
         let mut resize = || -> opencv::Result<()> {
-            let src = crate::template::bgr(self)?;
+            let src = crate::template::bgr(source)?;
             let mut dst =
                 Mat::new_rows_cols_with_bytes_mut::<Vec3b>(height as i32, width as i32, &mut bgr)?;
             for (sy, sh, dy, dh) in [

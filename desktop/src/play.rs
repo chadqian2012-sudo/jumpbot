@@ -3,7 +3,7 @@ use crate::{
     control::Controls,
     landing,
     options::Options,
-    platform::{CaptureMode, PressOutcome, Window},
+    platform::{CaptureMode, Overlay, PressOutcome, Window},
     records::{same_game_score, Records},
     runtime::{annotated, JumpTiming},
     screen::{CaptureRows, Screen, ScreenState},
@@ -89,7 +89,7 @@ impl Game<'_> {
     }
     fn gate(&mut self, initial: bool, timeout: Option<Duration>) -> Result<Option<(Window, u64)>> {
         self.vision.reset_prior();
-        let wait = self.ctl.wait_clock();
+        let mut wait = self.ctl.wait_clock();
         let mut countdown = None;
         loop {
             let g = self.ctl.generation();
@@ -103,10 +103,14 @@ impl Game<'_> {
                 countdown = None;
                 continue;
             }
-            let elapsed = self.ctl.wait_clock().saturating_sub(wait);
+            let now = self.ctl.wait_clock();
             let mut reason = "等待用户打开游戏窗口";
             let window = Window::find(self.c, (1, 1))?;
             let missing = window.is_none();
+            if !missing {
+                wait = now;
+            }
+            let elapsed = now.saturating_sub(wait);
             if let Some(w) = window {
                 let Ok(guard) = self.ctl.guard(g, false) else {
                     continue;
@@ -137,11 +141,12 @@ impl Game<'_> {
                 reason = "请将游戏窗口切到前台";
             }
             countdown = None;
+            let timeout = timeout.filter(|_| missing);
             if timeout.is_some_and(|t| elapsed >= t) {
                 if self.ctl.guard(g, false).is_err() {
                     continue;
                 }
-                return if !initial && self.o.daemon && missing {
+                return if !initial && self.o.daemon {
                     Ok(None)
                 } else {
                     Err("等待游戏窗口超时".into())
@@ -158,6 +163,30 @@ impl Game<'_> {
             .map(|raw| raw.mapped_for_recognition(self.c))
             .transpose()
     }
+    // Only consult the window's own pixels after repeated failed screen reads.
+    // They can explain a missing pawn, but must never supply a jump target.
+    fn hidden_piece_overlay(&mut self, w: &Window, since: Instant) -> Option<Overlay> {
+        if self.mode != CaptureMode::Screen || !w.is_foreground() {
+            return None;
+        }
+        let raw = self.capturer.reference_frame(w, since)?;
+        // Read the desktop again after PrintWindow; the overlay may have moved.
+        let visible = self.capturer.capture(w, CaptureMode::Screen).ok()??;
+        let [wx, wy, _, _] = w.client_rect;
+        self.vision.reset_prior();
+        let owner = hidden_piece_in_frames(self.vision, self.c, &raw, &visible, |[l, t, r, b]| {
+            w.overlap([wx + l, wy + t, wx + r, wy + b])
+        });
+        self.vision.reset_prior();
+        let owner = owner?;
+        (w.still_current().ok()? && w.is_foreground()).then_some(owner)
+    }
+
+    fn jump(&self, w: &Window, g: u64, duration: f64) -> Result<PressOutcome> {
+        let point = (self.c.at("press_point", 0), self.c.at("press_point", 1));
+        w.jump_with(point, self.o.background, |p| self.press(w, g, p, duration))
+    }
+
     fn press(&self, w: &Window, g: u64, p: (f64, f64), duration: f64) -> Result<PressOutcome> {
         if self.o.dry_run {
             return Err("只读检测模式已阻止按压".into());
@@ -224,6 +253,7 @@ impl Game<'_> {
         g: u64,
         scores: &Records,
         before: &Frame,
+        reference_deadline: Option<Instant>,
     ) -> Result<Option<Landing>> {
         let previous = scores.prev;
         let reference = before.motion_sample(self.c)?;
@@ -234,7 +264,12 @@ impl Game<'_> {
         let mut outcome = Landing::default();
         let start = Instant::now();
         let timeout = sec(self.c.f("settle_timeout_s"));
-        let deadline = timeout.saturating_mul(2);
+        let mut deadline = timeout.saturating_mul(2);
+        if let Some(until) = reference_deadline {
+            deadline = deadline
+                .max(self.frame_period)
+                .min(until.saturating_duration_since(start));
+        }
         let mut last_score = None;
         while start.elapsed() < deadline {
             let retry = start.elapsed() >= timeout;
@@ -246,7 +281,7 @@ impl Game<'_> {
                 if self.status["state"] != "pausing" {
                     self.report("pausing", json!({}))
                 }
-                if retry || !w.is_foreground() {
+                if reference_deadline.is_some() || retry || !w.is_foreground() {
                     return Ok(Some(outcome));
                 }
             }
@@ -404,6 +439,24 @@ struct Landing {
     score_ms: f64,
 }
 impl Landing {
+    // The deadline belongs to one in-flight PrintWindow call, across settle passes.
+    fn wait_for_reference(
+        &mut self,
+        pending: bool,
+        deadline: &mut Option<Instant>,
+        now: Instant,
+    ) -> bool {
+        if !pending {
+            return false;
+        }
+        let until = deadline.get_or_insert_with(|| now + Duration::from_secs(15));
+        if now < *until {
+            return true;
+        }
+        self.error = Some("等待本跳的窗口参考截图超过 15 秒".into());
+        false
+    }
+
     fn pause_reason(&self, stalled: i32) -> Option<&str> {
         match self.result {
             "unknown" => Some(
@@ -434,6 +487,48 @@ impl Default for Landing {
             score_ms: 0.,
         }
     }
+}
+
+fn occlusion_message(id: u32) -> String {
+    format!("游戏画面持续无法识别人物，人物所在区域被悬浮窗遮挡（PID {id}），已停止")
+}
+
+fn hidden_piece_in_frames(
+    vision: &mut Vision,
+    cfg: &Config,
+    game: &Frame,
+    visible: &Frame,
+    covering: impl FnOnce([i32; 4]) -> Option<Overlay>,
+) -> Option<Overlay> {
+    if (game.width, game.height) != (visible.width, visible.height) {
+        return None;
+    }
+    let (normalized, rows) = game.resized_for_recognition(cfg).ok()?;
+    let reference = normalized.as_ref().unwrap_or(game);
+    let mut detection = vision.detect_piece_only(reference).ok()?;
+    crate::runtime::map_detection_to_capture(
+        &mut detection,
+        game.width as f64 / reference.width as f64,
+        rows,
+    );
+    let [x, y, width, height] = detection.piece?.bbox;
+    let owner = covering([x, y, x + width, y + height])?;
+    let changed = (y..y + height).any(|row| {
+        let lo = (row as usize * game.width + x as usize) * 3;
+        let roi = lo..lo + width as usize * 3;
+        game.bgr[roi.clone()] != visible.bgr[roi]
+    });
+    if !changed {
+        return None;
+    }
+    vision.reset_prior();
+    let (normalized, _) = visible.resized_for_recognition(cfg).ok()?;
+    vision
+        .detect_piece_only(normalized.as_ref().unwrap_or(visible))
+        .ok()?
+        .piece
+        .is_none()
+        .then_some(owner)
 }
 
 fn same_window(a: &Window, b: &Window) -> bool {
@@ -481,7 +576,8 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
         let (x, y) = xy.split_once(',').ok_or("click-xy 需要两个比例")?;
         drop(game.ctl.guard(g, true)?);
         let frame = raw_frame(&w)?.for_recognition(cfg)?;
-        if frame.has_dark_center(cfg)
+        if frame.is_solid_color()
+            || frame.has_dark_center(cfg)
             || matches!(
                 game.screen.state(&frame, cfg)?,
                 ScreenState::SkinModal | ScreenState::ResultPending
@@ -550,13 +646,7 @@ fn diagnostics(game: &mut Game<'_>) -> Result<()> {
             let row = timing.detection(&d, explicit_ms);
             if test_press {
                 let duration = row["hold_ms"].as_f64().ok_or("无法确认棋子和目标")?;
-                if game.press(
-                    &w,
-                    g,
-                    (cfg.at("press_point", 0), cfg.at("press_point", 1)),
-                    duration,
-                )? != PressOutcome::Sent
-                {
+                if game.jump(&w, g, duration)? != PressOutcome::Sent {
                     return Err("控制请求已取消试跳".into());
                 }
             }
@@ -616,6 +706,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     if window.is_some() {
         game.round_start = Some(active_start)
     }
+    let runtime_limit = cfg.f("max_runtime_s");
+    let time_is_up = |clock: Duration| {
+        runtime_limit > 0. && clock.saturating_sub(active_start) >= sec(runtime_limit)
+    };
     let mut k = cfg.f("k");
     let base = k;
     let mut best_k = k;
@@ -626,6 +720,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
     let mut previous_aim = None;
     let mut attempts = 0;
     let mut rejects = 0;
+    let mut missing_under_overlay = None;
     // Only a measured jump that landed can supply a fallback duration.
     let mut blind: Option<(f64, i64)> = None;
     let adaptive = !o.calibrate && cfg.f("gamma") > 0.;
@@ -661,6 +756,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             }
         };
         if interrupted || !valid_current {
+            missing_under_overlay = None;
             baseline = true;
             previous_aim = None;
             attempts = 0;
@@ -685,9 +781,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         // Taking the snapshot invalidates the plan unless this iteration explicitly keeps it.
         let (w, g) = window.take().unwrap();
         let clock = game.ctl.clock();
-        if cfg.f("max_runtime_s") > 0.
-            && clock.saturating_sub(active_start) >= sec(cfg.f("max_runtime_s"))
-        {
+        if time_is_up(clock) {
             break End::Finished("达到最长运行时间");
         }
         if !warned && clock.saturating_sub(last_progress) >= sec(90.) {
@@ -698,6 +792,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             Ok(Some(frame)) => frame,
             Ok(None) => continue,
             Err(reason) => {
+                missing_under_overlay = None;
                 game.report(
                     "capture_blocked",
                     json!({"game_state":"capture_blocked","stop_reason":reason}),
@@ -718,6 +813,7 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         let session = (w.hwnd, w.pid, g);
         let state = game.screen.state(&f, cfg)?;
         if let ScreenState::Start(p) | ScreenState::Restart(p) = state {
+            missing_under_overlay = None;
             let dead = state.is_result();
             game.report(
                 "acquiring",
@@ -749,13 +845,51 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             continue;
         }
         let detection = match state {
-            ScreenState::Board => Some(game.vision.detect(&f)?),
-            ScreenState::UnknownDark => {
-                let d = game.vision.detect(&f)?;
-                state.playable(&f, cfg, game.screen, &d).then_some(d)
-            }
+            ScreenState::Board | ScreenState::UnknownDark => Some(game.vision.detect(&f)?),
             _ => None,
         };
+        let overlay = detection
+            .as_ref()
+            .filter(|d| game.mode == CaptureMode::Screen && d.aim().is_none())
+            .and_then(|_| w.overlap(w.client_rect));
+        if let Some(overlay) = overlay {
+            // An overlap alone cannot block a readable frame. Retry an unreadable
+            // board without input, including the blind-jump fallback.
+            if matches!(overlay, Overlay::Other(_))
+                && detection.as_ref().is_some_and(|d| d.piece.is_none())
+            {
+                let (since, tries) = missing_under_overlay.get_or_insert((Instant::now(), 0_i64));
+                let limit = cfg.i("detect_retry_limit");
+                *tries = (*tries + 1).min(limit);
+                if *tries >= limit {
+                    if let Some(Overlay::Other(id)) = game.hidden_piece_overlay(&w, *since) {
+                        if game.ctl.guard(g, true).is_ok() {
+                            return Err(occlusion_message(id));
+                        }
+                    }
+                    if !game.capturer.awaiting_reference(*since) {
+                        missing_under_overlay = None;
+                    }
+                }
+            } else {
+                missing_under_overlay = None;
+            }
+            previous_aim = None;
+            attempts = 0;
+            rejects = 0;
+            blind = None;
+            baseline = true;
+            game.vision.reset_prior();
+            game.report(
+                "acquiring",
+                json!({"game_state":"acquiring","stop_reason":""}),
+            );
+            game.ctl.sleep(g, ms(300.));
+            window = Some((w, g));
+            continue;
+        }
+        missing_under_overlay = None;
+        let detection = detection.filter(|d| state.playable(&f, cfg, game.screen, d));
         let Some(d) = detection else {
             let (phase, reason) = match state {
                 ScreenState::ResultPending => ("result_pending", "正在结算，等待重玩按钮出现。"),
@@ -798,7 +932,10 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             if !aim.confirmed(previous_aim.replace(aim), cfg) {
                 attempts += 1;
                 if attempts >= cfg.i("detect_retry_limit") {
-                    return Err("连续识别到的位置不稳定，已停止".into());
+                    if game.mode != CaptureMode::Screen || w.overlap(w.client_rect).is_none() {
+                        return Err("连续识别到的位置不稳定，已停止".into());
+                    }
+                    attempts = 0;
                 }
                 game.ctl
                     .sleep(g, ms(cfg.f("acquire_poll_ms")).max(game.frame_period));
@@ -815,9 +952,12 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             {
                 rejects += 1;
                 if rejects >= cfg.i("detect_retry_limit") {
-                    return Err(format!(
-                        "沿轴距离或方向持续异常，已停止。本次距离 {dist:.1}px"
-                    ));
+                    if game.mode != CaptureMode::Screen || w.overlap(w.client_rect).is_none() {
+                        return Err(format!(
+                            "沿轴距离或方向持续异常，已停止。本次距离 {dist:.1}px"
+                        ));
+                    }
+                    rejects = 0;
                 }
                 previous_aim = None;
                 game.ctl.sleep(g, ms(250.));
@@ -868,14 +1008,16 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
             )
         };
         let acquire = acquisition.elapsed().as_secs_f64() * 1000.;
-        match game.press(
-            &w,
-            g,
-            (cfg.at("press_point", 0), cfg.at("press_point", 1)),
-            hold,
-        )? {
+        match game.jump(&w, g, hold)? {
             PressOutcome::Sent => (),
-            PressOutcome::WindowChanged => continue,
+            PressOutcome::WindowChanged => {
+                // Reacquire the aim if a toolbar intercepted every press point.
+                // Only an actual window/focus change needs the startup countdown.
+                previous_aim = None;
+                game.ctl.sleep(g, ms(250.));
+                window = Some((w, g));
+                continue;
+            }
             PressOutcome::Suppressed => {
                 window = Some((w, g));
                 continue;
@@ -885,7 +1027,47 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         previous_aim = None;
         game.report("landing", json!({"last_hold_ms":hold,"last_dist_px":dist}));
         let land_start = Instant::now();
-        let observation = game.settle(&w, g, &records, &f);
+        let mut observation = game.settle(&w, g, &records, &f, None);
+        let mut hidden = None;
+        let mut previous_cover = None;
+        let mut reference_deadline = None;
+        while let Ok(Some(landing)) = &mut observation {
+            if landing.result != "unknown"
+                || game.mode != CaptureMode::Screen
+                || game.ctl.guard(g, true).is_err()
+                || !w.is_foreground()
+                || time_is_up(game.ctl.clock())
+                || w.overlap(w.client_rect).is_none()
+            {
+                break;
+            }
+            match game.hidden_piece_overlay(&w, land_start) {
+                Some(Overlay::Allowed) => {
+                    previous_cover = None;
+                    reference_deadline = None;
+                }
+                Some(Overlay::Other(id)) if previous_cover == Some(id) => {
+                    let reason = occlusion_message(id);
+                    landing.error = Some(reason.clone());
+                    hidden = Some(reason);
+                    break;
+                }
+                Some(Overlay::Other(id)) => {
+                    previous_cover = Some(id);
+                    reference_deadline = None;
+                }
+                None => {
+                    if !landing.wait_for_reference(
+                        game.capturer.awaiting_reference(land_start),
+                        &mut reference_deadline,
+                        Instant::now(),
+                    ) {
+                        break;
+                    }
+                }
+            }
+            observation = game.settle(&w, g, &records, &f, reference_deadline);
+        }
         let changed = matches!(observation, Ok(None));
         let mut landed = Landing::after_input(
             observation.and_then(|o| o.ok_or_else(|| "落地观测期间客户区已变化".to_string())),
@@ -1038,6 +1220,14 @@ fn round(game: &mut Game<'_>, config_path: &Path, wait: f64) -> Result<End> {
         if game.ctl.state().stopped {
             break End::Stopped;
         }
+        if time_is_up(game.ctl.clock()) && !game.ctl.state().pause {
+            break End::Finished("达到最长运行时间");
+        }
+        if let Some(reason) = hidden {
+            if game.ctl.guard(g, true).is_ok() {
+                return Err(reason);
+            }
+        }
         if let Some(reason) = landed.pause_reason(records.stalled) {
             if (!changed || w.same_instance_exists()) && game.ctl.pause_if_current(g, reason) {
                 let _ = writeln!(
@@ -1144,6 +1334,63 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_landing_reference_survives_multiple_observations_but_has_a_deadline() {
+        let mut landing = Landing::default();
+        let mut deadline = None;
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+
+        for elapsed in [0, 5200, 8000, 10400] {
+            assert!(landing.wait_for_reference(true, &mut deadline, at(elapsed)));
+            assert_eq!(deadline, Some(at(15000)));
+        }
+        // A completed read without evidence of a covered pawn ends observation.
+        assert!(!landing.wait_for_reference(false, &mut deadline, at(10401)));
+        assert!(landing.error.is_none());
+        assert!(!landing.wait_for_reference(true, &mut deadline, at(15000)));
+        assert_eq!(
+            landing.pause_reason(0),
+            Some("等待本跳的窗口参考截图超过 15 秒")
+        );
+    }
+
+    #[test]
+    fn overlay_requires_a_missing_visible_pawn_and_changed_pixels_under_the_cover() {
+        let cfg = Config::default();
+        let mut vision = Vision::new(&cfg, "cpu").unwrap();
+        let game = Frame::read(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/skin-gold-play.png"),
+        )
+        .unwrap();
+        let piece = vision.detect_piece_only(&game).unwrap().piece.unwrap();
+        let [x, y, w, h] = piece.bbox;
+        let mut visible = game.clone();
+        let mut check = |screen: &Frame, pid| {
+            vision.reset_prior();
+            hidden_piece_in_frames(&mut vision, &cfg, &game, screen, |bounds| {
+                assert_eq!(bounds, [x, y, x + w, y + h]);
+                pid
+            })
+        };
+        assert_eq!(check(&visible, Some(Overlay::Other(7))), None); // transparent shared-screen overlay
+        visible.bgr[(y as usize * game.width + x as usize) * 3] ^= 1;
+        assert_eq!(check(&visible, Some(Overlay::Other(7))), None); // different pixels, pawn still recognizable
+        for row in y - 8..y + h + 8 {
+            let lo = (row as usize * game.width + (x - 8) as usize) * 3;
+            visible.bgr[lo..lo + (w + 16) as usize * 3].fill(251);
+        }
+        assert_eq!(
+            check(&visible, Some(Overlay::Allowed)),
+            Some(Overlay::Allowed)
+        );
+        assert_eq!(check(&visible, None), None); // no external window over the missing pawn
+        assert_eq!(
+            check(&visible, Some(Overlay::Other(7))),
+            Some(Overlay::Other(7))
+        );
+        assert_eq!(check(&game, Some(Overlay::Other(7))), None); // restored before final confirmation
+    }
     #[test]
     fn stalled_and_unconfirmed_jumps_are_recorded_before_requesting_pause() -> Result<()> {
         let dir = tempfile::tempdir().unwrap();

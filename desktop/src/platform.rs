@@ -312,28 +312,28 @@ impl Window {
             }
             y = next_y;
         }
-        self.check_occlusion()
+        Ok(())
     }
 
-    fn check_occlusion(&self) -> Result<()> {
+    /// A window rectangle is only a hint for diagnosing a failed visible read.
+    /// Transparent pixels in layered windows can occupy this entire rectangle.
+    pub(crate) fn overlap(&self, bounds: [i32; 4]) -> Option<Overlay> {
+        let _dpi = PhysicalPixels::enter().ok()?;
         let mut cover = Cover {
-            target: self,
-            stopped_at: null_mut(),
+            target: self.handle(),
+            bounds,
+            found: None,
         };
         unsafe { EnumWindows(Some(check_cover), &mut cover as *mut _ as LPARAM) };
-        if cover.stopped_at == self.handle() {
-            return Ok(());
+        cover.found
+    }
+
+    #[cfg(test)]
+    fn covering_pid(&self, bounds: [i32; 4]) -> Option<u32> {
+        match self.overlap(bounds)? {
+            Overlay::Other(id) => Some(id),
+            Overlay::Allowed => None,
         }
-        if cover.stopped_at.is_null() {
-            return Err("无法在桌面窗口列表中确认游戏窗口".into());
-        }
-        let id = pid(cover.stopped_at);
-        let path = executable(id);
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("未知程序");
-        Err(format!("游戏客户区被其他窗口遮挡（{name}，PID {id}）"))
     }
 
     /// Screen reads visible desktop pixels. PrintWindow requests client pixels
@@ -359,7 +359,9 @@ impl Window {
         let height = self.height() as i32;
         let mut capture = |clear, draw: &mut dyn FnMut(HDC) -> Result<()>| {
             let frame = render(width, height, clear, draw)?;
-            if frame.is_solid_color() {
+            if frame.is_solid_color()
+                && (mode != CaptureMode::Screen || self.overlap(self.client_rect).is_none())
+            {
                 return Err("截图只有单一颜色，等待窗口显示内容".into());
             }
             Ok(frame)
@@ -410,6 +412,23 @@ impl Window {
             self.check_screen()?;
         }
         frame.map(Some)
+    }
+
+    /// Only jump holds can move to another point. The caller admits each press separately.
+    pub(crate) fn jump_with(
+        &self,
+        point: (f64, f64),
+        background: bool,
+        mut press: impl FnMut((f64, f64)) -> Result<PressOutcome>,
+    ) -> Result<PressOutcome> {
+        for candidate in [point, (0.25, 0.72), (0.75, 0.72)] {
+            match press(candidate)? {
+                PressOutcome::WindowChanged
+                    if !background && self.is_foreground() && self.still_current()? => {}
+                outcome => return Ok(outcome),
+            }
+        }
+        Ok(PressOutcome::WindowChanged)
     }
 
     fn press_target(&self, point: (f64, f64), background: bool) -> Result<Option<ButtonTarget>> {
@@ -502,22 +521,59 @@ pub enum PressOutcome {
     Suppressed,
 }
 
-struct Cover<'a> {
-    target: &'a Window,
-    stopped_at: HWND,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Overlay {
+    Allowed,
+    Other(u32),
+}
+
+fn allowed_overlay(class: &str, executable: &str) -> bool {
+    // Sogou creates its IME windows inside other processes, including WeChat.
+    // Match the vendor's window class, never the whole host or a generic IME class.
+    if class.starts_with("SoPY_") || class == "Sogou_TSF_UI" {
+        return true;
+    }
+    let path = std::path::Path::new(executable);
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "nvidia overlay.exe"
+        | "nvidia share.exe"
+        | "frameview_x64.exe"
+        | "qq.exe"
+        | "sogousmartassistant.exe"
+        | "sgsmartassistant.exe"
+        | "sogoucloud.exe"
+        | "sogouexe.exe"
+        | "sogoucommgr.exe"
+        | "sgmyinput.exe" => true,
+        // QQNT installs generic helper names alongside the rest of its remoting runtime.
+        "remoting_host.exe" | "qremoting_worker.exe" => path.ancestors().any(|p| {
+            p.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("QQNT") || n.eq_ignore_ascii_case("QQ"))
+        }),
+        _ => false,
+    }
+}
+
+struct Cover {
+    target: HWND,
+    bounds: [i32; 4],
+    found: Option<Overlay>,
 }
 
 unsafe extern "system" fn check_cover(hwnd: HWND, data: LPARAM) -> i32 {
-    let cover = &mut *(data as *mut Cover<'_>);
-    if hwnd == cover.target.handle() {
-        cover.stopped_at = hwnd;
+    let cover = &mut *(data as *mut Cover);
+    if hwnd == cover.target {
         return 0;
     }
     let mut rect = RECT::default();
     if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 || GetWindowRect(hwnd, &mut rect) == 0 {
         return 1;
     }
-    let [l, t, r, b] = cover.target.client_rect;
+    let [l, t, r, b] = cover.bounds;
     let (l, t, r, b) = (
         l.max(rect.left),
         t.max(rect.top),
@@ -589,7 +645,16 @@ unsafe extern "system" fn check_cover(hwnd: HWND, data: LPARAM) -> i32 {
             return 1;
         }
     }
-    cover.stopped_at = hwnd;
+    let id = pid(hwnd);
+    let mut class = [0u16; 256];
+    let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+    let class = String::from_utf16_lossy(&class[..n as usize]);
+    if allowed_overlay(&class, &executable(id)) {
+        // Keep searching: a transparent sharing border can sit above a real blocker.
+        cover.found = Some(Overlay::Allowed);
+        return 1;
+    }
+    cover.found = Some(Overlay::Other(id));
     0
 }
 
@@ -714,9 +779,57 @@ impl Drop for ReusableSurface {
 #[derive(Default)]
 pub(crate) struct Capturer {
     surface: Option<ReusableSurface>,
+    reference: Option<(Instant, std::sync::mpsc::Receiver<Option<Frame>>)>,
 }
 
 impl Capturer {
+    /// PrintWindow runs synchronously inside the window owner. An unresponsive
+    /// foreign window must not stall the foreground controls or pile up requests.
+    pub(crate) fn reference_frame(&mut self, window: &Window, since: Instant) -> Option<Frame> {
+        let window = window.clone();
+        self.read_reference(since, move || {
+            window.capture(CaptureMode::PrintWindow).ok().flatten()
+        })
+    }
+
+    pub(crate) fn awaiting_reference(&self, since: Instant) -> bool {
+        self.reference
+            .as_ref()
+            .is_some_and(|(start, _)| *start == since)
+    }
+
+    fn read_reference(
+        &mut self,
+        since: Instant,
+        capture: impl FnOnce() -> Option<Frame> + Send + 'static,
+    ) -> Option<Frame> {
+        use std::sync::mpsc::{channel, RecvTimeoutError, TryRecvError};
+        if let Some((start, rx)) = &self.reference {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => return None,
+                Ok(frame) if *start == since => {
+                    self.reference = None;
+                    return frame;
+                }
+                _ => self.reference = None,
+            }
+        }
+        let (send, receive) = channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = send.send(capture());
+            })
+            .ok()?;
+        match receive.recv_timeout(Duration::from_millis(50)) {
+            Ok(frame) => frame,
+            Err(RecvTimeoutError::Timeout) => {
+                self.reference = Some((since, receive));
+                None
+            }
+            Err(RecvTimeoutError::Disconnected) => None,
+        }
+    }
+
     fn draw(
         &mut self,
         width: i32,
@@ -938,6 +1051,528 @@ mod tests {
         panic::{catch_unwind, AssertUnwindSafe},
     };
 
+    fn fixture_window(hwnd: HWND) -> Window {
+        Window {
+            hwnd: hwnd as isize,
+            pid: pid(hwnd),
+            title: title(hwnd),
+            exe: executable(pid(hwnd)),
+            client_rect: client_rect(hwnd)
+                .unwrap()
+                .expect("fixture has a client area"),
+        }
+    }
+
+    #[test]
+    fn slow_reference_belongs_to_one_continuous_observation() {
+        use std::sync::mpsc::channel;
+        let mut capture = Capturer::default();
+        let first = Instant::now();
+        let frame = |value| {
+            Some(Frame {
+                width: 1,
+                height: 1,
+                bgr: vec![value; 3],
+            })
+        };
+        let (release, wait) = channel();
+        assert!(capture
+            .read_reference(first, move || {
+                wait.recv().unwrap();
+                frame(1)
+            })
+            .is_none());
+        assert!(capture.awaiting_reference(first));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let late = loop {
+            if let Some(f) = capture.read_reference(first, || panic!("duplicated read")) {
+                break f;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        assert_eq!(late.bgr, [1; 3]);
+        let (done, rx) = channel();
+        done.send(frame(2)).unwrap();
+        capture.reference = Some((first, rx));
+        let next = Instant::now();
+        let current = capture
+            .read_reference(next, move || frame(3))
+            .or_else(|| {
+                while capture.awaiting_reference(next) {
+                    if let Some(f) = capture.read_reference(next, || panic!("duplicated read")) {
+                        return Some(f);
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                None
+            })
+            .unwrap();
+        assert_eq!(current.bgr, [3; 3]);
+    }
+
+    #[test]
+    fn overlay_allowlist_is_specific_to_the_app_or_ime_window() {
+        for (class, exe) in [
+            ("", r"C:\NVIDIA App\CEF\NVIDIA Overlay.exe"),
+            ("", "FrameView_x64.exe"),
+            ("", r"D:\Apps\QQNT\QQ.exe"),
+            ("", r"D:\QQNT\versions\42\remoting_host.exe"),
+            ("", "SOGOUSmartAssistant.exe"),
+            ("SoPY_Comp", "explorer.exe"),
+            ("Sogou_TSF_UI", "WeChatAppEx.exe"),
+        ] {
+            assert!(allowed_overlay(class, exe), "{class} {exe}");
+        }
+        for (class, exe) in [
+            ("Chrome_WidgetWin_1", "chrome.exe"),
+            ("IME", "ctfmon.exe"),
+            ("", "QQMusic.exe"),
+            ("", "QQ.exe.bak"),
+            ("", r"D:\Other\remoting_host.exe"),
+            ("", "nvcontainer.exe"),
+            ("", ""),
+            ("WeChatAppEx", "WeChatAppEx.exe"),
+        ] {
+            assert!(!allowed_overlay(class, exe), "{class} {exe}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an exclusive Windows foreground desktop"]
+    fn foreground_overlay_capture() {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        let enabled = |key: &str| std::env::var(key).as_deref() == Ok("1");
+        assert!(
+            enabled("JUMPBOT_TEST_FOREGROUND"),
+            "requires an exclusive test desktop"
+        );
+        let deliver = enabled("JUMPBOT_TEST_SENDINPUT");
+        if deliver {
+            let hosted = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+                && std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted");
+            assert!(
+                (hosted || enabled("JUMPBOT_TEST_EXCLUSIVE_VM"))
+                    && std::env::var("JUMPBOT_NO_INPUT").as_deref() == Ok("0")
+                    && std::env::args().any(|a| a == "--exact")
+                    && std::env::args().any(|a| a == "platform::tests::foreground_overlay_capture"),
+                "real input requires NO_INPUT=0 and this exact test on GitHub-hosted Windows or a JUMPBOT_TEST_EXCLUSIVE_VM=1 test VM"
+            );
+        } else {
+            assert!(
+                no_input(),
+                "pixel-only acceptance requires JUMPBOT_NO_INPUT=1"
+            );
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Receipt {
+            hwnd: HWND,
+            pane: String,
+            event: &'static str,
+            client: (i32, i32),
+            screen: Option<(i32, i32)>,
+        }
+        thread_local! {
+            static RECEIPTS: std::cell::RefCell<Vec<Receipt>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn receive(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+            if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP) {
+                let client = (i32::from(lp as i16), i32::from((lp >> 16) as i16));
+                let mut pos = POINT {
+                    x: client.0,
+                    y: client.1,
+                };
+                let receipt = Receipt {
+                    hwnd,
+                    pane: title(hwnd),
+                    event: if msg == WM_LBUTTONDOWN { "DOWN" } else { "UP" },
+                    client,
+                    screen: (ClientToScreen(hwnd, &mut pos) != 0).then_some((pos.x, pos.y)),
+                };
+                RECEIPTS.with_borrow_mut(|log| log.push(receipt));
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        unsafe fn pump() {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                DispatchMessageW(&msg);
+            }
+        }
+        let last_input = || {
+            let mut state = LASTINPUTINFO {
+                cbSize: mem::size_of::<LASTINPUTINFO>() as u32,
+                dwTime: 0,
+            };
+            assert_ne!(
+                unsafe { GetLastInputInfo(&mut state) },
+                0,
+                "{}",
+                os_error("GetLastInputInfo")
+            );
+            state.dwTime
+        };
+        let _dpi = PhysicalPixels::enter().unwrap();
+        let cfg = Config::default();
+        let point = (cfg.at("press_point", 0), cfg.at("press_point", 1));
+        let x = (160. * point.0) as i32;
+        let y = (120. * point.1) as i32;
+        unsafe {
+            // This read requires access to the input desktop and never moves the cursor.
+            assert_ne!(
+                GetCursorPos(&mut POINT::default()),
+                0,
+                "active input desktop unavailable: {}",
+                os_error("GetCursorPos")
+            );
+            let instance = GetModuleHandleW(null());
+            let pane = |name: &str, color, ex, style, parent, [left, top, w, h]: [i32; 4]| {
+                let name: Vec<_> = name.encode_utf16().chain(Some(0)).collect();
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(receive),
+                    hInstance: instance,
+                    hbrBackground: CreateSolidBrush(color),
+                    lpszClassName: name.as_ptr(),
+                    ..Default::default()
+                };
+                assert!(
+                    !class.hbrBackground.is_null(),
+                    "{}",
+                    os_error("CreateSolidBrush")
+                );
+                assert_ne!(RegisterClassW(&class), 0, "{}", os_error("RegisterClassW"));
+                let hwnd = CreateWindowExW(
+                    ex,
+                    name.as_ptr(),
+                    name.as_ptr(),
+                    style,
+                    left,
+                    top,
+                    w,
+                    h,
+                    parent,
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null(), "{}", os_error("CreateWindowExW"));
+                hwnd
+            };
+            let board = pane(
+                "JumpBotCiBoard",
+                0xffffff,
+                0,
+                WS_POPUP | WS_CLIPCHILDREN,
+                null_mut(),
+                [64, 64, 160, 120],
+            );
+            let pawn_hwnd = pane(
+                "JumpBotCiPawn",
+                0,
+                0,
+                WS_CHILD | WS_VISIBLE,
+                board,
+                [x - 8, y - 10, 16, 20],
+            );
+            let style = WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED;
+            let overlay = pane(
+                "JumpBotCiCover",
+                0x0000ff,
+                style,
+                WS_POPUP,
+                null_mut(),
+                [0, 0, 24, 32],
+            );
+            assert_ne!(SetLayeredWindowAttributes(overlay, 0, 255, LWA_ALPHA), 0);
+            ShowWindow(board, SW_SHOW);
+            let activated = SetForegroundWindow(board);
+            let window = fixture_window(board);
+            let [left, top, _, _] = window.client_rect;
+            let press = POINT {
+                x: left + x,
+                y: top + y,
+            };
+            let alt_left = (0.25, 0.72);
+            let alt_right = (0.75, 0.72);
+            let send_case = |stage: &str,
+                             foreground: HWND,
+                             attempts: &[((f64, f64), HWND)],
+                             recipient: Option<(HWND, (i32, i32))>| {
+                assert!(deliver);
+                pump();
+                RECEIPTS.with_borrow(|log| {
+                    assert!(log.is_empty(), "{stage}: unexpected prior receipts {log:?}")
+                });
+                assert!(
+                    GetCapture().is_null(),
+                    "{stage}: a fixture already has mouse capture"
+                );
+                assert!(
+                    !GetAsyncKeyState(VK_LBUTTON as i32).is_negative(),
+                    "{stage}: left button already held"
+                );
+                let before = last_input();
+                let mut tried = Vec::new();
+                let outcome = window.jump_with(point, false, |p| {
+                    let &(expected, hit) = attempts
+                        .get(tried.len())
+                        .expect("unexpected additional press attempt");
+                    assert_eq!(p, expected, "{stage}: candidate order");
+                    let pos = POINT {
+                        x: left + (window.width() as f64 * p.0) as i32,
+                        y: top + (window.height() as f64 * p.1) as i32,
+                    };
+                    assert_eq!(
+                        WindowFromPoint(pos),
+                        hit,
+                        "{stage}: candidate is not over its intended fixture"
+                    );
+                    tried.push(p);
+                    window.press(p, Duration::from_millis(45), false, || {
+                        assert_eq!(
+                            GetForegroundWindow(),
+                            foreground,
+                            "{stage}: unexpected foreground"
+                        );
+                        Ok(())
+                    })
+                });
+                // Keep the layout fixed while Windows delivers both edges, including any extras.
+                let until = Instant::now() + Duration::from_secs(1);
+                loop {
+                    pump();
+                    if Instant::now() >= until {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let actual = RECEIPTS.with_borrow_mut(mem::take);
+                let after = last_input();
+                println!("SendInput {stage}: {outcome:?}; attempted {tried:?}; {} receipts {actual:?}; session input tick {before} -> {after}", actual.len());
+                assert_eq!(tried.len(), attempts.len(), "{stage}: candidates tried");
+                assert_eq!(
+                    outcome.unwrap(),
+                    if recipient.is_some() {
+                        PressOutcome::Sent
+                    } else {
+                        PressOutcome::WindowChanged
+                    }
+                );
+                assert_eq!(
+                    GetForegroundWindow(),
+                    foreground,
+                    "{stage}: foreground changed on delivery"
+                );
+                assert!(
+                    !GetAsyncKeyState(VK_LBUTTON as i32).is_negative(),
+                    "{stage}: left button still held"
+                );
+                if let Some((hwnd, client)) = recipient {
+                    let p = tried.last().unwrap();
+                    let screen = Some((
+                        left + (p.0 * window.width() as f64) as i32,
+                        top + (p.1 * window.height() as f64) as i32,
+                    ));
+                    let expected = ["DOWN", "UP"].map(|event| Receipt {
+                        hwnd,
+                        pane: title(hwnd),
+                        client,
+                        screen,
+                        event,
+                    });
+                    assert_eq!(
+                        actual, expected,
+                        "{stage}: recipients, order and coordinates"
+                    );
+                } else {
+                    assert!(actual.is_empty(), "{stage}: unexpected button delivery");
+                    assert_eq!(
+                        before, after,
+                        "{stage}: Windows observed input in this exclusive session"
+                    );
+                }
+            };
+            const WHITE: [u8; 3] = [255; 3];
+            const BLACK: [u8; 3] = [0; 3];
+            const RED: [u8; 3] = [0, 0, 255]; // Captured BGR.
+            for (stage, at, edge, pawn, through, route) in [
+                ("normal", None, WHITE, BLACK, false, board),
+                ("edge", Some((154, 6)), RED, BLACK, false, board),
+                (
+                    "covered",
+                    Some((x - 12, y - 16)),
+                    WHITE,
+                    RED,
+                    false,
+                    overlay,
+                ),
+                (
+                    "click-through",
+                    Some((x - 12, y - 16)),
+                    WHITE,
+                    RED,
+                    true,
+                    board,
+                ),
+                ("restored", Some((168, 6)), WHITE, BLACK, false, board),
+            ] {
+                if let Some((dx, dy)) = at {
+                    let ex = if through {
+                        style | WS_EX_TRANSPARENT
+                    } else {
+                        style
+                    };
+                    assert_ne!(SetWindowLongW(overlay, GWL_EXSTYLE, ex as i32), 0);
+                    assert_ne!(
+                        SetWindowPos(
+                            overlay,
+                            HWND_TOPMOST,
+                            left + dx,
+                            top + dy,
+                            0,
+                            0,
+                            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOSIZE
+                        ),
+                        0
+                    );
+                    UpdateWindow(overlay);
+                }
+                let expected = [edge, pawn, pawn, pawn, WHITE];
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    pump();
+                    let pixels = window.capture(CaptureMode::Screen).map(|frame| {
+                        frame.map(|f| {
+                            [(156, 12), (x - 7, y - 9), (x, y), (x + 7, y + 9), (12, 100)].map(
+                                |(sx, sy)| {
+                                    f.bgr.as_chunks::<3>().0[sy as usize * f.width + sx as usize]
+                                },
+                            )
+                        })
+                    });
+                    let hit = GetAncestor(WindowFromPoint(press), GA_ROOT);
+                    if pixels == Ok(Some(expected))
+                        && hit == route
+                        && point_is_target(board, press) == (route == board)
+                    {
+                        println!(
+                            "{stage}: captured BGR {pixels:?}, press routed to {}",
+                            if hit == board { "board" } else { "overlay" }
+                        );
+                        break;
+                    }
+                    assert!(Instant::now() < deadline,
+                        "{stage}: expected {expected:?}, got {pixels:?}; hit={hit:p}, expected={route:p}; foreground={:p}, board={board:p}, SetForegroundWindow={activated}",
+                        GetForegroundWindow());
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                if deliver {
+                    match stage {
+                        "click-through" => send_case(
+                            stage,
+                            board,
+                            &[(point, pawn_hwnd)],
+                            Some((pawn_hwnd, (8, 10))),
+                        ),
+                        "covered" => send_case(
+                            stage,
+                            board,
+                            &[(point, overlay), (alt_left, board)],
+                            Some((
+                                board,
+                                ((160. * alt_left.0) as i32, (120. * alt_left.1) as i32),
+                            )),
+                        ),
+                        _ => {}
+                    }
+                }
+            }
+            let pawn_bounds = [press.x - 8, press.y - 10, press.x + 8, press.y + 10];
+            let ime = pane(
+                "SoPY_JumpBotCi",
+                0x00ff00,
+                WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                WS_POPUP,
+                null_mut(),
+                [press.x - 12, press.y - 16, 24, 32],
+            );
+            ShowWindow(ime, SW_SHOWNOACTIVATE);
+            UpdateWindow(ime);
+            assert_eq!(window.overlap(pawn_bounds), Some(Overlay::Allowed));
+            assert_eq!(window.covering_pid(pawn_bounds), None);
+            assert_eq!(WindowFromPoint(press), ime);
+            assert!(window.is_foreground());
+            assert!(window.press_target(point, false).unwrap().is_none());
+
+            // Insert the ordinary overlay immediately below the IME at the same point.
+            assert_ne!(
+                SetWindowPos(
+                    overlay,
+                    ime,
+                    press.x - 12,
+                    press.y - 16,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOSIZE
+                ),
+                0
+            );
+            let blocker = pid(overlay);
+            assert_eq!(window.overlap(pawn_bounds), Some(Overlay::Other(blocker)));
+            assert_eq!(window.covering_pid(pawn_bounds), Some(blocker));
+            assert_eq!(WindowFromPoint(press), ime);
+            assert!(window.press_target(point, false).unwrap().is_none());
+            assert_ne!(DestroyWindow(ime), 0);
+            assert_eq!(WindowFromPoint(press), overlay);
+            if deliver {
+                assert_ne!(
+                    SetWindowPos(
+                        overlay,
+                        HWND_TOPMOST,
+                        left,
+                        top,
+                        window.width() as i32,
+                        window.height() as i32,
+                        SWP_NOACTIVATE
+                    ),
+                    0
+                );
+                send_case(
+                    "all-covered",
+                    board,
+                    &[(point, overlay), (alt_left, overlay), (alt_right, overlay)],
+                    None,
+                );
+            }
+            assert_ne!(DestroyWindow(overlay), 0);
+            assert!(window.press_target(point, false).unwrap().is_some());
+            if deliver {
+                // Another owned fixture takes focus without covering any of the board's candidates.
+                let other = pane(
+                    "JumpBotCiOtherApp",
+                    0xffffff,
+                    0,
+                    WS_POPUP,
+                    null_mut(),
+                    [left + 180, top, 64, 64],
+                );
+                ShowWindow(other, SW_SHOW);
+                SetForegroundWindow(other);
+                assert_eq!(
+                    GetForegroundWindow(),
+                    other,
+                    "unable to establish foreground-loss control"
+                );
+                send_case("foreground-lost", other, &[(point, pawn_hwnd)], None);
+                DestroyWindow(other);
+            }
+            DestroyWindow(board);
+        }
+    }
+
     #[test]
     fn ctrl_hotkey_and_no_input_fixture() {
         use std::{os::windows::process::CommandExt, process::Command};
@@ -1013,13 +1648,7 @@ mod tests {
             };
             let _dpi = PhysicalPixels::enter().unwrap();
             let hwnd = make_window(caption, 0, 30, 30);
-            let window = Window {
-                hwnd: hwnd as isize,
-                pid: pid(hwnd),
-                title: title(hwnd),
-                exe: executable(pid(hwnd)),
-                client_rect: client_rect(hwnd).unwrap().expect("fixture has a client area"),
-            };
+            let window = fixture_window(hwnd);
             assert_eq!(window.title, caption);
             ShowWindow(hwnd, SW_HIDE);
             assert!(window.same_instance_exists());
@@ -1027,7 +1656,15 @@ mod tests {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // A visible HWND may temporarily have no drawable client area during a resize.
             assert_ne!(
-                SetWindowPos(hwnd, null_mut(), 30, 30, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER),
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    30,
+                    30,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOZORDER
+                ),
                 0
             );
             assert_eq!(window.still_current(), Ok(false));
@@ -1083,29 +1720,94 @@ mod tests {
                     assert!(frame.err().unwrap().contains("单一颜色"));
                 }
             }
-            window.check_occlusion().unwrap();
+            assert!(window.covering_pid(window.client_rect).is_none());
             let overlay = make_window(
                 "Click-through overlay",
                 WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED,
                 110,
                 75,
             );
+            // Plain STATIC text passes hits through even without a layered overlay.
+            const SS_NOTIFY: i32 = 0x0100;
+            for control in [hwnd, overlay] {
+                let style = GetWindowLongW(control, GWL_STYLE);
+                assert_ne!(SetWindowLongW(control, GWL_STYLE, style | SS_NOTIFY), 0);
+            }
+            let cfg = Config::default();
+            let [left, top, _, _] = window.client_rect;
+            let press = POINT {
+                x: left + (cfg.at("press_point", 0) * window.width() as f64) as i32,
+                y: top + (cfg.at("press_point", 1) * window.height() as f64) as i32,
+            };
+            let press_pixel = [press.x, press.y, press.x + 1, press.y + 1];
+            // The golden-piece fixture's box mapped into this 90 by 60 client.
+            let piece = [54, 60, 62, 67];
+            let owner = pid(overlay);
+            assert!(point_is_target(hwnd, press));
             for alpha in [0, 1, 255] {
                 assert_ne!(SetLayeredWindowAttributes(overlay, 0, alpha, LWA_ALPHA), 0);
-                assert_eq!(window.check_occlusion().is_ok(), alpha == 0);
+                let expected = (alpha != 0).then_some(owner);
+                assert_eq!(window.covering_pid(window.client_rect), expected);
+                assert_eq!(window.covering_pid([110, 75, 111, 76]), expected);
+                assert_eq!(window.covering_pid(piece), None);
+                assert_eq!(window.covering_pid(press_pixel), None);
             }
             // The two bars leave a hole at the only corner overlapping the target.
-            // Extending one bar by a single pixel must block capture again.
+            // Extending one bar by a single pixel reports a possible intersection only.
             for edge in [10, 9] {
                 let bottom = CreateRectRgn(0, 15, 90, 60);
                 let right = CreateRectRgn(edge, 0, 90, 15);
                 assert_eq!(CombineRgn(bottom, bottom, right, RGN_OR), COMPLEXREGION);
                 DeleteObject(right);
                 assert_ne!(SetWindowRgn(overlay, bottom, 0), 0);
-                assert_eq!(window.check_occlusion().is_ok(), edge == 10);
+                assert_eq!(
+                    window.covering_pid(window.client_rect).is_none(),
+                    edge == 10
+                );
+            }
+            assert_ne!(SetWindowRgn(overlay, null_mut(), 0), 0);
+            for bounds in [piece, press_pixel] {
+                let [x, y, r, b] = bounds;
+                assert_ne!(
+                    SetWindowPos(
+                        overlay,
+                        null_mut(),
+                        x,
+                        y,
+                        r - x,
+                        b - y,
+                        SWP_NOACTIVATE | SWP_NOZORDER
+                    ),
+                    0
+                );
+                assert_eq!(
+                    window.covering_pid(piece),
+                    (bounds == piece).then_some(owner)
+                );
+                assert_eq!(
+                    window.covering_pid(press_pixel),
+                    (bounds == press_pixel).then_some(owner)
+                );
+                assert_eq!(WindowFromPoint(press), hwnd);
+            }
+            // Same pixel and same HWND. Let Windows route hits by alpha alone.
+            let style = GetWindowLongW(overlay, GWL_EXSTYLE);
+            assert_ne!(
+                SetWindowLongW(overlay, GWL_EXSTYLE, style & !(WS_EX_TRANSPARENT as i32)),
+                0
+            );
+            for (alpha, hit) in [(0, hwnd), (255, overlay)] {
+                assert_ne!(SetLayeredWindowAttributes(overlay, 0, alpha, LWA_ALPHA), 0);
+                assert_eq!(
+                    window.covering_pid(press_pixel),
+                    (alpha != 0).then_some(owner)
+                );
+                assert_eq!(WindowFromPoint(press), hit);
+                assert_eq!(point_is_target(hwnd, press), hit == hwnd);
             }
             assert_ne!(DestroyWindow(overlay), 0);
-            window.check_occlusion().unwrap();
+            assert!(point_is_target(hwnd, press));
+            assert!(window.covering_pid(window.client_rect).is_none());
             assert!(window
                 .capture(CaptureMode::Screen)
                 .err()

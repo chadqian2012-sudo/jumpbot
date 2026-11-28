@@ -194,13 +194,18 @@ fn check_upgrade(
     uninstall(&target, id)
 }
 
-pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Result<()> {
+pub(super) fn run_checks(
+    version: &str,
+    packages: &Path,
+    install: bool,
+    offline: bool,
+) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root")
         .to_path_buf();
-    if install {
+    if install && !offline {
         let hosted = env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             && env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted");
         require_unused_ids(hosted, registered)?;
@@ -215,6 +220,23 @@ pub(super) fn run_checks(version: &str, packages: &Path, install: bool) -> Resul
         {
             return Err(format!("invalid checksum: {name}").into());
         }
+    }
+    if offline {
+        let name = format!("jumpbot-setup-{version}-offline.exe");
+        if !verified.contains(&name) {
+            return Err("missing offline installer".into());
+        }
+        if install {
+            run(Command::new("powershell.exe")
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(root.join("tools/installer/verify-offline.ps1"))
+                .arg("-Installer")
+                .arg(packages.join(name)))?;
+        }
+        return Ok(());
     }
     for (flavor, id, digest) in LEGACY {
         let zip_name = format!("jumpbot-win64-v{version}-{flavor}.zip");
