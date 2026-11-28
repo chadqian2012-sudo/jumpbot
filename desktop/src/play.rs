@@ -91,6 +91,7 @@ impl Game<'_> {
         self.vision.reset_prior();
         let mut wait = self.ctl.wait_clock();
         let mut countdown = None;
+        let mut observed_window = None;
         loop {
             let g = self.ctl.generation();
             if self.ctl.state().stopped {
@@ -107,7 +108,9 @@ impl Game<'_> {
             let mut reason = "等待用户打开游戏窗口";
             let window = Window::find(self.c, (1, 1))?;
             let missing = window.is_none();
-            if !missing {
+            if missing {
+                observed_window = None;
+            } else {
                 wait = now;
             }
             let elapsed = now.saturating_sub(wait);
@@ -115,10 +118,11 @@ impl Game<'_> {
                 let Ok(guard) = self.ctl.guard(g, false) else {
                     continue;
                 };
-                let foreground = self.o.background || w.is_foreground();
-                if !foreground {
-                    let _ = w.activate();
-                }
+                // Request focus on arrival or resume. Subsequent polls only observe the user.
+                let id = (g, w.hwnd, w.pid);
+                let arrived = observed_window.replace(id) != Some(id);
+                let foreground =
+                    self.o.background || w.is_foreground() || (arrived && w.activate().is_ok());
                 drop(guard);
                 if foreground {
                     let id = (g, w.hwnd, w.pid, w.client_rect);

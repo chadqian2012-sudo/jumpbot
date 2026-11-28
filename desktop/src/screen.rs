@@ -1825,6 +1825,7 @@ impl Screen {
         c: &Config,
         d: &crate::vision::Detection,
     ) -> Option<i32> {
+        d.aim()?;
         self.score(f, c)
             .filter(|_| crate::vision::clear_dark_board(f, d, c))
     }

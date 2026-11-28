@@ -280,6 +280,10 @@ fn selftest(cfg: &Config, vision: &mut Vision) -> Result<()> {
     };
     Frame::read(&asset_dir().join("templates/piece.png"))?;
     let reference = Masks::new(cfg, "cpu").compute(&f)?;
+    let selected = match cfg.s("masks_backend") {
+        "gpu" => "cuda",
+        backend => backend,
+    };
     for name in ["cpu", "simd", "cuda", "opencl", "auto"] {
         let mut masks = Masks::new(cfg, name);
         let start = Instant::now();
@@ -291,6 +295,9 @@ fn selftest(cfg: &Config, vision: &mut Vision) -> Result<()> {
             "{}",
             json!({"requested":name,"actual":masks.backend(),"mask_equal":true,"ms":start.elapsed().as_secs_f64()*1000.})
         );
+        if name == selected {
+            vision.masks = masks;
+        }
     }
     vision.detect(&f)?;
     println!("原生自检通过");
